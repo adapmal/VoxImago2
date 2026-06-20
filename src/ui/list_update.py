@@ -120,31 +120,39 @@ class list_update:
                 app.search_term and app.is_authenticated)
             source = app.current_view if not search_all_sources else None
 
-            files_raw = list_update._load_files_for_filters(app, source)
-            print(
-                f"DEBUG: files_raw (primeiro item): {files_raw[0] if files_raw else 'VAZIO'}")
-            files_to_add = filter_existing_files(
-                files_raw, path_key='path' if files_raw and 'path' in files_raw[0] else 'caminho')
-            print(
-                f"DEBUG: files_to_add (primeiro item): {files_to_add[0] if files_to_add else 'VAZIO'}")
-            print(
-                f"DEBUG: Carregados {len(files_to_add)} arquivos para filtro '{app.current_filter}', source='{source}'")
-
-            if not files_to_add:
-                app.all_files_loaded = True
-                if not app.file_list_model.rowCount():
-                    app.loading_label.setText("Nenhum arquivo encontrado.")
-                    app.loading_label.show()
-                else:
-                    app.loading_label.hide()
-                    app.all_loaded_label.show()
-            else:
-                app._add_thumbnail_widgets(files_to_add)
-                if len(files_to_add) < app.page_size:
+            while not app.all_files_loaded:
+                files_raw = list_update._load_files_for_filters(app, source)
+                print(
+                    f"DEBUG: files_raw (primeiro item): {files_raw[0] if files_raw else 'VAZIO'}")
+                
+                if len(files_raw) < app.page_size:
                     app.all_files_loaded = True
-                    app.all_loaded_label.show()
-                app.current_page += 1
-                app.loading_label.hide()
+
+                files_to_add = filter_existing_files(
+                    files_raw, path_key='path' if files_raw and 'path' in files_raw[0] else 'caminho')
+                print(
+                    f"DEBUG: files_to_add (primeiro item): {files_to_add[0] if files_to_add else 'VAZIO'}")
+                print(
+                    f"DEBUG: Carregados {len(files_to_add)} arquivos para filtro '{app.current_filter}', source='{source}'")
+
+                if files_to_add:
+                    app._add_thumbnail_widgets(files_to_add)
+                    app.current_page += 1
+                    app.loading_label.hide()
+                    if app.all_files_loaded:
+                        app.all_loaded_label.show()
+                    break
+                else:
+                    if app.all_files_loaded:
+                        if not app.file_list_model.rowCount():
+                            app.loading_label.setText("Nenhum arquivo encontrado.")
+                            app.loading_label.show()
+                        else:
+                            app.loading_label.hide()
+                            app.all_loaded_label.show()
+                        break
+                    else:
+                        app.current_page += 1
 
         except Exception as e:
             print(f"Erro ao carregar arquivos: {e}")
