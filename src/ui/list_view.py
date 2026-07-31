@@ -3,7 +3,7 @@ Visualizador de lista de arquivos personalizado com menu de contexto e funcional
 '''
 
 import os
-from PyQt6.QtWidgets import QListView, QMenu, QApplication, QDialog, QVBoxLayout, QLabel
+from PyQt6.QtWidgets import QListView, QMenu, QApplication, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QSlider
 from PyQt6.QtCore import Qt, QMimeData, pyqtSignal, QUrl
 from PyQt6.QtGui import QDrag, QCursor, QPixmap, QImage
 from PyQt6.QtMultimediaWidgets import QVideoWidget
@@ -119,84 +119,236 @@ class FileListView(QListView):
         indexes = self.selectedIndexes()
         if not indexes:
             return
-        file_item = indexes[0].data(Qt.ItemDataRole.UserRole)
-        file_path = file_item.get('path')
-        if not file_path or not os.path.exists(file_path):
-            return
 
-        ext = os.path.splitext(file_path)[1].lower()
-        video_exts = {'.mp4', '.avi', '.mov',
-                      '.mkv', '.wmv', '.flv', '.webm', '.m4v'}
-        raw_exts = {'.cr2', '.nef', '.arw', '.dng', '.orf', '.rw2',
-                    '.pef', '.srw', '.raf', '.raw', '.heic', '.heif'}
-
+        current_player = [None]
         dialog = QDialog(self)
-        dialog.setWindowTitle("Pré-visualização")
         layout = QVBoxLayout(dialog)
-
-        if ext in video_exts:
-            try:
-                video_widget = QVideoWidget(dialog)
-                layout.addWidget(video_widget)
-                player = QMediaPlayer(dialog)
-                audio = QAudioOutput(dialog)
-                player.setAudioOutput(audio)
-                player.setVideoOutput(video_widget)
-                player.setSource(QUrl.fromLocalFile(file_path))
-                player.play()
-                dialog.resize(900, 600)
-
-                def stop_player():
-                    player.stop()
-                dialog.finished.connect(stop_player)
-
-            except Exception as e:
-                label = QLabel(f"Erro ao tentar exibir vídeo: {e}", dialog)
-                label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                layout.addWidget(label)
-        elif ext in raw_exts:
-            try:
-                if rawpy:
-                    with rawpy.imread(file_path) as raw:
-                        rgb = raw.postprocess()
-                        image = Image.fromarray(rgb)
-                else:
-                    image = Image.open(file_path)
-                image = image.convert("RGB")
-                image.thumbnail((800, 600))
-                data = image.tobytes("raw", "RGB")
-                qimage = QImage(data, image.width, image.height,
-                                QImage.Format.Format_RGB888)
-                pixmap = QPixmap.fromImage(qimage)
-                label = QLabel(dialog)
-                label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                label.setPixmap(pixmap)
-                layout.addWidget(label)
-            except Exception as e:
-                label = QLabel(f"Não foi possível exibir RAW: {e}", dialog)
-                label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-                layout.addWidget(label)
-            dialog.resize(820, 620)
-        else:
-            label = QLabel(dialog)
-            label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            pixmap = QPixmap(file_path)
-            if not pixmap.isNull():
-                label.setPixmap(pixmap.scaled(
-                    800, 600, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-            else:
-                label.setText("Não foi possível carregar a imagem.")
-            layout.addWidget(label)
-            dialog.resize(820, 620)
-
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(5)
         dialog.setLayout(layout)
         dialog.setModal(True)
 
         def close_on_key(event):
             if event.key() in (Qt.Key.Key_Space, Qt.Key.Key_Escape):
                 dialog.close()
+            elif event.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right) and (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+                if current_player[0]:
+                    player = current_player[0]
+                    if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                        delta = 10000  # 10s
+                    else:
+                        delta = 2000   # 2s
+                    
+                    if event.key() == Qt.Key.Key_Left:
+                        new_pos = max(0, player.position() - delta)
+                    else:
+                        new_pos = min(player.duration(), player.position() + delta)
+                    
+                    player.setPosition(new_pos)
+                    if player.playbackState() != QMediaPlayer.PlaybackState.PlayingState and new_pos < player.duration():
+                        player.play()
+            elif event.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right, Qt.Key.Key_Up, Qt.Key.Key_Down):
+                # Propagate key event to list view to change selected item
+                QListView.keyPressEvent(self, event)
+                
+                # Load the newly selected item
+                new_indexes = self.selectedIndexes()
+                if new_indexes:
+                    new_item = new_indexes[0].data(Qt.ItemDataRole.UserRole)
+                    new_path = new_item.get('path')
+                    if new_path and os.path.exists(new_path):
+                        load_file(new_path)
             else:
                 QDialog.keyPressEvent(dialog, event)
+
         dialog.keyPressEvent = close_on_key
+
+        def load_file(file_path):
+            if current_player[0]:
+                try:
+                    current_player[0].stop()
+                    current_player[0].setSource(QUrl())
+                    current_player[0] = None
+                except Exception:
+                    pass
+
+            def clear_layout(lay):
+                while lay.count():
+                    child = lay.takeAt(0)
+                    if child.widget():
+                        child.widget().deleteLater()
+                    elif child.layout():
+                        clear_layout(child.layout())
+                        child.layout().deleteLater()
+
+            clear_layout(layout)
+
+            dialog.setWindowTitle(f"Pré-visualização - {os.path.basename(file_path)}")
+
+            ext = os.path.splitext(file_path)[1].lower()
+            video_exts = {'.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v'}
+            raw_exts = {'.cr2', '.nef', '.arw', '.dng', '.orf', '.rw2',
+                        '.pef', '.srw', '.raf', '.raw'}
+            heic_exts = {'.heic', '.heif'}
+
+            def format_time(ms):
+                if ms < 0:
+                    ms = 0
+                s = ms // 1000
+                m = s // 60
+                s = s % 60
+                h = m // 60
+                m = m % 60
+                if h > 0:
+                    return f"{h:02d}:{m:02d}:{s:02d}"
+                return f"{m:02d}:{s:02d}"
+
+            if ext in video_exts:
+                try:
+                    video_widget = QVideoWidget(dialog)
+                    video_widget.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+                    video_widget.keyPressEvent = close_on_key
+                    layout.addWidget(video_widget, 1)
+
+                    controls_layout = QHBoxLayout()
+
+                    slider = QSlider(Qt.Orientation.Horizontal, dialog)
+                    slider.setRange(0, 0)
+                    slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+                    slider.keyPressEvent = close_on_key
+                    controls_layout.addWidget(slider)
+
+                    time_label = QLabel("00:00 / 00:00", dialog)
+                    time_label.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+                    time_label.setStyleSheet("QLabel { font-family: 'Courier New', monospace; font-size: 11px; min-width: 80px; border: none; background: transparent; }")
+                    time_label.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight)
+                    controls_layout.addWidget(time_label)
+
+                    layout.addLayout(controls_layout, 0)
+
+                    player = QMediaPlayer(dialog)
+                    audio = QAudioOutput(dialog)
+                    player.setAudioOutput(audio)
+                    player.setVideoOutput(video_widget)
+                    player.setSource(QUrl.fromLocalFile(file_path))
+
+                    def update_time_label():
+                        current = format_time(player.position())
+                        total = format_time(player.duration())
+                        time_label.setText(f"{current} / {total}")
+
+                    def on_position_changed(position):
+                        if not slider.isSliderDown():
+                            slider.setValue(position)
+                        update_time_label()
+                        duration = player.duration()
+                        if duration > 0 and position >= duration:
+                            player.pause()
+
+                    def on_duration_changed(duration):
+                        slider.setRange(0, duration)
+                        update_time_label()
+
+                    def on_media_status_changed(status):
+                        if status == QMediaPlayer.MediaStatus.EndOfMedia:
+                            player.pause()
+                            player.setPosition(player.duration())
+
+                    player.positionChanged.connect(on_position_changed)
+                    player.durationChanged.connect(on_duration_changed)
+                    player.mediaStatusChanged.connect(on_media_status_changed)
+
+                    slider.sliderMoved.connect(player.setPosition)
+                    
+                    def on_slider_value_changed(val):
+                        if slider.isSliderDown():
+                            player.setPosition(val)
+                    slider.valueChanged.connect(on_slider_value_changed)
+
+                    def on_slider_released():
+                        if player.playbackState() != QMediaPlayer.PlaybackState.PlayingState and player.position() < player.duration():
+                            player.play()
+                    slider.sliderReleased.connect(on_slider_released)
+
+                    player.play()
+                    current_player[0] = player
+                    dialog.resize(900, 540)
+                except Exception as e:
+                    label = QLabel(f"Erro ao tentar exibir vídeo: {e}", dialog)
+                    label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    layout.addWidget(label)
+            elif ext in raw_exts:
+                try:
+                    if rawpy:
+                        with rawpy.imread(file_path) as raw:
+                            rgb = raw.postprocess()
+                            image = Image.fromarray(rgb)
+                    else:
+                        image = Image.open(file_path)
+                    image = image.convert("RGB")
+                    image.thumbnail((800, 600))
+                    data = image.tobytes("raw", "RGB")
+                    bytes_per_line = image.width * 3
+                    qimage = QImage(data, image.width, image.height, bytes_per_line,
+                                    QImage.Format.Format_RGB888).copy()
+                    pixmap = QPixmap.fromImage(qimage)
+                    label = QLabel(dialog)
+                    label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    label.setPixmap(pixmap)
+                    layout.addWidget(label)
+                except Exception as e:
+                    label = QLabel(f"Não foi possível exibir RAW: {e}", dialog)
+                    label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    layout.addWidget(label)
+                dialog.resize(820, 620)
+            elif ext in heic_exts:
+                try:
+                    import pillow_heif
+                    pillow_heif.register_heif_opener()
+                    image = Image.open(file_path)
+                    image = image.convert("RGB")
+                    image.thumbnail((800, 600))
+                    data = image.tobytes("raw", "RGB")
+                    bytes_per_line = image.width * 3
+                    qimage = QImage(data, image.width, image.height, bytes_per_line,
+                                    QImage.Format.Format_RGB888).copy()
+                    pixmap = QPixmap.fromImage(qimage)
+                    label = QLabel(dialog)
+                    label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    label.setPixmap(pixmap)
+                    layout.addWidget(label)
+                except Exception as e:
+                    label = QLabel(f"Não foi possível exibir HEIC: {e}", dialog)
+                    label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    layout.addWidget(label)
+                dialog.resize(820, 620)
+            else:
+                label = QLabel(dialog)
+                label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                pixmap = QPixmap(file_path)
+                if not pixmap.isNull():
+                    label.setPixmap(pixmap.scaled(
+                        800, 600, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+                else:
+                    label.setText("Não foi possível carregar a imagem.")
+                layout.addWidget(label)
+                dialog.resize(820, 620)
+
+        # Load first item
+        file_item = indexes[0].data(Qt.ItemDataRole.UserRole)
+        file_path = file_item.get('path')
+        if file_path and os.path.exists(file_path):
+            load_file(file_path)
+        else:
+            return
+
+        def stop_player():
+            if current_player[0]:
+                try:
+                    current_player[0].stop()
+                    current_player[0].setSource(QUrl())
+                except Exception:
+                    pass
+        dialog.finished.connect(stop_player)
 
         dialog.exec()

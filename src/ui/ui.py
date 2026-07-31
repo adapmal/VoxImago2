@@ -120,7 +120,7 @@ class DriveFileGalleryApp(QMainWindow):
         self.page_size = 50
         self.search_term = ""
         self.current_filter = "all"
-        self.current_sort = "name_asc"
+        self.current_sort = "created_desc"
         self.current_folder_id = None
         self.advanced_filters = {}
         self.explorer_special_active = False

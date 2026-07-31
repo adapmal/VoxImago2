@@ -40,11 +40,13 @@ class MainBar(QFrame):
         self.sort_combo.addItem("📏 Tamanho (Maior)", "size_desc")
         self.sort_combo.addItem("📅 Data (Mais recente)", "created_desc")
         self.sort_combo.addItem("📅 Data (Mais antiga)", "created_asc")
+        self.sort_combo.setCurrentIndex(4)
         self.sort_combo.setEnabled(False)
 
         self.category_combo = QComboBox()
         self.category_combo.setEditable(False)
         self.category_combo.addItem("🔵 Todos", "")
+        self.category_combo.addItem("📸 Fotos+Vídeos", "media")
         self.category_combo.addItem("🖼️ Imagens", "images")
         self.category_combo.addItem("🎬 Vídeos", "videos")
         self.category_combo.addItem("📄 Documentos", "documents")

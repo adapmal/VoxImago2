@@ -123,56 +123,111 @@ class SearchEngine:
             terms, exclude_terms, or_groups, extra_filters = self.parse_search_query(
                 norm_search_term)
 
+            # Separar os termos de busca em fts_terms (para FTS5 MATCH, >= 3 letras)
+            # e like_terms (para filtro LIKE do SQL, < 3 letras)
+            def is_long_term(term):
+                clean_term = term.replace('"', '')
+                clean_term_alpha = re.sub(r'^[<&#@]', '', clean_term)
+                return len(clean_term_alpha) >= 3
+
             def quote_if_short_or_symbol(term):
                 return f'"{term}"' if len(term) <= 4 or re.match(r'^[<&#@]', term) else term
-            valid_terms = [quote_if_short_or_symbol(t.strip()) for t in (or_groups if or_groups else terms) if t and t.strip(
-            ) and t.strip().upper() not in ['OR', 'AND'] and not t.startswith('-')]
-            if not valid_terms and not exclude_terms:
+
+            raw_terms = or_groups if or_groups else terms
+            valid_raw_terms = [t.strip() for t in raw_terms if t and t.strip() and t.strip().upper() not in ['OR', 'AND'] and not t.startswith('-')]
+
+            fts_terms = []
+            like_terms = []
+
+            for t in valid_raw_terms:
+                if is_long_term(t):
+                    fts_terms.append(quote_if_short_or_symbol(t))
+                else:
+                    like_terms.append(t)
+
+            if not valid_raw_terms and not exclude_terms:
                 self._paged_cache[cache_key] = []
                 return []
-            if or_groups:
-                fts_query = ' OR '.join(valid_terms)
-            else:
-                fts_query = ' '.join(valid_terms)
-            if exclude_terms:
-                for t in exclude_terms:
-                    fts_query += f' NOT "{t}"'
-            if not fts_query.strip():
-                self._paged_cache[cache_key] = []
-                return []
-            if explorer_special:
-                query = f"SELECT DISTINCT file_id FROM search_index WHERE (search_index MATCH ? OR normalized_name MATCH ? OR normalized_description MATCH ?) AND source = 'local' ORDER BY rank"
-                params = (fts_query, fts_query, fts_query)
-            else:
-                query = f"SELECT DISTINCT file_id FROM search_index WHERE search_index MATCH ? OR normalized_name MATCH ? OR normalized_description MATCH ? ORDER BY rank"
-                params = (fts_query, fts_query, fts_query)
-            try:
-                self.indexer.cursor.execute(query, params)
-                file_ids_to_fetch = [row[0]
-                                     for row in self.indexer.cursor.fetchall()]
-                print(f"Resultados FTS: {file_ids_to_fetch}")
-            except sqlite3.OperationalError as e:
-                print(f"Erro na consulta FTS: {e}")
-                print(f"Consulta problemática: {fts_query}")
-                self._paged_cache[cache_key] = []
-                return []
-            if not file_ids_to_fetch:
-                self._paged_cache[cache_key] = []
-                return []
-            placeholders = ','.join('?' for _ in file_ids_to_fetch)
-            details_query = f"SELECT file_id, name, path, mimeType, source, description, thumbnailLink, thumbnailPath, size, modifiedTime, createdTime, parentId, starred, webContentLink FROM files WHERE file_id IN ({placeholders})"
-            filter_clauses = []
-            filter_params = list(file_ids_to_fetch)
+
+            file_ids_to_fetch = []
+            fts_query = ""
+
+            if fts_terms:
+                if or_groups:
+                    fts_query = ' OR '.join(fts_terms)
+                else:
+                    fts_query = ' '.join(fts_terms)
+                
+                long_exclude_terms = [et for et in exclude_terms if is_long_term(et)]
+                if long_exclude_terms:
+                    for et in long_exclude_terms:
+                        clean_et = et.replace('"', '')
+                        fts_query += f' NOT "{clean_et}"'
+                
+                if fts_query.strip():
+                    if explorer_special:
+                        query = f"SELECT DISTINCT file_id FROM search_index WHERE (search_index MATCH ? OR normalized_name MATCH ? OR normalized_description MATCH ?) AND source = 'local' ORDER BY rank"
+                        params = (fts_query, fts_query, fts_query)
+                    elif source:
+                        query = f"SELECT DISTINCT file_id FROM search_index WHERE (search_index MATCH ? OR normalized_name MATCH ? OR normalized_description MATCH ?) AND source = ? ORDER BY rank"
+                        params = (fts_query, fts_query, fts_query, source)
+                    else:
+                        query = f"SELECT DISTINCT file_id FROM search_index WHERE search_index MATCH ? OR normalized_name MATCH ? OR normalized_description MATCH ? ORDER BY rank"
+                        params = (fts_query, fts_query, fts_query)
+                    try:
+                        self.indexer.cursor.execute(query, params)
+                        file_ids_to_fetch = [row[0] for row in self.indexer.cursor.fetchall()]
+                        print(f"Resultados FTS: {len(file_ids_to_fetch)} IDs encontrados")
+                    except sqlite3.OperationalError as e:
+                        print(f"Erro na consulta FTS: {e}")
+                        print(f"Consulta problemática: {fts_query}")
+                        self._paged_cache[cache_key] = []
+                        return []
+
+                    if not file_ids_to_fetch:
+                        self._paged_cache[cache_key] = []
+                        return []
+
+            where_parts = []
+            filter_params = []
+
+            if fts_terms:
+                file_ids_to_fetch = file_ids_to_fetch[:999]
+                placeholders = ','.join('?' for _ in file_ids_to_fetch)
+                where_parts.append(f"file_id IN ({placeholders})")
+                filter_params.extend(file_ids_to_fetch)
+
+            if source:
+                where_parts.append("source = ?")
+                filter_params.append(source)
+
+            where_parts.append("(path IS NOT NULL AND path != '')")
+
+            # Para termos de busca curtos (< 3 letras), fazemos correspondência de palavra inteira (whole word)
+            # substituindo delimitadores comuns por espaços, para evitar que "sé" case com "semana" ou "classe"
+            sql_norm_name = "replace(replace(replace(replace(replace(replace(replace(replace(name_normalized, '_', ' '), '-', ' '), '.', ' '), ',', ' '), '(', ' '), ')', ' '), '[', ' '), ']', ' ')"
+            sql_norm_desc = "replace(replace(replace(replace(replace(replace(replace(replace(description, '_', ' '), '-', ' '), '.', ' '), ',', ' '), '(', ' '), ')', ' '), '[', ' '), ']', ' ')"
+
+            for lt in like_terms:
+                where_parts.append(f"(' ' || {sql_norm_name} || ' ' LIKE ? OR ' ' || {sql_norm_desc} || ' ' LIKE ?)")
+                filter_params.append(f"% {lt} %")
+                filter_params.append(f"% {lt} %")
+
+            for et in exclude_terms:
+                clean_et = et.replace('"', '')
+                if not fts_terms or not is_long_term(et):
+                    where_parts.append(f"NOT (' ' || {sql_norm_name} || ' ' LIKE ? OR ' ' || {sql_norm_desc} || ' ' LIKE ?)")
+                    filter_params.append(f"% {clean_et} %")
+                    filter_params.append(f"% {clean_et} %")
+
             if extra_filters.get('is_starred'):
-                filter_clauses.append("starred = 1")
+                where_parts.append("starred = 1")
             if extra_filters.get('created_before'):
-                filter_clauses.append("createdTime <= ?")
-                filter_params.append(
-                    int(time.mktime(extra_filters['created_before'].timetuple())))
+                where_parts.append("createdTime <= ?")
+                filter_params.append(int(time.mktime(extra_filters['created_before'].timetuple())))
             if extra_filters.get('created_after'):
-                filter_clauses.append("createdTime >= ?")
-                filter_params.append(
-                    int(time.mktime(extra_filters['created_after'].timetuple())))
+                where_parts.append("createdTime >= ?")
+                filter_params.append(int(time.mktime(extra_filters['created_after'].timetuple())))
 
             if advanced_filters:
                 if advanced_filters.get('category'):
@@ -181,6 +236,7 @@ class SearchEngine:
                         category_extensions = {
                             'images': ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.svg', '.ico', '.tiff', '.heic', '.arw', '.cr2', '.nef', '.dng', '.raf', '.orf', '.srw'],
                             'videos': ['.mp4', '.avi', '.mov', '.wmv', '.flv', '.mkv', '.webm', '.m4v', '.3gp'],
+                            'media': ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.svg', '.ico', '.tiff', '.heic', '.arw', '.cr2', '.nef', '.dng', '.raf', '.orf', '.srw', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.mkv', '.webm', '.m4v', '.3gp'],
                             'documents': ['.pdf', '.doc', '.docx', '.txt', '.rtf', '.odt', '.xls', '.xlsx', '.ppt', '.pptx'],
                             'audios': ['.mp3', '.wav', '.flac', '.aac', '.ogg', '.wma', '.m4a']
                         }
@@ -191,31 +247,29 @@ class SearchEngine:
                                 ext_conditions.append("name LIKE ?")
                                 filter_params.append(f"%{ext}")
                             if ext_conditions:
-                                filter_clauses.append(
-                                    f"({' OR '.join(ext_conditions)})")
+                                where_parts.append(f"({' OR '.join(ext_conditions)})")
 
                 if advanced_filters.get('extension'):
-                    filter_clauses.append("name LIKE ?")
+                    where_parts.append("name LIKE ?")
                     filter_params.append(f"%{advanced_filters['extension']}")
-                    filter_clauses.append("mimeType != 'folder'")
-                    filter_clauses.append(
-                        "mimeType != 'application/vnd.google-apps.folder'")
+                    where_parts.append("mimeType != 'folder'")
+                    where_parts.append("mimeType != 'application/vnd.google-apps.folder'")
 
                 if advanced_filters.get('is_starred'):
-                    filter_clauses.append("starred = 1")
+                    where_parts.append("starred = 1")
 
                 if advanced_filters.get('created_before'):
-                    filter_clauses.append("createdTime <= ?")
-                    filter_params.append(
-                        int(time.mktime(advanced_filters['created_before'].timetuple())))
+                    where_parts.append("createdTime <= ?")
+                    filter_params.append(int(time.mktime(advanced_filters['created_before'].timetuple())))
 
                 if advanced_filters.get('created_after'):
-                    filter_clauses.append("createdTime >= ?")
-                    filter_params.append(
-                        int(time.mktime(advanced_filters['created_after'].timetuple())))
+                    where_parts.append("createdTime >= ?")
+                    filter_params.append(int(time.mktime(advanced_filters['created_after'].timetuple())))
 
-            if filter_clauses:
-                details_query += " AND " + " AND ".join(filter_clauses)
+            details_query = f"SELECT file_id, name, path, mimeType, source, description, thumbnailLink, thumbnailPath, size, modifiedTime, createdTime, parentId, starred, webContentLink FROM files"
+            if where_parts:
+                details_query += " WHERE " + " AND ".join(where_parts)
+
             self.indexer.cursor.execute(details_query, filter_params)
             rows = self.indexer.cursor.fetchall()
             result = self.indexer._build_file_objects_from_search(rows)
@@ -302,8 +356,9 @@ class SearchEngine:
                     category = advanced_filters['category']
                     if category != '':
                         category_extensions = {
-                            'images': ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.svg', '.ico', '.tiff'],
+                            'images': ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.svg', '.ico', '.tiff', '.heic', '.arw', '.cr2', '.nef', '.dng', '.raf', '.orf', '.srw'],
                             'videos': ['.mp4', '.avi', '.mov', '.wmv', '.flv', '.mkv', '.webm', '.m4v', '.3gp'],
+                            'media': ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.svg', '.ico', '.tiff', '.heic', '.arw', '.cr2', '.nef', '.dng', '.raf', '.orf', '.srw', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.mkv', '.webm', '.m4v', '.3gp'],
                             'documents': ['.pdf', '.doc', '.docx', '.txt', '.rtf', '.odt', '.xls', '.xlsx', '.ppt', '.pptx'],
                             'audios': ['.mp3', '.wav', '.flac', '.aac', '.ogg', '.wma', '.m4a']
                         }
