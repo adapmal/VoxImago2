@@ -58,9 +58,9 @@ class AutoTagger:
         #         dt = datetime.datetime.fromtimestamp(created_ts)
         #         year_str = str(dt.year)
         #         if year_str in self.vocab_mgr.all_tags:
-                    suggested.add(year_str)
-            except Exception:
-                pass
+        #             suggested.add(year_str)
+        #     except Exception:
+        #         pass
 
         # Sugerir por tipo de mídia
         mime = file_item.get('mimeType', '')
