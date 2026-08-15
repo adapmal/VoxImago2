@@ -83,6 +83,21 @@ class MainBar(QFrame):
         self.unified_layout.addWidget(self.mode_toggle_btn)
         self.unified_layout.addSpacing(5)
 
+        from src.ui.staging_queue import StagingQueue, StagingQueueDialog
+
+        self.staging_queue = StagingQueue()
+        self.staging_btn = QPushButton("📋 Fila (0)")
+        self.staging_btn.setFixedHeight(34)
+        self.staging_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.staging_btn.setStyleSheet(
+            "background-color: #E9ECEF; color: #495057; border: 1px solid #CED4DA; border-radius: 4px; padding: 4px 10px; font-weight: bold; font-size: 12px;")
+        self.staging_btn.setToolTip("Abre a Fila de Revisão de Alterações Pendentes.")
+        self.staging_btn.clicked.connect(self._open_staging_dialog)
+        self.unified_layout.addWidget(self.staging_btn)
+        self.unified_layout.addSpacing(5)
+
+        self.staging_queue.queueChanged.connect(self._update_staging_button)
+
         self._update_mode_ui()
         self.config_mgr.modeChanged.connect(lambda k, v: self._update_mode_ui())
 
@@ -337,4 +352,19 @@ class MainBar(QFrame):
                 QMessageBox.information(self, "Amostra de Testes Gerada", msg)
             else:
                 QMessageBox.warning(self, "Erro ao Gerar Amostra", msg)
+
+    def _update_staging_button(self, count):
+        self.staging_btn.setText(f"📋 Fila ({count})")
+        if count > 0:
+            self.staging_btn.setStyleSheet(
+                "background-color: #CCE5FF; color: #004085; border: 1px solid #B8DAFF; border-radius: 4px; padding: 4px 10px; font-weight: bold; font-size: 12px;")
+        else:
+            self.staging_btn.setStyleSheet(
+                "background-color: #E9ECEF; color: #495057; border: 1px solid #CED4DA; border-radius: 4px; padding: 4px 10px; font-weight: bold; font-size: 12px;")
+
+    def _open_staging_dialog(self):
+        from src.ui.staging_queue import StagingQueueDialog
+        dialog = StagingQueueDialog(self)
+        dialog.exec()
+
 

@@ -80,19 +80,30 @@ class FileListView(QListView):
         drag.exec(Qt.DropAction.CopyAction)
 
     def show_context_menu(self, position):
-        index = self.indexAt(position)
-        if not index.isValid():
+        selected_indexes = self.selectedIndexes()
+        selected_items = [idx.data(Qt.ItemDataRole.UserRole) for idx in selected_indexes if idx.isValid() and idx.data(Qt.ItemDataRole.UserRole)]
+
+        if not selected_items:
             return
 
-        file_item = index.data(Qt.ItemDataRole.UserRole)
+        file_item = selected_items[0]
         menu = QMenu()
+
+        batch_edit_action = None
+        if len(selected_items) >= 2:
+            batch_edit_action = menu.addAction(f"✏️ Editar Tags em Lote ({len(selected_items)} selecionados)...")
+            menu.addSeparator()
 
         open_action = menu.addAction("Abrir no Explorer")
         copy_pt_action = menu.addAction("Copiar Caminho em Português")
         copy_en_action = menu.addAction("Copiar Caminho em Inglês")
 
         action = menu.exec(self.viewport().mapToGlobal(position))
-        if action == open_action:
+        if batch_edit_action and action == batch_edit_action:
+            from src.ui.batch_editor import BatchEditorDialog
+            dialog = BatchEditorDialog(selected_items, parent=self)
+            dialog.exec()
+        elif action == open_action:
             if file_item.get('source') == 'local' and file_item.get('path'):
                 folder = os.path.dirname(file_item['path'])
                 os.startfile(folder)
