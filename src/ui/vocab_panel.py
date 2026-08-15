@@ -69,8 +69,8 @@ class VocabPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.vocab_mgr = VocabManager()
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        self.setMinimumHeight(180)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setFixedHeight(280)  # Forçar altura fixa para evitar esmagamento pelo splitter/layout
         self._init_ui()
 
     def _init_ui(self):

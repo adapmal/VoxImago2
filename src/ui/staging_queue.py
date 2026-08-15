@@ -318,7 +318,48 @@ class StagingQueueDialog(QDialog):
 
                     # Atualizar na API do Google Drive se o serviço de drive estiver ativo
                     if self.drive_service and item.file_id and not self.config_mgr.is_sandbox():
-                        self.drive_service.update_file_description(item.file_id, new_desc)
+                        try:
+                            self.drive_service.files().update(
+                                fileId=item.file_id, 
+                                body={'description': new_desc}, 
+                                supportsAllDrives=True
+                            ).execute()
+                        except Exception as e:
+                            logging.error(f"Erro na API Drive ao atualizar desc {item.file_id}: {e}")
+
+                elif item.action_type == 'rename':
+                    new_name = item.new_value
+                    if self.db_indexer and item.file_id:
+                        self.db_indexer.cursor.execute("UPDATE files SET name = ?, name_normalized = ? WHERE file_id = ?", (new_name, new_name.lower(), item.file_id))
+                        self.db_indexer.conn.commit()
+                    if self.drive_service and item.file_id and not self.config_mgr.is_sandbox():
+                        self.drive_service.files().update(
+                            fileId=item.file_id, 
+                            body={'name': new_name}, 
+                            supportsAllDrives=True
+                        ).execute()
+
+                elif item.action_type == 'delete':
+                    if self.db_indexer and item.file_id:
+                        self.db_indexer.cursor.execute("DELETE FROM files WHERE file_id = ?", (item.file_id,))
+                        self.db_indexer.conn.commit()
+                    if self.drive_service and item.file_id and not self.config_mgr.is_sandbox():
+                        self.drive_service.files().update(
+                            fileId=item.file_id, 
+                            body={'trashed': True}, 
+                            supportsAllDrives=True
+                        ).execute()
+
+                elif item.action_type == 'rotate_90':
+                    if item.path and os.path.exists(item.path):
+                        try:
+                            from PIL import Image
+                            with Image.open(item.path) as img:
+                                img = img.rotate(-90, expand=True)
+                                img.save(item.path)
+                        except Exception as e:
+                            logging.error(f"Erro ao rotacionar localmente {item.path}: {e}")
+                            errors.append(f"Erro na rotação local {item.file_name}: {e}")
 
                 executed_count += 1
                 self.queue.remove_item(item)

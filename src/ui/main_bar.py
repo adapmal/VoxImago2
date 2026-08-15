@@ -90,10 +90,10 @@ class MainBar(QFrame):
         self.config_mgr = ConfigManager()
 
         print('DEBUG: MainBar passo 3 - Sandbox badge')
-        self.sandbox_badge = QLabel("🧪 Sandbox (L:\\_TestesBanco)")
+        self.sandbox_badge = QLabel("🧪 Sandbox (L:\\Drives Compartilhados\\_TestesBanco)")
         self.sandbox_badge.setStyleSheet(
-            "background-color: #FFF3CD; color: #856404; border: 1px solid #FFEEBA; border-radius: 4px; padding: 4px 8px; font-weight: bold; font-size: 11px;")
-        self.sandbox_badge.setToolTip("Ambiente seguro de testes ativo (L:\\_TestesBanco). O acervo oficial não é afetado.")
+            "background-color: #FFF3CD; color: #856404; font-weight: bold; padding: 4px 8px; border-radius: 4px; border: 1px solid #FFEEBA;")
+        self.sandbox_badge.setToolTip("Ambiente seguro de testes ativo (L:\\Drives Compartilhados\\_TestesBanco). O acervo oficial não é afetado.")
         self.unified_layout.addWidget(self.sandbox_badge)
         self.unified_layout.addSpacing(5)
 
@@ -143,12 +143,12 @@ class MainBar(QFrame):
         self.action_toggle_read_only.setToolTip("Alterna o aplicativo entre modo somente leitura (seguro) e modo de edição.")
         self.action_toggle_read_only.triggered.connect(self._toggle_read_only_mode)
 
-        self.action_toggle_sandbox = QAction("🧪 Alternar Modo Sandbox (L:\\_TestesBanco)", self)
-        self.action_toggle_sandbox.setToolTip("Ativa ou desativa o ambiente seguro de testes em L:\\_TestesBanco.")
+        self.action_toggle_sandbox = QAction("🧪 Alternar Modo Sandbox (L:\\Drives Compartilhados\\_TestesBanco)", self)
+        self.action_toggle_sandbox.setToolTip("Ativa ou desativa o ambiente seguro de testes em L:\\Drives Compartilhados\\_TestesBanco.")
         self.action_toggle_sandbox.triggered.connect(self._toggle_sandbox_mode)
 
         self.action_create_sandbox_sample = QAction("📦 Gerar Amostra de Teste (30-50 Fotos)", self)
-        self.action_create_sandbox_sample.setToolTip("Copia uma amostra representativa de arquivos para L:\\_TestesBanco.")
+        self.action_create_sandbox_sample.setToolTip("Copia uma amostra representativa de arquivos para L:\\Drives Compartilhados\\_TestesBanco.")
         self.action_create_sandbox_sample.triggered.connect(self._generate_sandbox_sample)
 
         self.view_mode_group = QActionGroup(self)
@@ -360,7 +360,7 @@ class MainBar(QFrame):
         QMessageBox.information(
             self,
             "Ambiente Sandbox",
-            f"O Modo Sandbox foi {status_str}.\n\nAo utilizar o Modo Sandbox, todas as buscas e edições ocorrem em 'L:\\_TestesBanco'."
+            f"O Modo Sandbox foi {status_str}.\n\nAo utilizar o Modo Sandbox, todas as buscas e edições ocorrem em 'L:\\Drives Compartilhados\\_TestesBanco'."
         )
 
     def _generate_sandbox_sample(self):
@@ -390,7 +390,7 @@ class MainBar(QFrame):
 
     def _open_staging_dialog(self):
         from src.ui.staging_queue import StagingQueueDialog
-        dialog = StagingQueueDialog(self)
+        dialog = StagingQueueDialog(self, drive_service=self.parent_app.service, db_indexer=self.parent_app.indexer)
         dialog.exec()
 
 

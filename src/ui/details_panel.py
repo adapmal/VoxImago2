@@ -6,16 +6,46 @@ import webbrowser
 from datetime import datetime
 from PyQt6.QtWidgets import (
     QFrame, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QFormLayout, QScrollArea, QMessageBox, QGroupBox, QLineEdit, QTextEdit
+    QFormLayout, QScrollArea, QMessageBox, QGroupBox, QLineEdit, QCompleter
 )
-from PyQt6.QtGui import QPixmap, QFont
+from PyQt6.QtGui import QFont
 from PyQt6.QtCore import Qt
 from src.utils.utils import format_size
 from src.ui.thumbnails import ThumbnailCache, ThumbnailManager
 from src.drive.auto_tagger import AutoTagger
 from src.ui.staging_queue import StagingQueue, StagingItem
 from src.utils.config_manager import ConfigManager
+from src.database.vocab_manager import VocabManager
 
+class TagsLineEdit(QLineEdit):
+    def __init__(self, vocab_list, parent=None):
+        super().__init__(parent)
+        self.vocab_list = vocab_list
+        self.completer = QCompleter(self.vocab_list, self)
+        self.completer.setWidget(self)
+        self.completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self.completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.completer.activated.connect(self.insertCompletion)
+
+    def insertCompletion(self, completion):
+        text = self.text()
+        parts = text.split(',')
+        if len(parts) > 1:
+            parts[-1] = " " + completion
+            self.setText(", ".join(parts) + ", ")
+        else:
+            self.setText(completion + ", ")
+        self.textEdited.emit(self.text())
+
+    def keyPressEvent(self, event):
+        super().keyPressEvent(event)
+        text = self.text()
+        prefix = text.split(',')[-1].strip()
+        self.completer.setCompletionPrefix(prefix)
+        if prefix:
+            self.completer.complete()
+        else:
+            self.completer.popup().hide()
 
 class FileDetailsPanel(QFrame):
 
@@ -49,12 +79,21 @@ class FileDetailsPanel(QFrame):
         self.thumbnail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.main_layout.addWidget(self.thumbnail_label)
 
-        # Botão de Ação Rápida: Girar Foto
-        self.btn_rotate = QPushButton("🔄 Girar Foto 90° (Horário)")
+        btn_actions_layout = QVBoxLayout()
+
+        self.btn_rotate = QPushButton("🔄 Girar Foto 90°")
         self.btn_rotate.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_rotate.setStyleSheet("background-color: #6C757D; color: white; padding: 4px 10px; font-weight: bold;")
         self.btn_rotate.clicked.connect(self._rotate_image_action)
-        self.main_layout.addWidget(self.btn_rotate)
+        btn_actions_layout.addWidget(self.btn_rotate)
+
+        self.btn_delete = QPushButton("🗑️ Excluir Arquivo")
+        self.btn_delete.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_delete.setStyleSheet("background-color: #DC3545; color: white; padding: 4px 10px; font-weight: bold;")
+        self.btn_delete.clicked.connect(self._delete_file_action)
+        btn_actions_layout.addWidget(self.btn_delete)
+
+        self.main_layout.addLayout(btn_actions_layout)
 
         self.separator = QFrame()
         self.separator.setFrameShape(QFrame.Shape.HLine)
@@ -64,7 +103,6 @@ class FileDetailsPanel(QFrame):
         self.form_layout = QFormLayout()
         self.form_layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
 
-        # Nome: Exibição ou Edição
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText("Nome do arquivo...")
         self.name_edit.textEdited.connect(self._on_name_edited)
@@ -81,14 +119,16 @@ class FileDetailsPanel(QFrame):
         self.form_layout.addRow(QLabel("<b>Caminho:</b>"), self.path_label)
         self.form_layout.addRow(QLabel("<b>Criação:</b>"), self.created_label)
 
-        # Descrição / Tags com Edição ao Vivo
-        self.description_edit = QTextEdit()
+        vocab_mgr = VocabManager()
+        all_tags = []
+        for tags in vocab_mgr.categories.values():
+            all_tags.extend(tags)
+        
+        self.description_edit = TagsLineEdit(all_tags)
         self.description_edit.setPlaceholderText("Digite as tags separadas por vírgula...")
-        self.description_edit.setMaximumHeight(80)
-        self.description_edit.textChanged.connect(self._on_description_changed)
+        self.description_edit.textEdited.connect(self._on_description_changed)
         self.form_layout.addRow(QLabel("<b>Tags/Desc:</b>"), self.description_edit)
 
-        # Visualização de Diff de Cores (Adições em verde, Remoções em vermelho tachado)
         self.diff_label = QLabel()
         self.diff_label.setWordWrap(True)
         self.diff_label.setStyleSheet("padding: 4px; background: #1E1E1E; border-radius: 4px; font-size: 11px;")
@@ -106,12 +146,10 @@ class FileDetailsPanel(QFrame):
 
         self.main_layout.addLayout(self.form_layout)
 
-        # Seção de Tags Sugeridas pelo Auto-Tagger
         self.suggestions_group = QGroupBox("💡 Tags Sugeridas (Auto-Tagger)")
         self.suggestions_group.setStyleSheet("QGroupBox { font-weight: bold; margin-top: 10px; }")
         self.suggestions_container_layout = QVBoxLayout(self.suggestions_group)
 
-        # Botão Acrescentar Todas
         self.btn_add_all_suggestions = QPushButton("✨ Acrescentar Todas as Sugeridas")
         self.btn_add_all_suggestions.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_add_all_suggestions.setStyleSheet(
@@ -150,6 +188,7 @@ class FileDetailsPanel(QFrame):
         self.name_edit.setReadOnly(is_ro)
         self.description_edit.setReadOnly(is_ro)
         self.btn_rotate.setEnabled(not is_ro)
+        self.btn_delete.setEnabled(not is_ro)
         self.btn_add_all_suggestions.setEnabled(not is_ro)
         if is_ro:
             self.name_edit.setStyleSheet("background-color: #E9ECEF; color: #6C757D;")
@@ -201,7 +240,6 @@ class FileDetailsPanel(QFrame):
         self._update_suggested_tags(file_item)
         self._update_diff_preview()
 
-        # Carregar miniatura
         self.thumbnail_label.setPixmap(ThumbnailManager.get_generic_thumbnail(
             file_item.get('mimeType'), size=(300, 300)))
 
@@ -251,30 +289,29 @@ class FileDetailsPanel(QFrame):
     def _add_tag_directly(self, tag):
         if not self.current_file_item or self.config_mgr.is_read_only():
             return
-        current_text = self.description_edit.toPlainText().strip()
-        tags = [t.strip() for t in current_text.split(',') if t.strip()]
-        if tag not in tags:
-            tags.append(tag)
-            new_desc = ", ".join(tags)
-            self.description_edit.setText(new_desc)
-            self._stage_description_change(new_desc)
+        current_tags = [t.strip() for t in self.description_edit.text().split(',')]
+        if tag not in current_tags:
+            current_tags.append(tag)
+            current_tags = [t for t in current_tags if t]
+            new_text = ", ".join(current_tags)
+            self.description_edit.setText(new_text)
+            self._on_description_changed()
 
     def _add_all_suggestions_action(self):
         if not self.current_file_item or self.config_mgr.is_read_only() or not self.current_suggestions:
             return
-        current_text = self.description_edit.toPlainText().strip()
-        tags = [t.strip() for t in current_text.split(',') if t.strip()]
+        current_tags = [t.strip() for t in self.description_edit.text().split(',') if t.strip()]
         for tag in self.current_suggestions:
-            if tag not in tags:
-                tags.append(tag)
-        new_desc = ", ".join(tags)
-        self.description_edit.setText(new_desc)
-        self._stage_description_change(new_desc)
+            if tag not in current_tags:
+                current_tags.append(tag)
+        new_text = ", ".join(current_tags)
+        self.description_edit.setText(new_text)
+        self._on_description_changed()
 
-    def _on_description_changed(self):
+    def _on_description_changed(self, text=None):
         if self._is_updating or not self.current_file_item or self.config_mgr.is_read_only():
             return
-        new_desc = self.description_edit.toPlainText().strip()
+        new_desc = self.description_edit.text().strip()
         self._stage_description_change(new_desc)
 
     def _stage_description_change(self, new_desc):
@@ -283,7 +320,6 @@ class FileDetailsPanel(QFrame):
         fpath = self.current_file_item.get('path', '')
         old_desc = self.current_file_item.get('description', '')
 
-        # Remover itens anteriores de edição de tags deste mesmo arquivo
         for it in list(self.staging_queue.items):
             if it.file_id == fid and it.action_type in ('set_description', 'add_tags', 'remove_tags'):
                 self.staging_queue.remove_item(it)
