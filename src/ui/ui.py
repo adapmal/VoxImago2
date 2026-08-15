@@ -312,6 +312,13 @@ class DriveFileGalleryApp(QMainWindow):
 
         self.main_bar = MainBar(self)
         main_layout.addWidget(self.main_bar)
+
+        self.vocab_panel = VocabPanel(parent=self)
+        self.vocab_panel.tagSelected.connect(self.on_vocab_tag_selected)
+        main_layout.addWidget(self.vocab_panel)
+
+        self.main_bar.vocab_toggle_btn.clicked.connect(self.vocab_panel.toggle_visibility)
+
         self.action_grid_view = self.main_bar.action_grid_view
         self.action_list_view = self.main_bar.action_list_view
 
@@ -367,19 +374,15 @@ class DriveFileGalleryApp(QMainWindow):
         self.folder_tree = FolderTreeWidget(parent=self)
         self.folder_tree.folderSelected.connect(self.on_folder_tree_selected)
 
-        self.vocab_panel = VocabPanel(parent=self)
-        self.vocab_panel.tagSelected.connect(self.on_vocab_tag_selected)
-
         self.details_panel = FileDetailsPanel(self)
 
         self.splitter.addWidget(self.folder_tree)
         self.splitter.addWidget(self.file_list_view)
-        self.splitter.addWidget(self.vocab_panel)
         self.splitter.addWidget(self.details_panel)
 
         self.details_panel.setMinimumWidth(320)
         self.details_panel.setMaximumWidth(550)
-        self.splitter.setSizes([220, 650, 240, 350])
+        self.splitter.setSizes([240, 700, 360])
 
         main_layout.addWidget(self.splitter)
 
@@ -1543,9 +1546,15 @@ class DriveFileGalleryApp(QMainWindow):
     def on_folder_tree_selected(self, folder_path):
         if not folder_path or not os.path.exists(folder_path):
             return
-        folder_name = os.path.basename(folder_path)
-        if folder_name and folder_name != os.path.basename(self.folder_tree.root_dir):
-            self.main_bar.search_entry.setText(folder_name)
+        if folder_path == self.folder_tree.root_dir:
+            self.current_folder_path_filter = None
+        else:
+            self.current_folder_path_filter = folder_path
+
+        self.current_page = 0
+        self.all_files_loaded = False
+        list_update.clear_display(self)
+        list_update.load_next_batch(self)
 
     def on_vocab_tag_selected(self, tag_text):
         current = self.main_bar.search_entry.text().strip()

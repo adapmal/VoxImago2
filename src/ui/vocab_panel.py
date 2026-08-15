@@ -1,12 +1,10 @@
 '''
-Painel de Vocabulário Controlado (Controlled Vocabulary Panel) para o VoxImago v2.1
-Carrega e categoriza as tags das 13 colunas da planilha do Google Sheets.
-Exibe chips/pills clicáveis por categoria para busca e etiquetagem didática.
+Painel de Vocabulário Controlado Horizontal (Top Collapsible Controlled Vocabulary) para o VoxImago v2.1
+Exibe chips/pills organizados horizontalmente por categoria, com suporte a expansão/recolhimento.
 '''
 
 import os
 import csv
-import urllib.request
 import logging
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
@@ -23,7 +21,7 @@ class VocabManager:
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
-            cls._instance = super(VocabManager, cls).__new__(cls)
+            cls._instance = super().__new__(cls)
             cls._instance.config_mgr = ConfigManager()
             cls._instance.categories = {}  # { 'Categoria': ['tag1', 'tag2', ...] }
             cls._instance.all_tags = set()
@@ -34,7 +32,6 @@ class VocabManager:
         pass
 
     def load_vocabulary(self):
-        # 1. Ler imediatamente do cache CSV local para inicialização instantânea
         if os.path.exists(VOCAB_CACHE_FILE):
             try:
                 with open(VOCAB_CACHE_FILE, 'r', encoding='utf-8-sig', errors='ignore') as f:
@@ -72,40 +69,59 @@ class VocabPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.vocab_mgr = VocabManager()
-        self.setMaximumWidth(320)
-
         self._init_ui()
 
     def _init_ui(self):
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(6, 6, 6, 6)
+        main_layout.setContentsMargins(10, 4, 10, 8)
+        main_layout.setSpacing(4)
 
-        title_label = QLabel("🏷️ Vocabulário Controlado")
-        title_label.setStyleSheet("font-weight: bold; font-size: 14px;")
-        main_layout.addWidget(title_label)
+        # Barra superior com título, filtro e botão de fechar
+        top_bar = QHBoxLayout()
+        title_label = QLabel("🏷️ Vocabulário Controlado Oficial (Tags)")
+        title_label.setStyleSheet("font-weight: bold; font-size: 13px; color: #1976D2;")
+        top_bar.addWidget(title_label)
 
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Filtrar tags por nome...")
+        self.search_input.setPlaceholderText("Filtrar tags...")
+        self.search_input.setFixedWidth(200)
+        self.search_input.setClearButtonEnabled(True)
         self.search_input.textChanged.connect(self._filter_tags)
-        main_layout.addWidget(self.search_input)
+        top_bar.addWidget(self.search_input)
 
-        # Scroll Area para conter as categorias de chips
+        top_bar.addStretch()
+
+        self.btn_close = QPushButton("✕ Recolher")
+        self.btn_close.setFixedHeight(26)
+        self.btn_close.setStyleSheet("padding: 2px 8px; font-size: 11px;")
+        self.btn_close.clicked.connect(self.hide)
+        top_bar.addWidget(self.btn_close)
+
+        main_layout.addLayout(top_bar)
+
+        # Scroll horizontal para as categorias
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll_area.setFixedHeight(120)
+        self.scroll_area.setFrameShape(QFrame.Shape.StyledPanel)
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         self.container_widget = QWidget()
-        self.container_layout = QVBoxLayout(self.container_widget)
-        self.container_layout.setContentsMargins(0, 0, 0, 0)
+        self.container_layout = QHBoxLayout(self.container_widget)
+        self.container_layout.setContentsMargins(4, 4, 4, 4)
         self.container_layout.setSpacing(8)
 
         self.scroll_area.setWidget(self.container_widget)
         main_layout.addWidget(self.scroll_area)
 
         self._build_category_chips()
+        self.hide()  # Inicialmente recolhido
+
+    def toggle_visibility(self):
+        self.setVisible(not self.isVisible())
 
     def _build_category_chips(self, filter_text=""):
-        # Limpar widgets anteriores
         while self.container_layout.count():
             item = self.container_layout.takeAt(0)
             if item.widget():
@@ -122,45 +138,36 @@ class VocabPanel(QWidget):
                 continue
 
             group_box = QGroupBox(cat_name)
-            group_box.setStyleSheet("QGroupBox { font-weight: bold; font-size: 12px; margin-top: 6px; } QGroupBox::title { subcontrol-origin: margin; left: 6px; padding: 0 3px; }")
+            group_box.setStyleSheet(
+                "QGroupBox { font-weight: bold; font-size: 11px; margin-top: 4px; padding-top: 10px; } "
+                "QGroupBox::title { subcontrol-origin: margin; left: 6px; padding: 0 3px; }"
+            )
             group_layout = QVBoxLayout(group_box)
-            group_layout.setContentsMargins(6, 12, 6, 6)
+            group_layout.setContentsMargins(4, 8, 4, 4)
 
-            # Container flexível para os chips
-            chips_widget = QWidget()
-            chips_layout = QHBoxLayout(chips_widget)
-            chips_layout.setContentsMargins(0, 0, 0, 0)
-            chips_layout.setSpacing(4)
-
-            # Usar layout em embrulho se disponível, senão organizar em fluxo
-            chip_container_layout = QVBoxLayout()
-            row_layout = QHBoxLayout()
-            row_layout.setSpacing(4)
-            row_length = 0
+            scroll_cat = QScrollArea()
+            scroll_cat.setWidgetResizable(True)
+            scroll_cat.setFrameShape(QFrame.Shape.NoFrame)
+            scroll_cat_widget = QWidget()
+            scroll_cat_layout = QVBoxLayout(scroll_cat_widget)
+            scroll_cat_layout.setContentsMargins(0, 0, 0, 0)
+            scroll_cat_layout.setSpacing(2)
 
             for tag in matching_tags:
                 btn = QPushButton(tag)
                 btn.setCursor(Qt.CursorShape.PointingHandCursor)
                 btn.setStyleSheet(
-                    "QPushButton { background-color: #E9ECEF; color: #212529; border: 1px solid #CED4DA; border-radius: 12px; padding: 3px 8px; font-size: 11px; }"
+                    "QPushButton { background-color: #E9ECEF; color: #212529; border: 1px solid #CED4DA; border-radius: 9px; padding: 2px 6px; font-size: 11px; text-align: left; }"
                     "QPushButton:hover { background-color: #007BFF; color: white; border-color: #0056B3; }"
                 )
                 btn.clicked.connect(lambda checked, t=tag: self.tagSelected.emit(t))
+                scroll_cat_layout.addWidget(btn)
 
-                row_layout.addWidget(btn)
-                row_length += len(tag) + 4
-                if row_length > 30:
-                    row_layout.addStretch()
-                    chip_container_layout.addLayout(row_layout)
-                    row_layout = QHBoxLayout()
-                    row_layout.setSpacing(4)
-                    row_length = 0
+            scroll_cat_layout.addStretch()
+            scroll_cat.setWidget(scroll_cat_widget)
+            group_layout.addWidget(scroll_cat)
 
-            if row_layout.count() > 0:
-                row_layout.addStretch()
-                chip_container_layout.addLayout(row_layout)
-
-            group_layout.addLayout(chip_container_layout)
+            group_box.setFixedWidth(160)
             self.container_layout.addWidget(group_box)
 
         self.container_layout.addStretch()

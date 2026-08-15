@@ -634,6 +634,29 @@ class FileIndexer:
         if commit:
             self.conn.commit()
 
+    def export_to_shared_cache(self, target_path=r"L:\Drives Compartilhados\zRecursos_VoxImago\file_index_shared.db"):
+        '''Exporta o banco local para o local de cache compartilhado na rede Google Drive'''
+        try:
+            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+            self.conn.commit()
+            shutil.copy2(self.db_name, target_path)
+            print(f"[OK] Cache compartilhado atualizado em: {target_path}")
+            return True
+        except Exception as e:
+            print(f"[AVISO] Nao foi possivel exportar cache compartilhado: {e}")
+            return False
+
+    def import_from_shared_cache(self, source_path=r"L:\Drives Compartilhados\zRecursos_VoxImago\file_index_shared.db"):
+        '''Importa o banco compartilhado se existir e for mais recente'''
+        try:
+            if os.path.exists(source_path):
+                shutil.copy2(source_path, self.db_name)
+                print(f"[OK] Banco de dados importado do cache compartilhado: {source_path}")
+                return True
+        except Exception as e:
+            print(f"[AVISO] Nao foi possivel importar cache compartilhado: {e}")
+        return False
+
 
 def open_db_for_thread(db_name):
     conn = sqlite3.connect(db_name, check_same_thread=False, timeout=30.0)

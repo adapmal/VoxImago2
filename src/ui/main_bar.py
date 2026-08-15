@@ -29,8 +29,28 @@ class MainBar(QFrame):
 
         self.search_entry = QLineEdit()
         self.search_entry.setPlaceholderText("Pesquisar...")
-        self.search_entry.setFixedWidth(300)
+        self.search_entry.setFixedWidth(280)
+        self.search_entry.setClearButtonEnabled(True)
+
+        from PyQt6.QtWidgets import QCompleter
+        from src.ui.vocab_panel import VocabManager
+        vocab_tags = VocabManager().get_all_tags()
+        if vocab_tags:
+            completer = QCompleter(vocab_tags, self)
+            completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+            completer.setFilterMode(Qt.MatchFlag.MatchContains)
+            self.search_entry.setCompleter(completer)
+
         self.unified_layout.addWidget(self.search_entry)
+
+        self.vocab_toggle_btn = QPushButton("🏷️ Tags ▼")
+        self.vocab_toggle_btn.setFixedHeight(34)
+        self.vocab_toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.vocab_toggle_btn.setStyleSheet(
+            "background-color: #E3F2FD; color: #1565C0; border: 1px solid #BBDEFB; border-radius: 4px; padding: 4px 8px; font-weight: bold; font-size: 12px;")
+        self.vocab_toggle_btn.setToolTip("Abrir/Fechar painel horizontal de Vocabulário Controlado (Tags).")
+        self.unified_layout.addWidget(self.vocab_toggle_btn)
+        self.unified_layout.addSpacing(5)
         self.unified_layout.addStretch()
 
         self.sort_combo = QComboBox()

@@ -4,6 +4,7 @@ Permite acumular alterações em lote, visualizar o preview de modificações (D
 e realizar a execução segura no Google Drive e Banco de Dados.
 '''
 
+import os
 import time
 import logging
 from PyQt6.QtWidgets import (
@@ -38,6 +39,9 @@ class StagingItem:
         return f"[{self.action_type}] {self.new_value}"
 
 
+QUEUE_CACHE_FILE = os.path.join('config', 'staging_queue.json')
+
+
 class _StagingSignals(QObject):
     queueChanged = pyqtSignal(int)  # Emitido com o número total de itens pendentes
     itemAdded = pyqtSignal(object)
@@ -57,15 +61,53 @@ class StagingQueue:
             cls._instance.itemRemoved = cls._instance.signals.itemRemoved
             cls._instance.cleared = cls._instance.signals.cleared
             cls._instance.items = []
+            cls._instance._load_from_disk()
         return cls._instance
 
     def __init__(self, *args, **kwargs):
         pass
 
+    def _save_to_disk(self):
+        try:
+            os.makedirs(os.path.dirname(QUEUE_CACHE_FILE), exist_ok=True)
+            data = []
+            for it in self.items:
+                data.append({
+                    'file_id': it.file_id,
+                    'file_name': it.file_name,
+                    'path': it.path,
+                    'action_type': it.action_type,
+                    'old_value': it.old_value,
+                    'new_value': it.new_value,
+                    'timestamp': it.timestamp
+                })
+            with open(QUEUE_CACHE_FILE, 'w', encoding='utf-8') as f:
+                import json
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logging.error(f"Erro ao salvar fila no disco: {e}")
+
+    def _load_from_disk(self):
+        if os.path.exists(QUEUE_CACHE_FILE):
+            try:
+                import json
+                with open(QUEUE_CACHE_FILE, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    for d in data:
+                        it = StagingItem(
+                            d.get('file_id'), d.get('file_name'), d.get('path'),
+                            d.get('action_type'), d.get('old_value', ''), d.get('new_value', '')
+                        )
+                        it.timestamp = d.get('timestamp', time.time())
+                        self.items.append(it)
+            except Exception as e:
+                logging.error(f"Erro ao carregar fila do disco: {e}")
+
     def add_item(self, item):
         self.items.append(item)
         self.itemAdded.emit(item)
         self.queueChanged.emit(len(self.items))
+        self._save_to_disk()
 
     def add_batch_tags(self, files_list, tags_to_add="", tags_to_remove=""):
         count = 0
@@ -86,6 +128,7 @@ class StagingQueue:
                 count += 1
 
         self.queueChanged.emit(len(self.items))
+        self._save_to_disk()
         return count
 
     def remove_item(self, item):
@@ -93,11 +136,13 @@ class StagingQueue:
             self.items.remove(item)
             self.itemRemoved.emit(item)
             self.queueChanged.emit(len(self.items))
+            self._save_to_disk()
 
     def clear(self):
         self.items.clear()
         self.cleared.emit()
         self.queueChanged.emit(0)
+        self._save_to_disk()
 
     def count(self):
         return len(self.items)
@@ -136,8 +181,6 @@ class StagingQueueDialog(QDialog):
 
         layout.addLayout(header_layout)
 
-        self._update_mode_label()
-
         self.list_widget = QListWidget()
         self.list_widget.setStyleSheet("font-size: 13px;")
         layout.addWidget(self.list_widget)
@@ -169,6 +212,8 @@ class StagingQueueDialog(QDialog):
         btn_layout.addWidget(self.btn_execute)
 
         layout.addLayout(btn_layout)
+
+        self._update_mode_label()
 
     def _update_mode_label(self):
         if self.config_mgr.is_read_only():

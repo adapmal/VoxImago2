@@ -78,6 +78,12 @@ class list_update:
             if not app.show_drive_metadata:
                 files = [f for f in files if not (
                     f.get('source') == 'drive' and not f.get('path'))]
+
+            if getattr(app, 'current_folder_path_filter', None):
+                import os
+                norm_filter = os.path.normpath(app.current_folder_path_filter).lower()
+                files = [f for f in files if f.get('path') and os.path.normpath(f.get('path')).lower().startswith(norm_filter)]
+
             return list_update._sort_files(files, app.current_sort)
 
     @staticmethod

@@ -69,6 +69,20 @@ class AutoTagger:
             if 'Vídeo' in self.vocab_mgr.all_tags:
                 suggested.add('Vídeo')
 
+        # Sugerir orientação da imagem (Horizontal / Vertical)
+        local_path = file_item.get('path')
+        if local_path and os.path.exists(local_path) and ext in ['.jpg', '.jpeg', '.png', '.webp', '.heic']:
+            try:
+                from PIL import Image
+                with Image.open(local_path) as img:
+                    w, h = img.size
+                    if w > h:
+                        suggested.add('Horizontal')
+                    elif h > w:
+                        suggested.add('Vertical')
+            except Exception:
+                pass
+
         return sorted(list(suggested))
 
     def get_all_suggestions(self, file_item):
