@@ -358,6 +358,34 @@ class FileDetailsPanel(QFrame):
         self.staging_queue.add_item(item)
         self._update_diff_preview()
 
+    def _delete_file_action(self):
+        if self._is_updating or not self.current_file_item:
+            return
+
+        fid = self.current_file_item.get('file_id')
+        fname = self.current_file_item.get('name', 'N/A')
+        fpath = self.current_file_item.get('path', '')
+
+        # Esmaecer a miniatura para indicar exclusão visualmente
+        current_pixmap = self.thumbnail_label.pixmap()
+        if current_pixmap:
+            faded = QImage(current_pixmap.size(), QImage.Format.Format_ARGB32_Premultiplied)
+            faded.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(faded)
+            painter.setOpacity(0.4)
+            painter.drawPixmap(0, 0, current_pixmap)
+            painter.end()
+            self.thumbnail_label.setPixmap(QPixmap.fromImage(faded))
+
+        # Remover outras ações pendentes
+        for it in list(self.staging_queue.items):
+            if it.file_id == fid:
+                self.staging_queue.remove_item(it)
+
+        item = StagingItem(fid, fname, fpath, 'delete', old_value='', new_value='')
+        self.staging_queue.add_item(item)
+        self._update_diff_preview()
+
     def _update_diff_preview(self):
         if not self.current_file_item:
             self.diff_label.setText("Nenhuma alteração pendente.")
