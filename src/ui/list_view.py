@@ -3,7 +3,7 @@ Visualizador de lista de arquivos personalizado com menu de contexto e funcional
 '''
 
 import os
-from PyQt6.QtWidgets import QListView, QMenu, QApplication, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QSlider
+from PyQt6.QtWidgets import QListView, QMenu, QApplication, QDialog, QVBoxLayout, QHBoxLayout, QLabel, QSlider, QAbstractItemView
 from PyQt6.QtCore import Qt, QMimeData, pyqtSignal, QUrl
 from PyQt6.QtGui import QDrag, QCursor, QPixmap, QImage
 from PyQt6.QtMultimediaWidgets import QVideoWidget
@@ -17,10 +17,12 @@ except ImportError:
 
 class FileListView(QListView):
     fileSelected = pyqtSignal(object)
+    filesSelected = pyqtSignal(list)
     fileDoubleClicked = pyqtSignal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
         self.drag_start_position = None
@@ -33,9 +35,14 @@ class FileListView(QListView):
 
     def _emit_selection(self, selected, deselected):
         indexes = self.selectedIndexes()
-        if indexes:
-            file_item = indexes[0].data(Qt.ItemDataRole.UserRole)
-            self.fileSelected.emit(file_item)
+        items = []
+        for index in indexes:
+            items.append(index.data(Qt.ItemDataRole.UserRole))
+        if items:
+            self.fileSelected.emit(items[0])
+            self.filesSelected.emit(items)
+        else:
+            self.filesSelected.emit([])
 
     def _emit_double_click(self, index):
         file_item = index.data(Qt.ItemDataRole.UserRole)

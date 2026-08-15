@@ -51,13 +51,13 @@ class AutoTagger:
 
         suggested = set()
 
-        # Sugerir por Ano de criação/modificação
-        created_ts = file_item.get('createdTime') or file_item.get('modifiedTime')
-        if created_ts and isinstance(created_ts, (int, float)) and created_ts > 0:
-            try:
-                dt = datetime.datetime.fromtimestamp(created_ts)
-                year_str = str(dt.year)
-                if year_str in self.vocab_mgr.all_tags:
+        # Sugerir por Ano de criação/modificação (Desativado a pedido do usuário, que prefere usar apenas a pasta)
+        # created_ts = file_item.get('createdTime') or file_item.get('modifiedTime')
+        # if created_ts and isinstance(created_ts, (int, float)) and created_ts > 0:
+        #     try:
+        #         dt = datetime.datetime.fromtimestamp(created_ts)
+        #         year_str = str(dt.year)
+        #         if year_str in self.vocab_mgr.all_tags:
                     suggested.add(year_str)
             except Exception:
                 pass

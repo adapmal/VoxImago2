@@ -359,7 +359,7 @@ class DriveFileGalleryApp(QMainWindow):
         self.file_list_view.setUniformItemSizes(True)
         self.file_list_view.setMinimumHeight(400)
         self.file_list_view.setMinimumWidth(500)
-        self.file_list_view.fileSelected.connect(self.on_file_selected)
+        self.file_list_view.filesSelected.connect(self.on_files_selected)
         self.file_list_view.fileDoubleClicked.connect(self.on_double_click)
         self.file_list_view.verticalScrollBar().valueChanged.connect(self.on_scroll)
 
@@ -1569,8 +1569,16 @@ class DriveFileGalleryApp(QMainWindow):
             self.main_bar.search_entry.setText(f"{current} {tag_text}")
 
     def on_file_selected(self, file_item):
-        if file_item:
-            self.details_panel.update_details(file_item)
+        pass
+
+    def on_files_selected(self, files_list):
+        if files_list:
+            if len(files_list) == 1:
+                self.details_panel.update_details(files_list[0])
+            else:
+                self.details_panel.update_details_batch(files_list)
+        else:
+            self.details_panel.clear_details()
 
     def on_double_click(self, file_item):
         if file_item and file_item.get('mimeType') in ['application/vnd.google-apps.folder', 'folder']:

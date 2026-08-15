@@ -27,14 +27,19 @@ class list_update:
         filter_type = app.current_filter
 
         import os
+        from src.utils.config_manager import ConfigManager
+        config_mgr = ConfigManager()
         norm_filter = os.path.normpath(app.current_folder_path_filter).lower() if getattr(app, 'current_folder_path_filter', None) else None
-        norm_sandbox = os.path.normpath(app.config_mgr.get_sandbox_path()).lower() if app.config_mgr.is_sandbox() else None
+        norm_sandbox = os.path.normpath(config_mgr.get_sandbox_path()).lower() if config_mgr.is_sandbox() else None
+
+        # O sandbox filter deve ser absoluto sempre que estiver ativo, independentemente do tipo de busca
+        if norm_sandbox:
+            app.advanced_filters['sandbox_filter'] = norm_sandbox
 
         # Se há um filtro de pasta ativo selecionado na árvore e a busca está vazia:
         if norm_filter and not app.search_term:
             # Em vez de fazer query crua aqui, vamos usar a search_engine mas com path_filter
             app.advanced_filters['path_filter'] = norm_filter
-            app.advanced_filters['sandbox_filter'] = norm_sandbox
             
             filter_type = 'all'
             files = app.search_engine.load_files_paged(
@@ -44,7 +49,6 @@ class list_update:
 
         if not app.search_term and folder_id is None:
             app.advanced_filters['path_filter'] = norm_filter
-            app.advanced_filters['sandbox_filter'] = norm_sandbox
             
             if app.advanced_filters.get('is_starred') or app.advanced_filters.get('extension') not in [None, '']:
                 filter_type = 'all'
@@ -71,7 +75,6 @@ class list_update:
             return list_update._sort_files(all_files, app.current_sort)
         else:
             app.advanced_filters['path_filter'] = norm_filter
-            app.advanced_filters['sandbox_filter'] = norm_sandbox
             
             if app.advanced_filters.get('extension'):
                 filter_type = 'all'

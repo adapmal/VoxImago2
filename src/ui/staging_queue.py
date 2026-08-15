@@ -94,14 +94,22 @@ class StagingQueue:
                 with open(QUEUE_CACHE_FILE, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                     for d in data:
-                        it = StagingItem(
-                            d.get('file_id'), d.get('file_name'), d.get('path'),
-                            d.get('action_type'), d.get('old_value', ''), d.get('new_value', '')
-                        )
-                        it.timestamp = d.get('timestamp', time.time())
-                        self.items.append(it)
+                        try:
+                            it = StagingItem(
+                                d.get('file_id'), d.get('file_name'), d.get('path'),
+                                d.get('action_type'), d.get('old_value', ''), d.get('new_value', '')
+                            )
+                            it.timestamp = d.get('timestamp', time.time())
+                            self.items.append(it)
+                        except Exception as item_e:
+                            logging.error(f"Erro ao carregar item individual da fila: {item_e}")
             except Exception as e:
                 logging.error(f"Erro ao carregar fila do disco: {e}")
+                # Clear corrupted queue file
+                try:
+                    os.remove(QUEUE_CACHE_FILE)
+                except:
+                    pass
 
     def add_item(self, item):
         self.items.append(item)

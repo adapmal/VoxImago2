@@ -200,6 +200,8 @@ class FileDetailsPanel(QFrame):
     def update_details(self, file_item):
         self._is_updating = True
         self.current_file_item = file_item
+        self.current_files_list = [file_item]
+        self._is_batch_mode = False
 
         self.title_label.setText("Detalhes do Arquivo")
         self.name_edit.setText(file_item.get('name', 'N/A'))
@@ -261,6 +263,48 @@ class FileDetailsPanel(QFrame):
         self._is_updating = False
         self.show()
 
+    def update_details_batch(self, files_list):
+        self._is_updating = True
+        self.current_file_item = None
+        self.current_files_list = files_list
+        self._is_batch_mode = True
+
+        self.title_label.setText(f"{len(files_list)} Arquivos Selecionados")
+        self.name_edit.setText("Múltiplos Arquivos")
+        self.name_edit.setReadOnly(True)
+        self.source_label.setText("Variados")
+        self.size_label.setText("Vários")
+        self.path_label.setText("Múltiplos Caminhos")
+        self.created_label.setText("N/A")
+
+        self.description_edit.setText("")
+        self.description_edit.setPlaceholderText("Adicione tags em lote...")
+        
+        self.btn_rotate.setEnabled(not self.config_mgr.is_read_only())
+        self.btn_delete.setEnabled(not self.config_mgr.is_read_only())
+        
+        self.open_drive_button.setVisible(False)
+        self.open_folder_button.setVisible(False)
+        self.suggestions_group.setVisible(False)
+        
+        self.diff_label.setText(f"<span style='color: #6C757D;'>Modo Batch Ativo ({len(files_list)} arquivos). Alterações serão aplicadas a todos.</span>")
+        
+        # Ocultar miniatura no modo lote
+        faded = QImage(300, 300, QImage.Format.Format_ARGB32_Premultiplied)
+        faded.fill(Qt.GlobalColor.transparent)
+        self.thumbnail_label.setPixmap(QPixmap.fromImage(faded))
+
+        self._is_updating = False
+        self.show()
+
+    def clear_details(self):
+        self._is_updating = True
+        self.current_file_item = None
+        self.current_files_list = []
+        self._is_batch_mode = False
+        self.hide()
+        self._is_updating = False
+
     def _update_suggested_tags(self, file_item):
         while self.suggestions_chips_layout.count():
             item = self.suggestions_chips_layout.takeAt(0)
@@ -309,8 +353,31 @@ class FileDetailsPanel(QFrame):
         self._on_description_changed()
 
     def _on_description_changed(self, text=None):
-        if self._is_updating or not self.current_file_item or self.config_mgr.is_read_only():
+        if self._is_updating or self.config_mgr.is_read_only():
             return
+            
+        if getattr(self, '_is_batch_mode', False) and getattr(self, 'current_files_list', None):
+            new_desc = self.description_edit.text().strip()
+            # Em batch, a edição adiciona as tags para todos
+            for item in self.current_files_list:
+                fid = item.get('file_id') or item.get('id')
+                fpath = item.get('path', '')
+                fname = item.get('name', 'N/A')
+                old_desc = item.get('description', '')
+                
+                # Remover itens anteriores de edição deste mesmo arquivo
+                for it in list(self.staging_queue.items):
+                    if it.file_id == fid and it.action_type in ('set_description', 'add_tags', 'remove_tags'):
+                        self.staging_queue.remove_item(it)
+                
+                # Adicionar na fila
+                st_item = StagingItem(fid, fname, fpath, 'add_tags', old_value=old_desc, new_value=new_desc)
+                self.staging_queue.add_item(st_item)
+            return
+            
+        if not self.current_file_item:
+            return
+
         new_desc = self.description_edit.text().strip()
         self._stage_description_change(new_desc)
 
@@ -348,43 +415,55 @@ class FileDetailsPanel(QFrame):
         self._update_diff_preview()
 
     def _rotate_image_action(self):
-        if not self.current_file_item or self.config_mgr.is_read_only():
+        if self.config_mgr.is_read_only():
             return
-        fid = self.current_file_item.get('file_id') or self.current_file_item.get('id')
-        fname = self.current_file_item.get('name', '')
-        fpath = self.current_file_item.get('path', '')
+            
+        files_to_process = getattr(self, 'current_files_list', []) if getattr(self, '_is_batch_mode', False) else [self.current_file_item]
+        
+        for item_data in files_to_process:
+            if not item_data: continue
+            fid = item_data.get('file_id') or item_data.get('id')
+            fname = item_data.get('name', '')
+            fpath = item_data.get('path', '')
 
-        item = StagingItem(fid, fname, fpath, 'rotate_90', old_value='0', new_value='90')
-        self.staging_queue.add_item(item)
-        self._update_diff_preview()
+            item = StagingItem(fid, fname, fpath, 'rotate_90', old_value='0', new_value='90')
+            self.staging_queue.add_item(item)
+            
+        if not getattr(self, '_is_batch_mode', False):
+            self._update_diff_preview()
 
     def _delete_file_action(self):
-        if self._is_updating or not self.current_file_item:
+        if self._is_updating or self.config_mgr.is_read_only():
             return
+            
+        files_to_process = getattr(self, 'current_files_list', []) if getattr(self, '_is_batch_mode', False) else [self.current_file_item]
 
-        fid = self.current_file_item.get('file_id')
-        fname = self.current_file_item.get('name', 'N/A')
-        fpath = self.current_file_item.get('path', '')
+        for item_data in files_to_process:
+            if not item_data: continue
+            fid = item_data.get('file_id') or item_data.get('id')
+            fname = item_data.get('name', 'N/A')
+            fpath = item_data.get('path', '')
 
-        # Esmaecer a miniatura para indicar exclusão visualmente
-        current_pixmap = self.thumbnail_label.pixmap()
-        if current_pixmap:
-            faded = QImage(current_pixmap.size(), QImage.Format.Format_ARGB32_Premultiplied)
-            faded.fill(Qt.GlobalColor.transparent)
-            painter = QPainter(faded)
-            painter.setOpacity(0.4)
-            painter.drawPixmap(0, 0, current_pixmap)
-            painter.end()
-            self.thumbnail_label.setPixmap(QPixmap.fromImage(faded))
+            # Remover outras ações pendentes
+            for it in list(self.staging_queue.items):
+                if it.file_id == fid:
+                    self.staging_queue.remove_item(it)
 
-        # Remover outras ações pendentes
-        for it in list(self.staging_queue.items):
-            if it.file_id == fid:
-                self.staging_queue.remove_item(it)
-
-        item = StagingItem(fid, fname, fpath, 'delete', old_value='', new_value='')
-        self.staging_queue.add_item(item)
-        self._update_diff_preview()
+            item = StagingItem(fid, fname, fpath, 'delete', old_value='', new_value='')
+            self.staging_queue.add_item(item)
+            
+        if not getattr(self, '_is_batch_mode', False):
+            # Esmaecer a miniatura para indicar exclusão visualmente
+            current_pixmap = self.thumbnail_label.pixmap()
+            if current_pixmap and not current_pixmap.isNull() and current_pixmap.width() > 0:
+                faded = QImage(current_pixmap.size(), QImage.Format.Format_ARGB32_Premultiplied)
+                faded.fill(Qt.GlobalColor.transparent)
+                painter = QPainter(faded)
+                painter.setOpacity(0.4)
+                painter.drawPixmap(0, 0, current_pixmap)
+                painter.end()
+                self.thumbnail_label.setPixmap(QPixmap.fromImage(faded))
+            self._update_diff_preview()
 
     def _update_diff_preview(self):
         if not self.current_file_item:
