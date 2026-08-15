@@ -79,6 +79,23 @@ class FileDetailsPanel(QFrame):
                                 self.open_folder_button)
 
         self.main_layout.addLayout(self.form_layout)
+
+        # Seção de Tags Sugeridas pelo Auto-Tagger
+        from src.drive.auto_tagger import AutoTagger
+        from PyQt6.QtWidgets import QGroupBox, QHBoxLayout, QWidget, QMessageBox
+        from src.ui.staging_queue import StagingQueue, StagingItem
+
+        self.auto_tagger = AutoTagger()
+        self.suggestions_group = QGroupBox("💡 Tags Sugeridas (Auto-Tagger)")
+        self.suggestions_group.setStyleSheet("QGroupBox { font-weight: bold; margin-top: 10px; }")
+        self.suggestions_container_layout = QVBoxLayout(self.suggestions_group)
+
+        self.suggestions_chips_widget = QWidget()
+        self.suggestions_chips_layout = QHBoxLayout(self.suggestions_chips_widget)
+        self.suggestions_chips_layout.setContentsMargins(0, 0, 0, 0)
+        self.suggestions_container_layout.addWidget(self.suggestions_chips_widget)
+
+        self.main_layout.addWidget(self.suggestions_group)
         self.main_layout.addStretch()
 
         self.scroll_area.setWidget(self.content_widget)
@@ -137,6 +154,9 @@ class FileDetailsPanel(QFrame):
         self.description_label.setText(file_item.get('description', 'N/A'))
 
         self.current_file_item = file_item
+
+        # Atualizar Chips de Tags Sugeridas
+        self._update_suggested_tags(file_item)
 
         if file_item.get('source') == 'local' and file_item.get('webContentLink'):
             self.open_drive_button.setVisible(True)
@@ -258,3 +278,40 @@ class FileDetailsPanel(QFrame):
             self.thumbnail_thread.deleteLater()
             self.thumbnail_worker = None
             self.thumbnail_thread = None
+
+    def _update_suggested_tags(self, file_item):
+        while self.suggestions_chips_layout.count():
+            item = self.suggestions_chips_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        suggestions = self.auto_tagger.get_all_suggestions(file_item)
+        if not suggestions:
+            self.suggestions_group.setVisible(False)
+            return
+
+        self.suggestions_group.setVisible(True)
+        for tag in suggestions[:8]:
+            btn = QPushButton(f"➕ {tag}")
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setStyleSheet(
+                "QPushButton { background-color: #E2E3E5; color: #383D41; border: 1px solid #D6D8DB; border-radius: 10px; padding: 2px 6px; font-size: 11px; }"
+                "QPushButton:hover { background-color: #28A745; color: white; border-color: #1E7E34; }"
+            )
+            btn.setToolTip(f"Adicionar a tag '{tag}' à Fila de Revisão para este arquivo")
+            btn.clicked.connect(lambda checked, t=tag: self._stage_suggested_tag(t))
+            self.suggestions_chips_layout.addWidget(btn)
+
+        self.suggestions_chips_layout.addStretch()
+
+    def _stage_suggested_tag(self, tag):
+        if not self.current_file_item:
+            return
+        from src.ui.staging_queue import StagingQueue
+        queue = StagingQueue()
+        count = queue.add_batch_tags([self.current_file_item], tags_to_add=tag)
+        QMessageBox.information(
+            self, "Tag Agendada",
+            f"A tag '{tag}' foi adicionada para o arquivo '{self.current_file_item.get('name')}' na Fila de Revisão."
+        )
+
