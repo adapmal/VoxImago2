@@ -7,8 +7,9 @@ e permite filtrar o grid de imagens com um clique.
 import os
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTreeView,
-    QFileSystemModel, QHeaderView
+    QHeaderView
 )
+from PyQt6.QtGui import QFileSystemModel
 from PyQt6.QtCore import pyqtSignal, Qt, QDir
 from src.utils.config_manager import ConfigManager
 
