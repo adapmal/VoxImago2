@@ -46,16 +46,15 @@ class StagingQueue(QObject):
 
     _instance = None
 
-    def __new__(cls, parent=None):
+    def __new__(cls, *args, **kwargs):
         if cls._instance is None:
             cls._instance = super(StagingQueue, cls).__new__(cls)
+            super(StagingQueue, cls._instance).__init__()
+            cls._instance.items = []
         return cls._instance
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        if not getattr(self, '_initialized', False):
-            self._initialized = True
-            self.items = []
+    def __init__(self, *args, **kwargs):
+        pass
 
     def add_item(self, item):
         self.items.append(item)

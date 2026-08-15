@@ -25,17 +25,16 @@ class ConfigManager(QObject):
 
     _instance = None
 
-    def __new__(cls, parent=None):
+    def __new__(cls, *args, **kwargs):
         if cls._instance is None:
             cls._instance = super(ConfigManager, cls).__new__(cls)
+            super(ConfigManager, cls._instance).__init__()
+            cls._instance.settings = DEFAULT_SETTINGS.copy()
+            cls._instance.load_settings()
         return cls._instance
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        if not getattr(self, '_initialized', False):
-            self._initialized = True
-            self.settings = DEFAULT_SETTINGS.copy()
-            self.load_settings()
+    def __init__(self, *args, **kwargs):
+        pass
 
     def load_settings(self):
         try:

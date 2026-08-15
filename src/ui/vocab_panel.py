@@ -21,18 +21,17 @@ VOCAB_CACHE_FILE = os.path.join('config', 'vocab_cache.csv')
 class VocabManager:
     _instance = None
 
-    def __new__(cls):
+    def __new__(cls, *args, **kwargs):
         if cls._instance is None:
             cls._instance = super(VocabManager, cls).__new__(cls)
+            cls._instance.config_mgr = ConfigManager()
+            cls._instance.categories = {}  # { 'Categoria': ['tag1', 'tag2', ...] }
+            cls._instance.all_tags = set()
+            cls._instance.load_vocabulary()
         return cls._instance
 
-    def __init__(self):
-        if not hasattr(self, '_initialized'):
-            self._initialized = True
-            self.config_mgr = ConfigManager()
-            self.categories = {}  # { 'Categoria': ['tag1', 'tag2', ...] }
-            self.all_tags = set()
-            self.load_vocabulary()
+    def __init__(self, *args, **kwargs):
+        pass
 
     def load_vocabulary(self):
         # 1. Tentar baixar a versão mais recente da planilha online
