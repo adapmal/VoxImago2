@@ -249,8 +249,13 @@ class FileDetailsPanel(QFrame):
         local_path = file_item.get('path')
         if local_path and os.path.exists(local_path):
             try:
+                cached = None
                 if ThumbnailCache.is_thumbnail_cached(file_item):
                     cached = ThumbnailCache.get_existing_thumbnail_cache_path(file_item)
+                else:
+                    cached = ThumbnailManager.generate_local_thumbnail(file_item, size=(300, 300))
+                    
+                if cached:
                     pixmap = QPixmap(cached)
                     if not pixmap.isNull():
                         self.thumbnail_label.setPixmap(pixmap.scaled(
