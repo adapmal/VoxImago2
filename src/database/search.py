@@ -267,14 +267,14 @@ class SearchEngine:
                     filter_params.append(int(time.mktime(advanced_filters['created_after'].timetuple())))
 
                 if advanced_filters.get('path_filter'):
-                    pf = advanced_filters['path_filter']
-                    where_parts.append("(LOWER(path) LIKE ? OR LOWER(path) LIKE ?)")
-                    filter_params.extend([f"{pf}%", f"{pf.replace(chr(92), '/')}%"])
+                    pf = advanced_filters['path_filter'].replace(chr(92), '/').lower()
+                    where_parts.append("LOWER(REPLACE(path, '\\', '/')) LIKE ?")
+                    filter_params.append(f"{pf}%")
 
                 if advanced_filters.get('sandbox_filter'):
-                    sf = advanced_filters['sandbox_filter']
-                    where_parts.append("(LOWER(path) LIKE ? OR LOWER(path) LIKE ?)")
-                    filter_params.extend([f"{sf}%", f"{sf.replace(chr(92), '/')}%"])
+                    sf = advanced_filters['sandbox_filter'].replace(chr(92), '/').lower()
+                    where_parts.append("LOWER(REPLACE(path, '\\', '/')) LIKE ?")
+                    filter_params.append(f"{sf}%")
 
             details_query = f"SELECT file_id, name, path, mimeType, source, description, thumbnailLink, thumbnailPath, size, modifiedTime, createdTime, parentId, starred, webContentLink FROM files"
             if where_parts:
@@ -319,7 +319,7 @@ class SearchEngine:
             elif source == 'drive' and not folder_id:
                 files_where_clauses.append(
                     "(parentId IS NULL OR parentId = '')")
-            else:
+            elif filter_type not in ('all', 'folder'):
                 files_where_clauses.append(
                     "mimeType NOT IN ('folder', 'application/vnd.google-apps.folder')")
             if filter_type == 'image':
@@ -386,14 +386,14 @@ class SearchEngine:
                                     f"({' OR '.join(ext_conditions)})")
 
                 if advanced_filters.get('path_filter'):
-                    pf = advanced_filters['path_filter']
-                    files_where_clauses.append("(LOWER(path) LIKE ? OR LOWER(path) LIKE ?)")
-                    files_params.extend([f"{pf}%", f"{pf.replace(chr(92), '/')}%"])
+                    pf = advanced_filters['path_filter'].replace(chr(92), '/').lower()
+                    files_where_clauses.append("LOWER(REPLACE(path, '\\', '/')) LIKE ?")
+                    files_params.append(f"{pf}%")
 
                 if advanced_filters.get('sandbox_filter'):
-                    sf = advanced_filters['sandbox_filter']
-                    files_where_clauses.append("(LOWER(path) LIKE ? OR LOWER(path) LIKE ?)")
-                    files_params.extend([f"{sf}%", f"{sf.replace(chr(92), '/')}%"])
+                    sf = advanced_filters['sandbox_filter'].replace(chr(92), '/').lower()
+                    files_where_clauses.append("LOWER(REPLACE(path, '\\', '/')) LIKE ?")
+                    files_params.append(f"{sf}%")
             query = f"SELECT file_id, name, path, mimeType, source, description, thumbnailLink, thumbnailPath, size, modifiedTime, createdTime, parentId, starred, webContentLink FROM files WHERE {' AND '.join(files_where_clauses)} ORDER BY {order_by_clause} LIMIT ? OFFSET ?"
             if explorer_special:
                 query = query.replace("WHERE", "WHERE source = 'local' AND")
