@@ -15,7 +15,7 @@ from src.ui.thumbnails import ThumbnailCache, ThumbnailManager
 from src.drive.auto_tagger import AutoTagger
 from src.ui.staging_queue import StagingQueue, StagingItem
 from src.utils.config_manager import ConfigManager
-from src.database.vocab_manager import VocabManager
+from src.ui.vocab_panel import VocabManager
 
 class TagsLineEdit(QLineEdit):
     def __init__(self, vocab_list, parent=None):
