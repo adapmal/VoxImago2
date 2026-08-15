@@ -11,7 +11,7 @@ SETTINGS_FILE = os.path.join('config', 'settings.json')
 DEFAULT_SETTINGS = {
     'read_only_mode': False,
     'sandbox_mode': True,  # Ativo por padrão no desenvolvimento da v2.1
-    'sandbox_path': r'L:\_TestesBanco',
+    'sandbox_path': r'L:\Drives Compartilhados\_TestesBanco',
     'shared_cache_path': r'L:\.voximago_system\shared_index.db',
     'sheets_vocab_url': 'https://docs.google.com/spreadsheets/d/1_etBf2z9sqmdR74j4ADso47XYGgYQXljdjtBo3X74Jw/export?format=csv',
     'sheets_doc_url': 'https://docs.google.com/document/d/1huecd2o-vcoapmPcjguQwjsQAMnaAbxYw4qSXmgOo0Y/export?format=txt',
