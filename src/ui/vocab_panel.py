@@ -1,6 +1,6 @@
 '''
 Painel de Vocabulário Controlado Horizontal (Top Collapsible Controlled Vocabulary) para o VoxImago v2.1
-Exibe chips/pills organizados em 13 colunas verticais lado a lado, com cabeçalhos fixos e expansão responsiva.
+Exibe chips/pills organizados em 13 colunas verticais lado a lado, com cabeçalhos fixos, scroll vertical independente por coluna e expansão responsiva.
 '''
 
 import os
@@ -71,7 +71,6 @@ class VocabPanel(QWidget):
         self.vocab_mgr = VocabManager()
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.setMinimumHeight(180)
-        self.setMaximumHeight(350)
         self._init_ui()
 
     def _init_ui(self):
@@ -106,12 +105,12 @@ class VocabPanel(QWidget):
 
         main_layout.addLayout(top_bar)
 
-        # 2. Área com Scroll Horizontal contendo as 13 colunas verticais que esticam com a altura
+        # 2. Scroll Horizontal principal contendo as 13 colunas
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setFrameShape(QFrame.Shape.StyledPanel)
         self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.scroll_area.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         self.columns_container = QWidget()
@@ -149,7 +148,7 @@ class VocabPanel(QWidget):
             # Coluna de Categoria com cabeçalho fixo no topo e lista rolável
             col_widget = QFrame()
             col_widget.setFrameShape(QFrame.Shape.StyledPanel)
-            col_widget.setFixedWidth(160)
+            col_widget.setFixedWidth(170)
             col_widget.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
             col_widget.setStyleSheet(
                 "QFrame { background-color: #F8F9FA; border: 1px solid #CED4DA; border-radius: 6px; }"
@@ -168,16 +167,18 @@ class VocabPanel(QWidget):
             header_label.setWordWrap(True)
             col_layout.addWidget(header_label)
 
-            # Scroll individual para os itens da coluna
+            # Scroll individual para os itens da coluna (com scrollbar vertical funcional)
             tag_scroll = QScrollArea()
             tag_scroll.setWidgetResizable(True)
             tag_scroll.setFrameShape(QFrame.Shape.NoFrame)
+            tag_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            tag_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             tag_scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
             tag_scroll_content = QWidget()
             tag_layout = QVBoxLayout(tag_scroll_content)
-            tag_layout.setContentsMargins(0, 2, 0, 2)
-            tag_layout.setSpacing(2)
+            tag_layout.setContentsMargins(0, 2, 4, 2)
+            tag_layout.setSpacing(3)
             tag_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
             for tag in matching_tags:

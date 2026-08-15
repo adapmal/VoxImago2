@@ -306,9 +306,12 @@ class SearchEngine:
             if folder_id:
                 files_where_clauses.append("parentId=?")
                 files_params.append(folder_id)
-            else:
+            elif source == 'drive' and not folder_id:
                 files_where_clauses.append(
                     "(parentId IS NULL OR parentId = '')")
+            else:
+                files_where_clauses.append(
+                    "mimeType NOT IN ('folder', 'application/vnd.google-apps.folder')")
             if filter_type == 'image':
                 files_where_clauses.append("mimeType LIKE 'image/%'")
             elif filter_type == 'document':
