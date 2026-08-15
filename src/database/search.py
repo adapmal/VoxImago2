@@ -266,6 +266,16 @@ class SearchEngine:
                     where_parts.append("createdTime >= ?")
                     filter_params.append(int(time.mktime(advanced_filters['created_after'].timetuple())))
 
+                if advanced_filters.get('path_filter'):
+                    pf = advanced_filters['path_filter']
+                    where_parts.append("(LOWER(path) LIKE ? OR LOWER(path) LIKE ?)")
+                    filter_params.extend([f"{pf}%", f"{pf.replace(chr(92), '/')}%"])
+
+                if advanced_filters.get('sandbox_filter'):
+                    sf = advanced_filters['sandbox_filter']
+                    where_parts.append("(LOWER(path) LIKE ? OR LOWER(path) LIKE ?)")
+                    filter_params.extend([f"{sf}%", f"{sf.replace(chr(92), '/')}%"])
+
             details_query = f"SELECT file_id, name, path, mimeType, source, description, thumbnailLink, thumbnailPath, size, modifiedTime, createdTime, parentId, starred, webContentLink FROM files"
             if where_parts:
                 details_query += " WHERE " + " AND ".join(where_parts)
@@ -374,6 +384,16 @@ class SearchEngine:
                             if ext_conditions:
                                 files_where_clauses.append(
                                     f"({' OR '.join(ext_conditions)})")
+
+                if advanced_filters.get('path_filter'):
+                    pf = advanced_filters['path_filter']
+                    files_where_clauses.append("(LOWER(path) LIKE ? OR LOWER(path) LIKE ?)")
+                    files_params.extend([f"{pf}%", f"{pf.replace(chr(92), '/')}%"])
+
+                if advanced_filters.get('sandbox_filter'):
+                    sf = advanced_filters['sandbox_filter']
+                    files_where_clauses.append("(LOWER(path) LIKE ? OR LOWER(path) LIKE ?)")
+                    files_params.extend([f"{sf}%", f"{sf.replace(chr(92), '/')}%"])
             query = f"SELECT file_id, name, path, mimeType, source, description, thumbnailLink, thumbnailPath, size, modifiedTime, createdTime, parentId, starred, webContentLink FROM files WHERE {' AND '.join(files_where_clauses)} ORDER BY {order_by_clause} LIMIT ? OFFSET ?"
             if explorer_special:
                 query = query.replace("WHERE", "WHERE source = 'local' AND")

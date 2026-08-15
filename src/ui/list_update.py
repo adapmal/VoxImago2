@@ -32,21 +32,20 @@ class list_update:
 
         # Se há um filtro de pasta ativo selecionado na árvore e a busca está vazia:
         if norm_filter and not app.search_term:
-            app.indexer.ensure_conn()
-            query = """
-                SELECT file_id, name, path, mimeType, source, description, thumbnailLink, thumbnailPath, size, modifiedTime, createdTime, parentId, starred, webContentLink 
-                FROM files 
-                WHERE mimeType NOT IN ('folder', 'application/vnd.google-apps.folder')
-            """
-            app.indexer.cursor.execute(query)
-            rows = app.indexer.cursor.fetchall()
-            files = app.indexer._build_file_objects_from_search(rows)
-            files = [f for f in files if f.get('path') and os.path.normpath(f.get('path')).lower().startswith(norm_filter)]
-            if norm_sandbox:
-                files = [f for f in files if f.get('path') and os.path.normpath(f.get('path')).lower().startswith(norm_sandbox)]
+            # Em vez de fazer query crua aqui, vamos usar a search_engine mas com path_filter
+            app.advanced_filters['path_filter'] = norm_filter
+            app.advanced_filters['sandbox_filter'] = norm_sandbox
+            
+            filter_type = 'all'
+            files = app.search_engine.load_files_paged(
+                'local', app.current_page, app.page_size, None, app.current_sort, filter_type, None, app.advanced_filters, explorer_special=app.explorer_special_active
+            )
             return list_update._sort_files(files, app.current_sort)
 
         if not app.search_term and folder_id is None:
+            app.advanced_filters['path_filter'] = norm_filter
+            app.advanced_filters['sandbox_filter'] = norm_sandbox
+            
             if app.advanced_filters.get('is_starred') or app.advanced_filters.get('extension') not in [None, '']:
                 filter_type = 'all'
                 local_files = app.search_engine.load_files_paged(
@@ -69,13 +68,11 @@ class list_update:
                     )
                 all_files = local_files + drive_files
 
-            if norm_filter:
-                all_files = [f for f in all_files if f.get('path') and os.path.normpath(f.get('path')).lower().startswith(norm_filter)]
-            if norm_sandbox:
-                all_files = [f for f in all_files if f.get('path') and os.path.normpath(f.get('path')).lower().startswith(norm_sandbox)]
-
             return list_update._sort_files(all_files, app.current_sort)
         else:
+            app.advanced_filters['path_filter'] = norm_filter
+            app.advanced_filters['sandbox_filter'] = norm_sandbox
+            
             if app.advanced_filters.get('extension'):
                 filter_type = 'all'
             files = app.search_engine.load_files_paged(
@@ -85,11 +82,6 @@ class list_update:
             if not app.show_drive_metadata:
                 files = [f for f in files if not (
                     f.get('source') == 'drive' and not f.get('path'))]
-
-            if norm_filter:
-                files = [f for f in files if f.get('path') and os.path.normpath(f.get('path')).lower().startswith(norm_filter)]
-            if norm_sandbox:
-                files = [f for f in files if f.get('path') and os.path.normpath(f.get('path')).lower().startswith(norm_sandbox)]
 
             return list_update._sort_files(files, app.current_sort)
 
