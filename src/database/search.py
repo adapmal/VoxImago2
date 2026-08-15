@@ -268,13 +268,15 @@ class SearchEngine:
 
                 if advanced_filters.get('path_filter'):
                     pf = advanced_filters['path_filter'].replace(chr(92), '/').lower()
+                    # Apenas filhos (começam com pf/) para não exibir a própria pasta
                     where_parts.append("LOWER(REPLACE(path, '\\', '/')) LIKE ?")
-                    filter_params.append(f"{pf}%")
+                    filter_params.append(f"{pf}/%")
 
                 if advanced_filters.get('sandbox_filter'):
                     sf = advanced_filters['sandbox_filter'].replace(chr(92), '/').lower()
-                    where_parts.append("LOWER(REPLACE(path, '\\', '/')) LIKE ?")
-                    filter_params.append(f"{sf}%")
+                    where_parts.append("(LOWER(REPLACE(path, '\\', '/')) = ? OR LOWER(REPLACE(path, '\\', '/')) LIKE ?)")
+                    filter_params.append(sf)
+                    filter_params.append(f"{sf}/%")
 
             details_query = f"SELECT file_id, name, path, mimeType, source, description, thumbnailLink, thumbnailPath, size, modifiedTime, createdTime, parentId, starred, webContentLink FROM files"
             if where_parts:

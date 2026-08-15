@@ -49,12 +49,13 @@ class FileListView(QListView):
         self.fileDoubleClicked.emit(file_item)
 
     def mousePressEvent(self, event):
-        self.drag_start_position = event.pos()
+        super().mousePressEvent(event)
         if event.button() == Qt.MouseButton.LeftButton:
             index = self.indexAt(event.pos())
             if index.isValid():
-                self.setCurrentIndex(index)
-        super().mousePressEvent(event)
+                self.drag_start_position = event.pos()
+            else:
+                self.drag_start_position = None
 
     def mouseMoveEvent(self, event):
         if self.drag_start_position is not None and (event.pos() - self.drag_start_position).manhattanLength() > QApplication.startDragDistance():
