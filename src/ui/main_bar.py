@@ -63,6 +63,29 @@ class MainBar(QFrame):
         self.unified_layout.addSpacing(5)
         self.unified_layout.addStretch()
 
+        # Botão de alternância de modo (Leitura / Edição) e indicador Sandbox
+        from src.utils.config_manager import ConfigManager
+        from src.utils.sandbox_helper import generate_sample_test_data, ensure_sandbox_directory
+
+        self.config_mgr = ConfigManager()
+
+        self.sandbox_badge = QLabel("🧪 Sandbox (L:\\_TestesBanco)")
+        self.sandbox_badge.setStyleSheet(
+            "background-color: #FFF3CD; color: #856404; border: 1px solid #FFEEBA; border-radius: 4px; padding: 4px 8px; font-weight: bold; font-size: 11px;")
+        self.sandbox_badge.setToolTip("Ambiente seguro de testes ativo (L:\\_TestesBanco). O acervo oficial não é afetado.")
+        self.unified_layout.addWidget(self.sandbox_badge)
+        self.unified_layout.addSpacing(5)
+
+        self.mode_toggle_btn = QPushButton()
+        self.mode_toggle_btn.setFixedHeight(34)
+        self.mode_toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.mode_toggle_btn.clicked.connect(self._toggle_read_only_mode)
+        self.unified_layout.addWidget(self.mode_toggle_btn)
+        self.unified_layout.addSpacing(5)
+
+        self._update_mode_ui()
+        self.config_mgr.modeChanged.connect(lambda k, v: self._update_mode_ui())
+
         self.action_scan_options = QAction("📂 Selecionar Pastas Locais", self)
         self.action_scan_options.setToolTip(
             "Escolha quais pastas do seu computador serão monitoradas e sincronizadas.")
@@ -75,6 +98,18 @@ class MainBar(QFrame):
         self.action_clear_cache = QAction("🧹 Limpar Cache", self)
         self.action_clear_cache.setToolTip(
             "Remove arquivos temporários e dados em cache para liberar espaço e corrigir possíveis erros.")
+
+        self.action_toggle_read_only = QAction("🔒 Alternar Modo Somente Leitura / Edição", self)
+        self.action_toggle_read_only.setToolTip("Alterna o aplicativo entre modo somente leitura (seguro) e modo de edição.")
+        self.action_toggle_read_only.triggered.connect(self._toggle_read_only_mode)
+
+        self.action_toggle_sandbox = QAction("🧪 Alternar Modo Sandbox (L:\\_TestesBanco)", self)
+        self.action_toggle_sandbox.setToolTip("Ativa ou desativa o ambiente seguro de testes em L:\\_TestesBanco.")
+        self.action_toggle_sandbox.triggered.connect(self._toggle_sandbox_mode)
+
+        self.action_create_sandbox_sample = QAction("📦 Gerar Amostra de Teste (30-50 Fotos)", self)
+        self.action_create_sandbox_sample.setToolTip("Copia uma amostra representativa de arquivos para L:\\_TestesBanco.")
+        self.action_create_sandbox_sample.triggered.connect(self._generate_sandbox_sample)
 
         self.view_mode_group = QActionGroup(self)
         self.view_mode_group.setExclusive(True)
@@ -94,6 +129,13 @@ class MainBar(QFrame):
         self.view_mode_group.addAction(self.action_list_view)
 
         self.tools_menu = QMenu("Ferramentas", self)
+
+        # Submenu Modos e Permissões
+        self.menu_modes = QMenu("⚙️ Modos & Permissões", self.tools_menu)
+        self.menu_modes.addAction(self.action_toggle_read_only)
+        self.menu_modes.addAction(self.action_toggle_sandbox)
+        self.menu_modes.addAction(self.action_create_sandbox_sample)
+        self.tools_menu.addMenu(self.menu_modes)
 
         # Submenu Utilitários
         self.menu_utils = QMenu("🛠️ Utilitários", self.tools_menu)
@@ -246,3 +288,53 @@ class MainBar(QFrame):
         default_pixmap = create_default_avatar(36)
         self.avatar_label.setIcon(QIcon(default_pixmap))
         self.user_profile = {}
+
+    def _update_mode_ui(self):
+        is_ro = self.config_mgr.is_read_only()
+        is_sb = self.config_mgr.is_sandbox()
+
+        if is_ro:
+            self.mode_toggle_btn.setText("🔒 Somente Leitura")
+            self.mode_toggle_btn.setStyleSheet(
+                "background-color: #E2E3E5; color: #383D41; border: 1px solid #D6D8DB; border-radius: 4px; padding: 4px 10px; font-weight: bold; font-size: 12px;")
+            self.mode_toggle_btn.setToolTip("Modo Somente Leitura ativo. Ações de edição estão bloqueadas.")
+        else:
+            self.mode_toggle_btn.setText("✏️ Modo Edição")
+            self.mode_toggle_btn.setStyleSheet(
+                "background-color: #D4EDDA; color: #155724; border: 1px solid #C3E6CB; border-radius: 4px; padding: 4px 10px; font-weight: bold; font-size: 12px;")
+            self.mode_toggle_btn.setToolTip("Modo Edição ativo. Você pode alterar tags, renomear e mover arquivos.")
+
+        self.sandbox_badge.setVisible(is_sb)
+
+    def _toggle_read_only_mode(self):
+        current = self.config_mgr.is_read_only()
+        self.config_mgr.set_read_only(not current)
+
+    def _toggle_sandbox_mode(self):
+        from PyQt6.QtWidgets import QMessageBox
+        current = self.config_mgr.is_sandbox()
+        new_val = not current
+        self.config_mgr.set_sandbox(new_val)
+        status_str = "ATIVADO (L:\\_TestesBanco)" if new_val else "DESATIVADO (Modo Produção Oficial)"
+        QMessageBox.information(
+            self,
+            "Ambiente Sandbox",
+            f"O Modo Sandbox foi {status_str}.\n\nAo utilizar o Modo Sandbox, todas as buscas e edições ocorrem em 'L:\\_TestesBanco'."
+        )
+
+    def _generate_sandbox_sample(self):
+        from PyQt6.QtWidgets import QFileDialog, QMessageBox
+        from src.utils.sandbox_helper import generate_sample_test_data
+
+        source_dir = QFileDialog.getExistingDirectory(
+            self,
+            "Selecione uma pasta com fotos de origem para copiar amostras de teste",
+            "L:\\"
+        )
+        if source_dir:
+            ok, msg, count = generate_sample_test_data(source_dir, max_files=50)
+            if ok:
+                QMessageBox.information(self, "Amostra de Testes Gerada", msg)
+            else:
+                QMessageBox.warning(self, "Erro ao Gerar Amostra", msg)
+
