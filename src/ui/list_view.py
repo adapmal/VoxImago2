@@ -19,6 +19,7 @@ class FileListView(QListView):
     fileSelected = pyqtSignal(object)
     filesSelected = pyqtSignal(list)
     fileDoubleClicked = pyqtSignal(object)
+    deleteRequested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -32,6 +33,12 @@ class FileListView(QListView):
         super().setModel(model)
         if self.selectionModel():
             self.selectionModel().selectionChanged.connect(self._emit_selection)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Delete:
+            if self.selectedIndexes():
+                self.deleteRequested.emit()
+        super().keyPressEvent(event)
 
     def _emit_selection(self, selected, deselected):
         indexes = self.selectedIndexes()

@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
     QFrame, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFormLayout, QScrollArea, QMessageBox, QGroupBox, QLineEdit, QCompleter
 )
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QImage, QPainter, QPixmap
 from PyQt6.QtCore import Qt
 from src.utils.utils import format_size
 from src.ui.thumbnails import ThumbnailCache, ThumbnailManager

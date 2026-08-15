@@ -213,7 +213,23 @@ class StagingQueueDialog(QDialog):
 
         btn_layout.addStretch()
 
-        self.btn_execute = QPushButton("🚀 Executar Alterações")
+        self.btn_import = QPushButton("📂 Importar")
+        self.btn_import.clicked.connect(self._import_queue)
+        btn_layout.addWidget(self.btn_import)
+
+        self.btn_export = QPushButton("💾 Exportar")
+        self.btn_export.clicked.connect(self._export_queue)
+        btn_layout.addWidget(self.btn_export)
+
+        btn_layout.addStretch()
+
+        self.btn_execute_next = QPushButton("▶️ Executar Próxima")
+        self.btn_execute_next.setStyleSheet(
+            "background-color: #17A2B8; color: white; font-weight: bold; font-size: 13px; padding: 6px 16px;")
+        self.btn_execute_next.clicked.connect(self._execute_next)
+        btn_layout.addWidget(self.btn_execute_next)
+
+        self.btn_execute = QPushButton("🚀 Executar Todas")
         self.btn_execute.setStyleSheet(
             "background-color: #28A745; color: white; font-weight: bold; font-size: 13px; padding: 6px 16px;")
         self.btn_execute.clicked.connect(self._execute_queue)
@@ -303,76 +319,9 @@ class StagingQueueDialog(QDialog):
 
         for item in list(self.queue.items):
             try:
-                # Processar alteração de tags / descrição
-                if item.action_type in ('add_tags', 'remove_tags', 'set_description'):
-                    new_desc = item.old_value
-                    if item.action_type == 'add_tags':
-                        tags = [t.strip() for t in item.new_value.split(',') if t.strip()]
-                        existing_tags = [t.strip() for t in item.old_value.split(',') if t.strip()]
-                        for t in tags:
-                            if t not in existing_tags:
-                                existing_tags.append(t)
-                        new_desc = ", ".join(existing_tags)
-                    elif item.action_type == 'remove_tags':
-                        tags_to_rem = [t.strip().lower() for t in item.new_value.split(',') if t.strip()]
-                        existing_tags = [t.strip() for t in item.old_value.split(',') if t.strip()]
-                        existing_tags = [t for t in existing_tags if t.lower() not in tags_to_rem]
-                        new_desc = ", ".join(existing_tags)
-                    elif item.action_type == 'set_description':
-                        new_desc = item.new_value
-
-                    # Atualizar localmente no banco SQLite se indexer estiver presente
-                    if self.db_indexer and item.file_id:
-                        self.db_indexer.update_description(item.file_id, new_desc, commit=True)
-
-                    # Atualizar na API do Google Drive se o serviço de drive estiver ativo
-                    if self.drive_service and item.file_id and not self.config_mgr.is_sandbox():
-                        try:
-                            self.drive_service.files().update(
-                                fileId=item.file_id, 
-                                body={'description': new_desc}, 
-                                supportsAllDrives=True
-                            ).execute()
-                        except Exception as e:
-                            logging.error(f"Erro na API Drive ao atualizar desc {item.file_id}: {e}")
-
-                elif item.action_type == 'rename':
-                    new_name = item.new_value
-                    if self.db_indexer and item.file_id:
-                        self.db_indexer.cursor.execute("UPDATE files SET name = ?, name_normalized = ? WHERE file_id = ?", (new_name, new_name.lower(), item.file_id))
-                        self.db_indexer.conn.commit()
-                    if self.drive_service and item.file_id and not self.config_mgr.is_sandbox():
-                        self.drive_service.files().update(
-                            fileId=item.file_id, 
-                            body={'name': new_name}, 
-                            supportsAllDrives=True
-                        ).execute()
-
-                elif item.action_type == 'delete':
-                    if self.db_indexer and item.file_id:
-                        self.db_indexer.cursor.execute("DELETE FROM files WHERE file_id = ?", (item.file_id,))
-                        self.db_indexer.conn.commit()
-                    if self.drive_service and item.file_id and not self.config_mgr.is_sandbox():
-                        self.drive_service.files().update(
-                            fileId=item.file_id, 
-                            body={'trashed': True}, 
-                            supportsAllDrives=True
-                        ).execute()
-
-                elif item.action_type == 'rotate_90':
-                    if item.path and os.path.exists(item.path):
-                        try:
-                            from PIL import Image
-                            with Image.open(item.path) as img:
-                                img = img.rotate(-90, expand=True)
-                                img.save(item.path)
-                        except Exception as e:
-                            logging.error(f"Erro ao rotacionar localmente {item.path}: {e}")
-                            errors.append(f"Erro na rotação local {item.file_name}: {e}")
-
+                self._execute_single_item(item)
                 executed_count += 1
                 self.queue.remove_item(item)
-
             except Exception as e:
                 logging.error(f"Erro ao executar item {item.file_name}: {e}")
                 errors.append(f"{item.file_name}: {e}")
@@ -390,3 +339,131 @@ class StagingQueueDialog(QDialog):
 
         self.executionCompleted.emit(executed_count)
         self.accept()
+
+    def _execute_next(self):
+        if self.config_mgr.is_read_only() or self.queue.count() == 0:
+            return
+
+        item = self.queue.items[0]
+        try:
+            self._execute_single_item(item)
+            self.queue.remove_item(item)
+            self.executionCompleted.emit(1)
+        except Exception as e:
+            logging.error(f"Erro ao executar proxima: {e}")
+            QMessageBox.warning(self, "Erro", f"Falha ao executar o item: {e}")
+
+    def _execute_single_item(self, item):
+        # Processar alteração de tags / descrição
+        if item.action_type in ('add_tags', 'remove_tags', 'set_description'):
+            new_desc = item.old_value
+            if item.action_type == 'add_tags':
+                tags = [t.strip() for t in item.new_value.split(',') if t.strip()]
+                existing_tags = [t.strip() for t in item.old_value.split(',') if t.strip()]
+                for t in tags:
+                    if t not in existing_tags:
+                        existing_tags.append(t)
+                new_desc = ", ".join(existing_tags)
+            elif item.action_type == 'remove_tags':
+                tags_to_rem = [t.strip().lower() for t in item.new_value.split(',') if t.strip()]
+                existing_tags = [t.strip() for t in item.old_value.split(',') if t.strip()]
+                existing_tags = [t for t in existing_tags if t.lower() not in tags_to_rem]
+                new_desc = ", ".join(existing_tags)
+            elif item.action_type == 'set_description':
+                new_desc = item.new_value
+
+            # Atualizar localmente no banco SQLite se indexer estiver presente
+            if self.db_indexer and item.file_id:
+                self.db_indexer.update_description(item.file_id, new_desc, commit=True)
+
+            # Atualizar na API do Google Drive se o serviço de drive estiver ativo
+            if self.drive_service and item.file_id:
+                try:
+                    self.drive_service.files().update(
+                        fileId=item.file_id, 
+                        body={'description': new_desc}, 
+                        supportsAllDrives=True
+                    ).execute()
+                except Exception as e:
+                    logging.error(f"Erro na API Drive ao atualizar desc {item.file_id}: {e}")
+                    raise e
+
+        elif item.action_type == 'rename':
+            new_name = item.new_value
+            if self.db_indexer and item.file_id:
+                self.db_indexer.cursor.execute("UPDATE files SET name = ?, name_normalized = ? WHERE file_id = ?", (new_name, new_name.lower(), item.file_id))
+                self.db_indexer.conn.commit()
+            if self.drive_service and item.file_id:
+                self.drive_service.files().update(
+                    fileId=item.file_id, 
+                    body={'name': new_name}, 
+                    supportsAllDrives=True
+                ).execute()
+
+        elif item.action_type == 'delete':
+            if self.db_indexer and item.file_id:
+                self.db_indexer.cursor.execute("DELETE FROM files WHERE file_id = ?", (item.file_id,))
+                self.db_indexer.conn.commit()
+            if self.drive_service and item.file_id:
+                self.drive_service.files().update(
+                    fileId=item.file_id, 
+                    body={'trashed': True}, 
+                    supportsAllDrives=True
+                ).execute()
+
+        elif item.action_type == 'rotate_90':
+            if item.path and os.path.exists(item.path):
+                from PIL import Image
+                with Image.open(item.path) as img:
+                    img = img.rotate(-90, expand=True)
+                    img.save(item.path)
+
+    def _export_queue(self):
+        from PyQt6.QtWidgets import QFileDialog
+        import json
+        if self.queue.count() == 0:
+            return
+        
+        filepath, _ = QFileDialog.getSaveFileName(self, "Exportar Fila", "", "JSON Files (*.json)")
+        if filepath:
+            try:
+                data = []
+                for it in self.queue.items:
+                    data.append({
+                        'file_id': it.file_id,
+                        'file_name': it.file_name,
+                        'path': it.path,
+                        'action_type': it.action_type,
+                        'old_value': it.old_value,
+                        'new_value': it.new_value,
+                        'timestamp': it.timestamp
+                    })
+                with open(filepath, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=4, ensure_ascii=False)
+                QMessageBox.information(self, "Sucesso", "Fila exportada com sucesso.")
+            except Exception as e:
+                QMessageBox.warning(self, "Erro", f"Falha ao exportar: {e}")
+
+    def _import_queue(self):
+        from PyQt6.QtWidgets import QFileDialog
+        import json
+        
+        filepath, _ = QFileDialog.getOpenFileName(self, "Importar Fila", "", "JSON Files (*.json)")
+        if filepath:
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                count = 0
+                for d in data:
+                    it = StagingItem(
+                        d.get('file_id'), d.get('file_name', ''), d.get('path', ''),
+                        d.get('action_type'), d.get('old_value', ''), d.get('new_value', '')
+                    )
+                    it.timestamp = d.get('timestamp', time.time())
+                    self.queue.add_item(it)
+                    count += 1
+                
+                QMessageBox.information(self, "Sucesso", f"{count} itens importados com sucesso.")
+            except Exception as e:
+                QMessageBox.warning(self, "Erro", f"Falha ao importar: {e}")

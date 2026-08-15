@@ -114,6 +114,7 @@ class VocabPanel(QWidget):
         self.scroll_area.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         self.columns_container = QWidget()
+        self.columns_container.setFixedHeight(220)  # Força altura fixa para acionar scrollbars internos
         self.columns_layout = QHBoxLayout(self.columns_container)
         self.columns_layout.setContentsMargins(4, 4, 4, 4)
         self.columns_layout.setSpacing(10)

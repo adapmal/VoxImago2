@@ -350,7 +350,7 @@ class DriveFileGalleryApp(QMainWindow):
         self.file_list_model = FileListModel([])
         self.file_list_view.setModel(self.file_list_model)
         self.file_list_view.setSelectionMode(
-            QListView.SelectionMode.SingleSelection)
+            QAbstractItemView.SelectionMode.ExtendedSelection)
         self.file_list_delegate = FileListDelegate(
             self.file_list_view, indexer=self.indexer)
         self.file_list_delegate.requestThumbnail.connect(
@@ -362,6 +362,7 @@ class DriveFileGalleryApp(QMainWindow):
         self.file_list_view.filesSelected.connect(self.on_files_selected)
         self.file_list_view.fileDoubleClicked.connect(self.on_double_click)
         self.file_list_view.verticalScrollBar().valueChanged.connect(self.on_scroll)
+        self.file_list_view.deleteRequested.connect(self.details_panel._delete_file_action)
 
         self.set_view_mode("grid")
         self.file_list_view.setResizeMode(QListView.ResizeMode.Adjust)
