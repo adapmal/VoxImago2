@@ -197,10 +197,10 @@ class FileIndexer:
                     "ALTER TABLE files ADD COLUMN name_aggressive TEXT")
 
             self.conn.commit()
-            print("✅ Migração de colunas concluída")
+            print("[OK] Migracao de colunas concluida")
 
         except Exception as e:
-            print(f"⚠️ Erro na migração de colunas: {e}")
+            print(f"[AVISO] Erro na migracao de colunas: {e}")
             self.conn.rollback()
 
     def _create_performance_indices(self):
@@ -211,12 +211,12 @@ class FileIndexer:
             if 'name_normalized' in columns:
                 self.cursor.execute(
                     'CREATE INDEX IF NOT EXISTS idx_files_name_normalized ON files(name_normalized) WHERE source="local"')
-                print("📊 Índice name_normalized criado")
+                print("[INFO] Indice name_normalized criado")
 
             if 'name_aggressive' in columns:
                 self.cursor.execute(
                     'CREATE INDEX IF NOT EXISTS idx_files_name_aggressive ON files(name_aggressive) WHERE source="local"')
-                print("📊 Índice name_aggressive criado")
+                print("[INFO] Indice name_aggressive criado")
 
             self.cursor.execute(
                 'CREATE INDEX IF NOT EXISTS idx_files_name_lower_local ON files(LOWER(name)) WHERE source="local"')
@@ -226,7 +226,7 @@ class FileIndexer:
             self.conn.commit()
 
         except Exception as e:
-            print(f"⚠️ Erro ao criar índices de performance: {e}")
+            print(f"[AVISO] Erro ao criar indices de performance: {e}")
             self.conn.rollback()
 
     def save_files_in_batch(self, files_list, source, simulate_error=False):

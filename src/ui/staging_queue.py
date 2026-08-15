@@ -52,8 +52,8 @@ class StagingQueue(QObject):
         return cls._instance
 
     def __init__(self, parent=None):
-        if not hasattr(self, '_initialized'):
-            super().__init__(parent)
+        super().__init__(parent)
+        if not getattr(self, '_initialized', False):
             self._initialized = True
             self.items = []
 
