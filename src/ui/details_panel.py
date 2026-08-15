@@ -6,12 +6,15 @@ import subprocess
 import webbrowser
 from datetime import datetime
 from PyQt6.QtWidgets import (
-    QFrame, QWidget, QVBoxLayout, QLabel, QPushButton, QFormLayout, QScrollArea, QMessageBox
+    QFrame, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QFormLayout, QScrollArea, QMessageBox, QGroupBox
 )
 from PyQt6.QtGui import QPixmap, QFont
 from PyQt6.QtCore import Qt
 from src.utils.utils import format_size
 from src.ui.thumbnails import ThumbnailCache, ThumbnailManager
+from src.drive.auto_tagger import AutoTagger
+from src.ui.staging_queue import StagingQueue, StagingItem
 
 
 class FileDetailsPanel(QFrame):
@@ -81,10 +84,6 @@ class FileDetailsPanel(QFrame):
         self.main_layout.addLayout(self.form_layout)
 
         # Seção de Tags Sugeridas pelo Auto-Tagger
-        from src.drive.auto_tagger import AutoTagger
-        from PyQt6.QtWidgets import QGroupBox, QHBoxLayout, QWidget, QMessageBox
-        from src.ui.staging_queue import StagingQueue, StagingItem
-
         self.auto_tagger = AutoTagger()
         self.suggestions_group = QGroupBox("💡 Tags Sugeridas (Auto-Tagger)")
         self.suggestions_group.setStyleSheet("QGroupBox { font-weight: bold; margin-top: 10px; }")

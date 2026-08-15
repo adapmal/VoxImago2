@@ -20,15 +20,18 @@ DEFAULT_SETTINGS = {
 }
 
 
-class ConfigManager(QObject):
+class _ConfigSignals(QObject):
     modeChanged = pyqtSignal(str, object)  # (key_name, new_value)
 
+
+class ConfigManager:
     _instance = None
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
-            cls._instance = super(ConfigManager, cls).__new__(cls)
-            super(ConfigManager, cls._instance).__init__()
+            cls._instance = super().__new__(cls)
+            cls._instance.signals = _ConfigSignals()
+            cls._instance.modeChanged = cls._instance.signals.modeChanged
             cls._instance.settings = DEFAULT_SETTINGS.copy()
             cls._instance.load_settings()
         return cls._instance

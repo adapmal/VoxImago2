@@ -38,18 +38,24 @@ class StagingItem:
         return f"[{self.action_type}] {self.new_value}"
 
 
-class StagingQueue(QObject):
+class _StagingSignals(QObject):
     queueChanged = pyqtSignal(int)  # Emitido com o número total de itens pendentes
     itemAdded = pyqtSignal(object)
     itemRemoved = pyqtSignal(object)
     cleared = pyqtSignal()
 
+
+class StagingQueue:
     _instance = None
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
-            cls._instance = super(StagingQueue, cls).__new__(cls)
-            super(StagingQueue, cls._instance).__init__()
+            cls._instance = super().__new__(cls)
+            cls._instance.signals = _StagingSignals()
+            cls._instance.queueChanged = cls._instance.signals.queueChanged
+            cls._instance.itemAdded = cls._instance.signals.itemAdded
+            cls._instance.itemRemoved = cls._instance.signals.itemRemoved
+            cls._instance.cleared = cls._instance.signals.cleared
             cls._instance.items = []
         return cls._instance
 

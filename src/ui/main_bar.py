@@ -63,12 +63,14 @@ class MainBar(QFrame):
         self.unified_layout.addSpacing(5)
         self.unified_layout.addStretch()
 
-        # Botão de alternância de modo (Leitura / Edição) e indicador Sandbox
+        print('DEBUG: MainBar passo 1')
         from src.utils.config_manager import ConfigManager
         from src.utils.sandbox_helper import generate_sample_test_data, ensure_sandbox_directory
 
+        print('DEBUG: MainBar passo 2 - ConfigManager')
         self.config_mgr = ConfigManager()
 
+        print('DEBUG: MainBar passo 3 - Sandbox badge')
         self.sandbox_badge = QLabel("🧪 Sandbox (L:\\_TestesBanco)")
         self.sandbox_badge.setStyleSheet(
             "background-color: #FFF3CD; color: #856404; border: 1px solid #FFEEBA; border-radius: 4px; padding: 4px 8px; font-weight: bold; font-size: 11px;")
@@ -76,6 +78,7 @@ class MainBar(QFrame):
         self.unified_layout.addWidget(self.sandbox_badge)
         self.unified_layout.addSpacing(5)
 
+        print('DEBUG: MainBar passo 4 - Mode toggle btn')
         self.mode_toggle_btn = QPushButton()
         self.mode_toggle_btn.setFixedHeight(34)
         self.mode_toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -83,6 +86,7 @@ class MainBar(QFrame):
         self.unified_layout.addWidget(self.mode_toggle_btn)
         self.unified_layout.addSpacing(5)
 
+        print('DEBUG: MainBar passo 5 - StagingQueue')
         from src.ui.staging_queue import StagingQueue, StagingQueueDialog
 
         self.staging_queue = StagingQueue()
@@ -98,8 +102,10 @@ class MainBar(QFrame):
 
         self.staging_queue.queueChanged.connect(self._update_staging_button)
 
+        print('DEBUG: MainBar passo 6 - update_mode_ui')
         self._update_mode_ui()
         self.config_mgr.modeChanged.connect(lambda k, v: self._update_mode_ui())
+        print('DEBUG: MainBar passo 7 - actions')
 
         self.action_scan_options = QAction("📂 Selecionar Pastas Locais", self)
         self.action_scan_options.setToolTip(
@@ -212,8 +218,9 @@ class MainBar(QFrame):
             if tip:
                 QToolTip.showText(QCursor.pos(), tip)
 
-        for menu in [self.menu_utils, self.menu_diag, self.menu_view]:
+        for menu in [self.menu_modes, self.menu_utils, self.menu_diag, self.menu_view]:
             menu.hovered.connect(show_action_tooltip)
+        print('DEBUG: MainBar FIM')
 
     def _show_profile_dialog(self):
         print("DEBUG: _show_profile_dialog chamado")

@@ -34,20 +34,7 @@ class VocabManager:
         pass
 
     def load_vocabulary(self):
-        # 1. Tentar baixar a versão mais recente da planilha online
-        url = self.config_mgr.get('sheets_vocab_url')
-        downloaded = False
-        if url:
-            try:
-                os.makedirs(os.path.dirname(VOCAB_CACHE_FILE), exist_ok=True)
-                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(req, timeout=5) as response, open(VOCAB_CACHE_FILE, 'wb') as out_file:
-                    out_file.write(response.read())
-                downloaded = True
-            except Exception as e:
-                logging.warning(f"Não foi possível baixar vocabulário online, usando cache local: {e}")
-
-        # 2. Ler do cache CSV local
+        # 1. Ler imediatamente do cache CSV local para inicialização instantânea
         if os.path.exists(VOCAB_CACHE_FILE):
             try:
                 with open(VOCAB_CACHE_FILE, 'r', encoding='utf-8-sig', errors='ignore') as f:
