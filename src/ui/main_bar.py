@@ -356,7 +356,7 @@ class MainBar(QFrame):
         current = self.config_mgr.is_sandbox()
         new_val = not current
         self.config_mgr.set_sandbox(new_val)
-        status_str = "ATIVADO (L:\\_TestesBanco)" if new_val else "DESATIVADO (Modo Produção Oficial)"
+        status_str = "ATIVADO (L:\\Drives Compartilhados\\_TestesBanco)" if new_val else "DESATIVADO (Modo Produção Oficial)"
         QMessageBox.information(
             self,
             "Ambiente Sandbox",

@@ -85,6 +85,13 @@ class FileListDelegate(QStyledItemDelegate):
         else:
             painter.fillRect(rect, option.palette.base())
 
+        from src.ui.staging_queue import StagingQueue
+        queue = StagingQueue()
+        fid = file_item.get('file_id') or file_item.get('id')
+        is_deleted = any(it.file_id == fid and it.action_type == 'delete' for it in queue.items)
+        if is_deleted:
+            painter.setOpacity(0.3)
+
         parent_view = self.parent()
         is_grid = hasattr(parent_view, 'viewMode') and parent_view.viewMode(
         ) == parent_view.ViewMode.IconMode

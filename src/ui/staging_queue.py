@@ -230,7 +230,7 @@ class StagingQueueDialog(QDialog):
             self.btn_execute.setEnabled(False)
         else:
             if self.config_mgr.is_sandbox():
-                self.mode_info_label.setText("🧪 Alvo: Sandbox (L:\\_TestesBanco)")
+                self.mode_info_label.setText("🧪 Alvo: Sandbox (L:\\Drives Compartilhados\\_TestesBanco)")
                 self.mode_info_label.setStyleSheet("color: #856404;")
             else:
                 self.mode_info_label.setText("☁️ Alvo: Produção Oficial (Google Drive)")
@@ -287,8 +287,9 @@ class StagingQueueDialog(QDialog):
         total = self.queue.count()
         if total == 0:
             return
-
-        dest_name = "Sandbox (L:\\_TestesBanco)" if self.config_mgr.is_sandbox() else "Google Drive Oficial"
+            
+        errors = []
+        dest_name = "Sandbox (L:\\Drives Compartilhados\\_TestesBanco)" if self.config_mgr.is_sandbox() else "Google Drive Oficial"
         reply = QMessageBox.question(
             self, "Confirmar Execução em Lote",
             f"Deseja executar {total} alteração(ões) pendente(s) em {dest_name}?",

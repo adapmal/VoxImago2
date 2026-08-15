@@ -132,6 +132,7 @@ class FileDetailsPanel(QFrame):
         self.diff_label = QLabel()
         self.diff_label.setWordWrap(True)
         self.diff_label.setStyleSheet("padding: 4px; background: #1E1E1E; border-radius: 4px; font-size: 11px;")
+        self.diff_label.linkActivated.connect(self._handle_diff_link)
         self.form_layout.addRow(QLabel("<b>Status Fila:</b>"), self.diff_label)
 
         self.open_drive_button = QPushButton("☁️ Abrir no Drive")
@@ -466,6 +467,16 @@ class FileDetailsPanel(QFrame):
             self._update_diff_preview()
 
     def _update_diff_preview(self):
+        if getattr(self, '_is_batch_mode', False) and getattr(self, 'current_files_list', None):
+            new_desc = self.description_edit.text().strip()
+            if new_desc:
+                tags = [t.strip() for t in new_desc.split(',') if t.strip()]
+                parts = [f"<a href='remove_tag:{t}' style='color: #28A745; font-weight: bold; text-decoration: none;'>+ {t}</a>" for t in tags]
+                self.diff_label.setText(f"<b>Tags em Lote:</b> " + ", ".join(parts))
+            else:
+                self.diff_label.setText(f"<span style='color: #6C757D;'>Modo Batch Ativo ({len(self.current_files_list)} arquivos). Alterações serão aplicadas a todos.</span>")
+            return
+
         if not self.current_file_item:
             self.diff_label.setText("Nenhuma alteração pendente.")
             return
@@ -488,7 +499,7 @@ class FileDetailsPanel(QFrame):
                 diff_parts = []
                 for t in new_tags:
                     if t in added:
-                        diff_parts.append(f"<span style='color: #28A745; font-weight: bold;'>+ {t}</span>")
+                        diff_parts.append(f"<a href='remove_tag:{t}' style='color: #28A745; font-weight: bold; text-decoration: none;' title='Clique para remover'>+ {t}</a>")
                     else:
                         diff_parts.append(f"<span style='color: #E2E3E5;'>{t}</span>")
                 for t in removed:
@@ -513,3 +524,13 @@ class FileDetailsPanel(QFrame):
             folder = os.path.dirname(self.current_file_item['path'])
             if os.path.exists(folder):
                 os.startfile(folder)
+
+    def _handle_diff_link(self, url):
+        if url.startswith("remove_tag:"):
+            tag_to_remove = url.split(":", 1)[1]
+            current_text = self.description_edit.text()
+            tags = [t.strip() for t in current_text.split(',') if t.strip()]
+            if tag_to_remove in tags:
+                tags.remove(tag_to_remove)
+                self.description_edit.setText(", ".join(tags))
+                self._on_description_changed()
