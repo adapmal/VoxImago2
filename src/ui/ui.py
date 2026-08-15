@@ -888,8 +888,13 @@ class DriveFileGalleryApp(QMainWindow):
             settings['scan_paths'] = selected_paths
             save_settings(settings)
 
+            if selected_paths:
+                self.config_mgr.set('scan_folders', selected_paths)
+                self.folder_tree.set_root_directory(selected_paths[0])
+
             self.current_view = 'local'
             self.current_folder_id = None
+            self.current_folder_path_filter = None
             list_update.clear_display(self)
             self.all_files_loaded = False
             self.current_page = 0

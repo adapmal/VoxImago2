@@ -33,16 +33,21 @@ class FolderTreeWidget(QWidget):
             if os.path.exists(sb_path):
                 return sb_path
 
-        # Tentar localizar o diretório base do Banco de Imagens
+        scan_folders = self.config_mgr.get('scan_folders', [])
+        if scan_folders:
+            for sf in scan_folders:
+                if os.path.exists(sf):
+                    return sf
+
         possible_roots = [
+            r"L:\Drives Compartilhados\_TestesBanco",
             r"L:\Drives Compartilhados\Banco de Imagens",
-            r"L:\Banco de Imagens",
-            r"L:\Drives Compartilhados\_TestesBanco"
+            r"L:\Banco de Imagens"
         ]
         for p in possible_roots:
             if os.path.exists(p):
                 return p
-        return r"L:\\"
+        return r"L:\Drives Compartilhados"
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
@@ -64,7 +69,7 @@ class FolderTreeWidget(QWidget):
         self.tree_view.setModel(self.model)
         self.tree_view.setRootIndex(self.model.index(self.root_dir))
 
-        # Ocultar colunas secundárias (Tamanho, Tipo, Data Modificação) para exibição limpa
+        # Ocultar colunas secundárias
         self.tree_view.hideColumn(1)
         self.tree_view.hideColumn(2)
         self.tree_view.hideColumn(3)
@@ -88,15 +93,12 @@ class FolderTreeWidget(QWidget):
             self.folderSelected.emit(folder_path)
 
     def _on_mode_changed(self, key, value):
-        if key == 'sandbox_mode' or key == 'sandbox_path':
+        if key in ('sandbox_mode', 'sandbox_path'):
             new_root = self._determine_root_dir()
-            if new_root != self.root_dir:
-                self.root_dir = new_root
-                self.model.setRootPath(self.root_dir)
-                self.tree_view.setRootIndex(self.model.index(self.root_dir))
+            self.set_root_directory(new_root)
 
     def set_root_directory(self, path):
-        if os.path.exists(path):
+        if path and os.path.exists(path):
             self.root_dir = path
             self.model.setRootPath(self.root_dir)
             self.tree_view.setRootIndex(self.model.index(self.root_dir))

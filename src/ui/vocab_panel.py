@@ -1,6 +1,6 @@
 '''
 Painel de Vocabulário Controlado Horizontal (Top Collapsible Controlled Vocabulary) para o VoxImago v2.1
-Exibe chips/pills organizados horizontalmente por categoria, com suporte a expansão/recolhimento.
+Exibe chips/pills organizados em 13 colunas verticais lado a lado, com cabeçalhos fixos e expansão responsiva.
 '''
 
 import os
@@ -8,7 +8,7 @@ import csv
 import logging
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
-    QPushButton, QScrollArea, QFrame, QGroupBox
+    QPushButton, QScrollArea, QFrame, QSizePolicy
 )
 from PyQt6.QtCore import pyqtSignal, Qt
 from src.utils.config_manager import ConfigManager
@@ -64,27 +64,30 @@ class VocabManager:
 
 
 class VocabPanel(QWidget):
-    tagSelected = pyqtSignal(str)  # Emitido quando um chip/pill de tag é clicado
+    tagSelected = pyqtSignal(str)  # Emitido quando uma tag é clicada
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.vocab_mgr = VocabManager()
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.setMinimumHeight(180)
+        self.setMaximumHeight(350)
         self._init_ui()
 
     def _init_ui(self):
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(10, 4, 10, 8)
+        main_layout.setContentsMargins(10, 4, 10, 6)
         main_layout.setSpacing(4)
 
-        # Barra superior com título, filtro e botão de fechar
+        # 1. Barra superior fixa (Título + Filtro + Botão Recolher)
         top_bar = QHBoxLayout()
-        title_label = QLabel("🏷️ Vocabulário Controlado Oficial (Tags)")
+        title_label = QLabel("🏷️ Vocabulário Controlado Oficial (13 Categorias)")
         title_label.setStyleSheet("font-weight: bold; font-size: 13px; color: #1976D2;")
         top_bar.addWidget(title_label)
 
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Filtrar tags...")
-        self.search_input.setFixedWidth(200)
+        self.search_input.setPlaceholderText("🔍 Filtrar tags...")
+        self.search_input.setFixedWidth(220)
         self.search_input.setClearButtonEnabled(True)
         self.search_input.textChanged.connect(self._filter_tags)
         top_bar.addWidget(self.search_input)
@@ -93,37 +96,43 @@ class VocabPanel(QWidget):
 
         self.btn_close = QPushButton("✕ Recolher")
         self.btn_close.setFixedHeight(26)
-        self.btn_close.setStyleSheet("padding: 2px 8px; font-size: 11px;")
+        self.btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_close.setStyleSheet(
+            "QPushButton { background-color: #E0E0E0; border: 1px solid #BDBDBD; border-radius: 4px; padding: 2px 10px; font-weight: bold; font-size: 11px; }"
+            "QPushButton:hover { background-color: #D32F2F; color: white; border-color: #B71C1C; }"
+        )
         self.btn_close.clicked.connect(self.hide)
         top_bar.addWidget(self.btn_close)
 
         main_layout.addLayout(top_bar)
 
-        # Scroll horizontal para as categorias
+        # 2. Área com Scroll Horizontal contendo as 13 colunas verticais que esticam com a altura
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setFixedHeight(120)
         self.scroll_area.setFrameShape(QFrame.Shape.StyledPanel)
         self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll_area.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
-        self.container_widget = QWidget()
-        self.container_layout = QHBoxLayout(self.container_widget)
-        self.container_layout.setContentsMargins(4, 4, 4, 4)
-        self.container_layout.setSpacing(8)
+        self.columns_container = QWidget()
+        self.columns_layout = QHBoxLayout(self.columns_container)
+        self.columns_layout.setContentsMargins(4, 4, 4, 4)
+        self.columns_layout.setSpacing(10)
+        self.columns_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
 
-        self.scroll_area.setWidget(self.container_widget)
+        self.scroll_area.setWidget(self.columns_container)
         main_layout.addWidget(self.scroll_area)
 
-        self._build_category_chips()
+        self._build_columns()
         self.hide()  # Inicialmente recolhido
 
     def toggle_visibility(self):
         self.setVisible(not self.isVisible())
 
-    def _build_category_chips(self, filter_text=""):
-        while self.container_layout.count():
-            item = self.container_layout.takeAt(0)
+    def _build_columns(self, filter_text=""):
+        # Limpar layout anterior
+        while self.columns_layout.count():
+            item = self.columns_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
 
@@ -137,40 +146,56 @@ class VocabPanel(QWidget):
             if not matching_tags:
                 continue
 
-            group_box = QGroupBox(cat_name)
-            group_box.setStyleSheet(
-                "QGroupBox { font-weight: bold; font-size: 11px; margin-top: 4px; padding-top: 10px; } "
-                "QGroupBox::title { subcontrol-origin: margin; left: 6px; padding: 0 3px; }"
+            # Coluna de Categoria com cabeçalho fixo no topo e lista rolável
+            col_widget = QFrame()
+            col_widget.setFrameShape(QFrame.Shape.StyledPanel)
+            col_widget.setFixedWidth(160)
+            col_widget.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+            col_widget.setStyleSheet(
+                "QFrame { background-color: #F8F9FA; border: 1px solid #CED4DA; border-radius: 6px; }"
             )
-            group_layout = QVBoxLayout(group_box)
-            group_layout.setContentsMargins(4, 8, 4, 4)
 
-            scroll_cat = QScrollArea()
-            scroll_cat.setWidgetResizable(True)
-            scroll_cat.setFrameShape(QFrame.Shape.NoFrame)
-            scroll_cat_widget = QWidget()
-            scroll_cat_layout = QVBoxLayout(scroll_cat_widget)
-            scroll_cat_layout.setContentsMargins(0, 0, 0, 0)
-            scroll_cat_layout.setSpacing(2)
+            col_layout = QVBoxLayout(col_widget)
+            col_layout.setContentsMargins(4, 4, 4, 4)
+            col_layout.setSpacing(4)
+
+            # Cabeçalho da Coluna Fixo
+            header_label = QLabel(cat_name)
+            header_label.setStyleSheet(
+                "QLabel { font-weight: bold; font-size: 11px; color: #333333; padding: 4px; background: #E9ECEF; border-radius: 4px; text-align: center; }"
+            )
+            header_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            header_label.setWordWrap(True)
+            col_layout.addWidget(header_label)
+
+            # Scroll individual para os itens da coluna
+            tag_scroll = QScrollArea()
+            tag_scroll.setWidgetResizable(True)
+            tag_scroll.setFrameShape(QFrame.Shape.NoFrame)
+            tag_scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+            tag_scroll_content = QWidget()
+            tag_layout = QVBoxLayout(tag_scroll_content)
+            tag_layout.setContentsMargins(0, 2, 0, 2)
+            tag_layout.setSpacing(2)
+            tag_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
             for tag in matching_tags:
                 btn = QPushButton(tag)
                 btn.setCursor(Qt.CursorShape.PointingHandCursor)
                 btn.setStyleSheet(
-                    "QPushButton { background-color: #E9ECEF; color: #212529; border: 1px solid #CED4DA; border-radius: 9px; padding: 2px 6px; font-size: 11px; text-align: left; }"
-                    "QPushButton:hover { background-color: #007BFF; color: white; border-color: #0056B3; }"
+                    "QPushButton { background-color: #FFFFFF; color: #212529; border: 1px solid #DEE2E6; border-radius: 4px; padding: 3px 6px; font-size: 11px; text-align: left; }"
+                    "QPushButton:hover { background-color: #007BFF; color: white; border-color: #0056B3; font-weight: bold; }"
                 )
                 btn.clicked.connect(lambda checked, t=tag: self.tagSelected.emit(t))
-                scroll_cat_layout.addWidget(btn)
+                tag_layout.addWidget(btn)
 
-            scroll_cat_layout.addStretch()
-            scroll_cat.setWidget(scroll_cat_widget)
-            group_layout.addWidget(scroll_cat)
+            tag_scroll.setWidget(tag_scroll_content)
+            col_layout.addWidget(tag_scroll)
 
-            group_box.setFixedWidth(160)
-            self.container_layout.addWidget(group_box)
+            self.columns_layout.addWidget(col_widget)
 
-        self.container_layout.addStretch()
+        self.columns_layout.addStretch()
 
     def _filter_tags(self, text):
-        self._build_category_chips(text)
+        self._build_columns(text)

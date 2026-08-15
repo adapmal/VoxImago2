@@ -23,13 +23,12 @@ class MainBar(QFrame):
         self.app_title_label = QLabel("VI-MB")
         self.app_title_label.setFont(QFont("Arial", 12, QFont.Weight.Bold))
         self.unified_layout.addWidget(self.app_title_label)
-        self.unified_layout.addSpacing(15)
+        self.unified_layout.addSpacing(10)
 
-        self.unified_layout.addStretch()
-
+        # Campo de Pesquisa com botão de limpeza e auto-complete
         self.search_entry = QLineEdit()
         self.search_entry.setPlaceholderText("Pesquisar...")
-        self.search_entry.setFixedWidth(280)
+        self.search_entry.setFixedWidth(220)
         self.search_entry.setClearButtonEnabled(True)
 
         from PyQt6.QtWidgets import QCompleter
@@ -42,16 +41,16 @@ class MainBar(QFrame):
             self.search_entry.setCompleter(completer)
 
         self.unified_layout.addWidget(self.search_entry)
+        self.unified_layout.addSpacing(4)
 
         self.vocab_toggle_btn = QPushButton("🏷️ Tags ▼")
-        self.vocab_toggle_btn.setFixedHeight(34)
+        self.vocab_toggle_btn.setFixedHeight(32)
         self.vocab_toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.vocab_toggle_btn.setStyleSheet(
             "background-color: #E3F2FD; color: #1565C0; border: 1px solid #BBDEFB; border-radius: 4px; padding: 4px 8px; font-weight: bold; font-size: 12px;")
         self.vocab_toggle_btn.setToolTip("Abrir/Fechar painel horizontal de Vocabulário Controlado (Tags).")
         self.unified_layout.addWidget(self.vocab_toggle_btn)
-        self.unified_layout.addSpacing(5)
-        self.unified_layout.addStretch()
+        self.unified_layout.addSpacing(10)
 
         self.sort_combo = QComboBox()
         self.sort_combo.addItem("🅰️ Nome (A-Z)", "name_asc")
