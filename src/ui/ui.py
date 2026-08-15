@@ -28,6 +28,8 @@ from src.ui.thumbnails import ThumbnailCache, ThumbnailManager, FileListDelegate
 from src.ui.main_bar import MainBar
 from src.ui.list_model import FileListModel
 from src.ui.list_update import list_update
+from src.ui.folder_tree_widget import FolderTreeWidget
+from src.ui.vocab_panel import VocabPanel
 
 
 SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
@@ -362,13 +364,22 @@ class DriveFileGalleryApp(QMainWindow):
         self.file_list_view.setDragDropMode(
             QAbstractItemView.DragDropMode.DragOnly)
 
+        self.folder_tree = FolderTreeWidget(parent=self)
+        self.folder_tree.folderSelected.connect(self.on_folder_tree_selected)
+
+        self.vocab_panel = VocabPanel(parent=self)
+        self.vocab_panel.tagSelected.connect(self.on_vocab_tag_selected)
+
         self.details_panel = FileDetailsPanel(self)
 
+        self.splitter.addWidget(self.folder_tree)
         self.splitter.addWidget(self.file_list_view)
+        self.splitter.addWidget(self.vocab_panel)
         self.splitter.addWidget(self.details_panel)
-        self.details_panel.setMinimumWidth(400)
-        self.details_panel.setMaximumWidth(600)
-        self.splitter.setSizes([900, 400])
+
+        self.details_panel.setMinimumWidth(320)
+        self.details_panel.setMaximumWidth(550)
+        self.splitter.setSizes([220, 650, 240, 350])
 
         main_layout.addWidget(self.splitter)
 
@@ -1528,6 +1539,20 @@ class DriveFileGalleryApp(QMainWindow):
             self.file_list_model.setFiles(files_to_add)
         else:
             self.file_list_model.addFiles(files_to_add)
+
+    def on_folder_tree_selected(self, folder_path):
+        if not folder_path or not os.path.exists(folder_path):
+            return
+        folder_name = os.path.basename(folder_path)
+        if folder_name and folder_name != os.path.basename(self.folder_tree.root_dir):
+            self.main_bar.search_entry.setText(folder_name)
+
+    def on_vocab_tag_selected(self, tag_text):
+        current = self.main_bar.search_entry.text().strip()
+        if not current:
+            self.main_bar.search_entry.setText(tag_text)
+        elif tag_text.lower() not in current.lower():
+            self.main_bar.search_entry.setText(f"{current} {tag_text}")
 
     def on_file_selected(self, file_item):
         if file_item:
