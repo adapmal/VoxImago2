@@ -120,6 +120,7 @@ class MainBar(QFrame):
         self.unified_layout.addSpacing(5)
 
         self.staging_queue.queueChanged.connect(self._update_staging_button)
+        self._update_staging_button(self.staging_queue.count())
 
         print('DEBUG: MainBar passo 6 - update_mode_ui')
         self._update_mode_ui()
@@ -182,6 +183,9 @@ class MainBar(QFrame):
         self.menu_utils.addAction(self.action_scan_options)
         self.menu_utils.addAction(self.action_sync_drive)
         self.menu_utils.addAction(self.action_clear_cache)
+        self.menu_utils.addSeparator()
+        self.action_advanced_settings = QAction("⚙️ Avançado / Sistema", self)
+        self.menu_utils.addAction(self.action_advanced_settings)
         self.tools_menu.addMenu(self.menu_utils)
 
         # Submenu Diagnóstico
@@ -390,7 +394,13 @@ class MainBar(QFrame):
 
     def _open_staging_dialog(self):
         from src.ui.staging_queue import StagingQueueDialog
-        dialog = StagingQueueDialog(self, drive_service=self.parent_app.service, db_indexer=self.parent_app.indexer)
+        dialog = StagingQueueDialog(self, drive_service=self.window().service, db_indexer=self.window().indexer)
+        def on_queue_done(count):
+            if count > 0:
+                if hasattr(self.window(), 'indexer'):
+                    self.window().indexer.export_to_shared_cache()
+                self.window()._force_refresh_after_sync()
+        dialog.executionCompleted.connect(on_queue_done)
         dialog.exec()
 
 

@@ -46,8 +46,28 @@ class FileIndexer:
         if db_dir and not os.path.exists(db_dir):
             os.makedirs(db_dir, exist_ok=True)
             print(f"📁 Pasta '{db_dir}' criada automaticamente")
-        self.conn = sqlite3.connect(self.db_name)
+
+        # Se o banco local não existir ou estiver vazio (ex: clone novo do GitHub), restaurar da nuvem
+        if (not os.path.exists(self.db_name) or os.path.getsize(self.db_name) < 1024 * 1024):
+            shared_candidates = [
+                r"L:\Drives Compartilhados\zRecursos_VoxImago\file_index_shared.db",
+                r"L:\.voximago_system\shared_index.db"
+            ]
+            for s_path in shared_candidates:
+                if os.path.exists(s_path) and os.path.getsize(s_path) > 1024 * 1024:
+                    try:
+                        print(f"📦 Restaurando banco de dados local a partir do Drive Compartilhado ({s_path})...")
+                        shutil.copy2(s_path, self.db_name)
+                        print("✅ Banco de dados restaurado com sucesso da nuvem!")
+                        break
+                    except Exception as e_copy:
+                        print(f"⚠️ Não foi possível copiar banco compartilhado: {e_copy}")
+
+        self.conn = sqlite3.connect(self.db_name, check_same_thread=False, timeout=30.0)
+        self.conn.create_function("py_lower", 1, lambda s: s.lower() if s else s)
         self.cursor = self.conn.cursor()
+        self.cursor.execute("PRAGMA journal_mode=WAL")
+        self.cursor.execute("PRAGMA busy_timeout=30000")
         self._create_tables()
         self._count_cache = {}
         self._paged_cache = {}
@@ -113,14 +133,18 @@ class FileIndexer:
 
     def ensure_conn(self):
         if self.conn is None:
-            self.conn = sqlite3.connect(self.db_name)
+            self.conn = sqlite3.connect(self.db_name, check_same_thread=False, timeout=30.0)
+            self.conn.create_function("py_lower", 1, lambda s: s.lower() if s else s)
             self.cursor = self.conn.cursor()
+            self.cursor.execute("PRAGMA busy_timeout=30000")
         try:
             self.cursor.execute("SELECT 1")
         except sqlite3.ProgrammingError as e:
-            if "closed" in str(e):
-                self.conn = sqlite3.connect(self.db_name)
+            if "closed" in str(e) or "thread" in str(e):
+                self.conn = sqlite3.connect(self.db_name, check_same_thread=False, timeout=30.0)
+                self.conn.create_function("py_lower", 1, lambda s: s.lower() if s else s)
                 self.cursor = self.conn.cursor()
+                self.cursor.execute("PRAGMA busy_timeout=30000")
 
     def _create_tables(self):
         self.cursor.execute('''
@@ -598,6 +622,8 @@ class FileIndexer:
         os.makedirs(os.path.join('assets', 'thumbnail_cache'), exist_ok=True)
         self.cursor.execute(
             "UPDATE files SET thumbnailPath = NULL WHERE source = 'drive'")
+        self._count_cache.clear()
+        self._paged_cache.clear()
         self.conn.commit()
 
     def clear_source(self, source: str):
@@ -635,12 +661,34 @@ class FileIndexer:
             self.conn.commit()
 
     def export_to_shared_cache(self, target_path=r"L:\Drives Compartilhados\zRecursos_VoxImago\file_index_shared.db"):
-        '''Exporta o banco local para o local de cache compartilhado na rede Google Drive'''
+        '''Exporta o banco local e CSV para o local de cache compartilhado na rede Google Drive'''
         try:
             os.makedirs(os.path.dirname(target_path), exist_ok=True)
             self.conn.commit()
             shutil.copy2(self.db_name, target_path)
-            print(f"[OK] Cache compartilhado atualizado em: {target_path}")
+            
+            # Exportar CSV localmente primeiro para alta velocidade, depois copiar
+            temp_csv = os.path.join(os.path.dirname(self.db_name), "temp_export.csv")
+            csv_path = os.path.splitext(target_path)[0] + ".csv"
+            
+            with open(temp_csv, "w", newline="", encoding="utf-8-sig") as f:
+                import csv
+                writer = csv.writer(f)
+                writer.writerow(["file_id", "name", "path", "mimeType", "source", "description", "size", "modifiedTime", "createdTime", "parentId", "webContentLink", "starred"])
+                self.ensure_conn()
+                cur = self.conn.cursor()
+                cur.execute("SELECT file_id, name, path, mimeType, source, description, size, modifiedTime, createdTime, parentId, webContentLink, starred FROM files")
+                for row in cur:
+                    writer.writerow(row)
+            
+            shutil.copy2(temp_csv, csv_path)
+            if os.path.exists(temp_csv):
+                try:
+                    os.remove(temp_csv)
+                except Exception:
+                    pass
+            
+            print(f"[OK] Cache compartilhado (.db e .csv) atualizado em: {target_path}")
             return True
         except Exception as e:
             print(f"[AVISO] Nao foi possivel exportar cache compartilhado: {e}")
@@ -660,6 +708,7 @@ class FileIndexer:
 
 def open_db_for_thread(db_name):
     conn = sqlite3.connect(db_name, check_same_thread=False, timeout=30.0)
+    conn.create_function("py_lower", 1, lambda s: s.lower() if s else s)
     conn.execute("PRAGMA journal_mode = WAL;")
     conn.execute("PRAGMA synchronous = NORMAL;")
     conn.execute("PRAGMA temp_store = MEMORY;")

@@ -452,6 +452,13 @@ class DriveSync(QObject):
             self.update_status.emit(
                 f"Sincronização concluída: {total_files_processed} arquivos. Fusionados: {fusion_count}.")
             self.progress_update.emit(100, "Sincronização concluída.")
+            
+            # Salvar timestamp para a sincronização incremental
+            from src.utils.config_manager import ConfigManager
+            config_mgr = ConfigManager()
+            import time
+            config_mgr.set('last_sync_timestamp', int(time.time()))
+            
             self._emit_finish_signal(success=True)
             if indexer:
                 try:

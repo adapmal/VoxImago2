@@ -114,6 +114,8 @@ class DriveFileGalleryApp(QMainWindow):
 
         self.tray_icon.show()
 
+        from src.utils.config_manager import ConfigManager
+        self.config_mgr = ConfigManager()
         self.service = None
         self.indexer = FileIndexer()
         self.search_engine = SearchEngine(self.indexer)
@@ -147,6 +149,10 @@ class DriveFileGalleryApp(QMainWindow):
         self.suggestion_timer = QTimer()
         self.suggestion_timer.setSingleShot(True)
         self.suggestion_timer.timeout.connect(self.update_search_suggestions)
+        
+        self.incremental_sync_timer = QTimer()
+        self.incremental_sync_timer.timeout.connect(self._run_incremental_sync)
+        self.incremental_sync_timer.start(1 * 60 * 1000)  # 1 minuto
 
         self.completer_model = QStringListModel()
 
@@ -315,6 +321,7 @@ class DriveFileGalleryApp(QMainWindow):
 
         self.vocab_panel = VocabPanel(parent=self)
         self.vocab_panel.tagSelected.connect(self.on_vocab_tag_selected)
+        self.vocab_panel.vocabUpdated.connect(self._on_vocab_updated)
         main_layout.addWidget(self.vocab_panel)
 
         self.main_bar.vocab_toggle_btn.clicked.connect(self.vocab_panel.toggle_visibility)
@@ -330,6 +337,8 @@ class DriveFileGalleryApp(QMainWindow):
             self._reindex_local_files)
         self.main_bar.action_clear_cache.triggered.connect(
             self.clear_thumbnail_cache)
+        self.main_bar.action_advanced_settings.triggered.connect(
+            self._open_advanced_settings)
         self.main_bar.action_explorer.triggered.connect(
             self.toggle_explorer_special)
         self.main_bar.action_grid_view.triggered.connect(
@@ -362,7 +371,6 @@ class DriveFileGalleryApp(QMainWindow):
         self.file_list_view.filesSelected.connect(self.on_files_selected)
         self.file_list_view.fileDoubleClicked.connect(self.on_double_click)
         self.file_list_view.verticalScrollBar().valueChanged.connect(self.on_scroll)
-        self.file_list_view.deleteRequested.connect(self.details_panel._delete_file_action)
 
         self.set_view_mode("grid")
         self.file_list_view.setResizeMode(QListView.ResizeMode.Adjust)
@@ -374,8 +382,13 @@ class DriveFileGalleryApp(QMainWindow):
 
         self.folder_tree = FolderTreeWidget(parent=self)
         self.folder_tree.folderSelected.connect(self.on_folder_tree_selected)
+        self.folder_tree.filesDroppedOnFolder.connect(self.on_files_dropped_on_folder)
+
+        self.main_bar.staging_queue.queueChanged.connect(self._on_staging_queue_changed)
 
         self.details_panel = FileDetailsPanel(self)
+        
+        self.file_list_view.deleteRequested.connect(self.details_panel._delete_file_action)
 
         self.splitter.addWidget(self.folder_tree)
         self.splitter.addWidget(self.file_list_view)
@@ -780,6 +793,61 @@ class DriveFileGalleryApp(QMainWindow):
         list_update.clear_display(self)
         list_update.load_next_batch(self)
 
+    def _run_incremental_sync(self):
+        if not self.is_authenticated or not self.service:
+            return
+            
+        import logging
+        logging.info("⏳ Disparando Sincronização Incremental (Background)...")
+        self.status_bar.showMessage("🔄 Verificando atualizações no Google Drive...", 2500)
+        
+        from src.drive.incremental_sync import IncrementalSyncWorker
+        from src.utils.config_manager import ConfigManager
+        
+        self.inc_sync_thread = QThread()
+        self.inc_sync_worker = IncrementalSyncWorker(self.service, ConfigManager(), self.search_engine.indexer)
+        self.inc_sync_worker.moveToThread(self.inc_sync_thread)
+        
+        self.inc_sync_thread.started.connect(self.inc_sync_worker.run)
+        
+        def on_inc_finished(count):
+            self.inc_sync_thread.quit()
+            self.inc_sync_thread.wait(2000)
+            if count > 0:
+                self.status_bar.showMessage(f"✅ Sincronização: {count} arquivo(s) atualizado(s) da nuvem.", 5000)
+                self._force_refresh_after_sync()
+            else:
+                self.status_bar.showMessage("🔄 Sincronização: Tudo atualizado com o Drive.", 3000)
+        
+        def on_inc_failed(err):
+            self.inc_sync_thread.quit()
+            self.inc_sync_thread.wait(2000)
+            import logging
+            logging.error(f"Sincronização incremental falhou: {err}")
+            self.status_bar.showMessage(f"⚠️ Erro no sync em segundo plano: {err}", 4000)
+            
+        self.inc_sync_worker.sync_finished.connect(on_inc_finished)
+        self.inc_sync_worker.sync_failed.connect(on_inc_failed)
+        
+        self.inc_sync_thread.start()
+
+    def update_ui_for_auth_state(self, is_auth):
+        self.main_bar.category_combo.setEnabled(True)
+        self.main_bar.sort_combo.setEnabled(True)
+
+    def change_filter_type_combo(self, index):
+        selected_category = self.main_bar.category_combo.itemData(index)
+        self.current_filter = selected_category
+        print(f"DEBUG: Filtro alterado para: {self.current_filter}")
+        if selected_category:
+            self.advanced_filters['category'] = selected_category
+        else:
+            self.advanced_filters.pop('category', None)
+        self.current_page = 0
+        self.all_files_loaded = False
+        list_update.clear_display(self)
+        list_update.load_next_batch(self)
+
     def change_sort_order(self, index):
         self.current_sort = self.main_bar.sort_combo.itemData(index)
         self.current_page = 0
@@ -874,6 +942,12 @@ class DriveFileGalleryApp(QMainWindow):
         if value >= scroll_bar.maximum() - threshold and not self.is_loading and not self.all_files_loaded:
             self.scroll_loading = True
             list_update.load_next_batch(self)
+
+    def _open_advanced_settings(self):
+        from src.ui.advanced_settings_dialog import AdvancedSettingsDialog
+        dialog = AdvancedSettingsDialog(self, indexer=self.search_engine.indexer, service=self.service)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._force_refresh_after_sync()
 
     def _show_scan_options(self):
         if self.local_scan_thread and self.local_scan_thread.isRunning():
@@ -1207,8 +1281,14 @@ class DriveFileGalleryApp(QMainWindow):
 
     def _force_refresh_after_sync(self, prev_selected_id=None):
         try:
+            if hasattr(self, 'search_engine'):
+                self.search_engine.clear_cache()
+            if hasattr(self, 'indexer'):
+                self.indexer.clear_cache()
+            self.current_page = 0
+            self.all_files_loaded = False
+            list_update.clear_display(self)
             list_update.load_next_batch(self)
-
             if prev_selected_id:
                 QTimer.singleShot(
                     200, lambda: self._reselect_and_refresh(prev_selected_id))
@@ -1562,12 +1642,114 @@ class DriveFileGalleryApp(QMainWindow):
         list_update.clear_display(self)
         list_update.load_next_batch(self)
 
+    def on_files_dropped_on_folder(self, dropped_items, target_folder_path):
+        if not dropped_items or not target_folder_path:
+            return
+
+        from src.ui.staging_queue import StagingQueue, StagingItem
+        queue = StagingQueue()
+        staged_count = 0
+        reverted_count = 0
+
+        for item in dropped_items:
+            src_path = item.get('path') or item.get('file_id') or ''
+            if not src_path:
+                continue
+            src_path = os.path.normpath(src_path)
+            fname = item.get('name') or os.path.basename(src_path)
+            dst_path = os.path.normpath(os.path.join(target_folder_path, fname))
+
+            if os.path.normpath(os.path.dirname(src_path)).lower() == os.path.normpath(target_folder_path).lower():
+                continue  # Arquivo já está nesta mesma pasta
+
+            fid = item.get('file_id') or item.get('id') or src_path
+
+            # Obter o caminho físico original registrado no banco SQLite
+            db_orig_path = None
+            if hasattr(self, 'indexer') and self.indexer:
+                try:
+                    self.indexer.ensure_conn()
+                    self.indexer.cursor.execute("SELECT path FROM files WHERE file_id = ? OR path = ? LIMIT 1", (fid, src_path))
+                    r = self.indexer.cursor.fetchone()
+                    if r and r[0]:
+                        db_orig_path = os.path.normpath(r[0])
+                except Exception:
+                    pass
+            if not db_orig_path:
+                db_orig_path = item.get('physical_path') or item.get('orig_path') or src_path
+
+            # Remover staging de 'move' anterior para este mesmo arquivo
+            for it in list(queue.items):
+                if it.file_id == fid and it.action_type == 'move':
+                    queue.remove_item(it)
+
+            # Se o destino é a pasta original do banco, a movimentação foi desfeita/revertida!
+            if os.path.normpath(dst_path).lower() == os.path.normpath(db_orig_path).lower():
+                reverted_count += 1
+            else:
+                # Caso contrário, enfileira o move a partir do caminho físico original
+                st_item = StagingItem(
+                    fid, fname, db_orig_path, 'move',
+                    old_value=db_orig_path, new_value=dst_path
+                )
+                queue.add_item(st_item)
+                staged_count += 1
+
+        folder_name = os.path.basename(target_folder_path)
+        if hasattr(self, 'status_bar') and self.status_bar:
+            if staged_count > 0:
+                self.status_bar.showMessage(f"📦 {staged_count} arquivo(s) enfileirado(s) para mover para '{folder_name}'.", 4000)
+            elif reverted_count > 0:
+                self.status_bar.showMessage(f"↩️ {reverted_count} arquivo(s) retornado(s) à pasta original.", 4000)
+
+        # Atualizar grid para refletir as alterações virtuais
+        self.current_page = 0
+        self.all_files_loaded = False
+        list_update.clear_display(self)
+        list_update.load_next_batch(self)
+
+    def _on_staging_queue_changed(self, count):
+        # Apenas atualiza a grade se houver alteração em itens de 'move' ou 'delete'
+        # Alterações de tags/descrição NÃO devem recarregar a grade nem fechar o painel de detalhes!
+        current_move_items = [f"{it.file_id}_{it.action_type}_{it.new_value}" for it in self.main_bar.staging_queue.items if it.action_type in ('move', 'delete')]
+        if not hasattr(self, '_prev_move_items'):
+            self._prev_move_items = []
+            
+        if current_move_items != self._prev_move_items:
+            self._prev_move_items = list(current_move_items)
+            if getattr(self, 'current_folder_path_filter', None):
+                self.current_page = 0
+                self.all_files_loaded = False
+                list_update.clear_display(self)
+                list_update.load_next_batch(self)
+
     def on_vocab_tag_selected(self, tag_text):
         current = self.main_bar.search_entry.text().strip()
         if not current:
             self.main_bar.search_entry.setText(tag_text)
         elif tag_text.lower() not in current.lower():
             self.main_bar.search_entry.setText(f"{current} {tag_text}")
+
+    def _on_vocab_updated(self):
+        from src.ui.vocab_panel import VocabManager
+        vocab_tags = VocabManager().get_all_tags()
+        
+        # 1. Atualizar completer da barra de busca principal
+        if hasattr(self.main_bar, 'search_entry'):
+            from PyQt6.QtWidgets import QCompleter
+            completer = QCompleter(vocab_tags, self.main_bar.search_entry)
+            completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+            completer.setFilterMode(Qt.MatchFlag.MatchContains)
+            self.main_bar.search_entry.setCompleter(completer)
+        
+        # 2. Atualizar completer e sugestões no painel de detalhes
+        if hasattr(self, 'details_panel') and self.details_panel:
+            if hasattr(self.details_panel, 'tag_chips_widget'):
+                self.details_panel.tag_chips_widget.update_vocab_suggestions(vocab_tags)
+            if getattr(self.details_panel, '_is_batch_mode', False) and getattr(self.details_panel, 'current_files_list', None):
+                self.details_panel._update_suggested_tags_batch(self.details_panel.current_files_list)
+            elif getattr(self.details_panel, 'current_file_item', None):
+                self.details_panel._update_suggested_tags(self.details_panel.current_file_item)
 
     def on_file_selected(self, file_item):
         pass
@@ -1609,6 +1791,10 @@ class DriveFileGalleryApp(QMainWindow):
                 file_item = self.file_list_model.data(
                     selected_indexes[0], Qt.ItemDataRole.UserRole)
                 self.on_double_click(file_item)
+        elif event.key() == Qt.Key.Key_Delete:
+            selected_indexes = self.file_list_view.selectedIndexes()
+            if selected_indexes:
+                self.file_list_view.deleteRequested.emit()
         elif event.key() == Qt.Key.Key_F12:
             current_search = self.main_bar.search_entry.text().strip()
             if current_search:

@@ -18,6 +18,9 @@ class SearchEngine:
         self.indexer = indexer
         self._paged_cache = {}
 
+    def clear_cache(self):
+        self._paged_cache.clear()
+
     def parse_search_query(self, search_term):
         filters = {}
         terms = []
@@ -252,8 +255,6 @@ class SearchEngine:
                 if advanced_filters.get('extension'):
                     where_parts.append("name LIKE ?")
                     filter_params.append(f"%{advanced_filters['extension']}")
-                    where_parts.append("mimeType != 'folder'")
-                    where_parts.append("mimeType != 'application/vnd.google-apps.folder'")
 
                 if advanced_filters.get('is_starred'):
                     where_parts.append("starred = 1")
@@ -268,17 +269,23 @@ class SearchEngine:
 
                 if advanced_filters.get('path_filter'):
                     pf = advanced_filters['path_filter'].replace(chr(92), '/').lower()
-                    # Apenas filhos (começam com pf/) para não exibir a própria pasta
-                    where_parts.append("LOWER(REPLACE(path, '\\', '/')) LIKE ?")
+                    # Apenas filhos diretos (não a própria pasta e nem netos)
+                    where_parts.append("(py_lower(REPLACE(path, '\\', '/')) LIKE ? AND py_lower(REPLACE(path, '\\', '/')) NOT LIKE ?)")
                     filter_params.append(f"{pf}/%")
+                    filter_params.append(f"{pf}/%/%")
 
                 if advanced_filters.get('sandbox_filter'):
                     sf = advanced_filters['sandbox_filter'].replace(chr(92), '/').lower()
-                    where_parts.append("(LOWER(REPLACE(path, '\\', '/')) = ? OR LOWER(REPLACE(path, '\\', '/')) LIKE ?)")
+                    where_parts.append("(py_lower(REPLACE(path, '\\', '/')) = ? OR py_lower(REPLACE(path, '\\', '/')) LIKE ?)")
                     filter_params.append(sf)
                     filter_params.append(f"{sf}/%")
 
             details_query = f"SELECT file_id, name, path, mimeType, source, description, thumbnailLink, thumbnailPath, size, modifiedTime, createdTime, parentId, starred, webContentLink FROM files"
+            
+            # Remover o bloqueio global de pastas na busca normal
+            # where_parts.append("mimeType != 'folder'")
+            # where_parts.append("mimeType != 'application/vnd.google-apps.folder'")
+            
             if where_parts:
                 details_query += " WHERE " + " AND ".join(where_parts)
 
@@ -318,12 +325,12 @@ class SearchEngine:
             if folder_id:
                 files_where_clauses.append("parentId=?")
                 files_params.append(folder_id)
-            elif source == 'drive' and not folder_id:
+            if advanced_filters and advanced_filters.get('is_root'):
                 files_where_clauses.append(
                     "(parentId IS NULL OR parentId = '')")
-            elif filter_type not in ('all', 'folder'):
-                files_where_clauses.append(
-                    "mimeType NOT IN ('folder', 'application/vnd.google-apps.folder')")
+            
+            # Remove global ban of folders, so explorer works as intended
+            # files_where_clauses.append("mimeType NOT IN ('folder', 'application/vnd.google-apps.folder')")
             if filter_type == 'image':
                 files_where_clauses.append("mimeType LIKE 'image/%'")
             elif filter_type == 'document':
@@ -362,9 +369,8 @@ class SearchEngine:
                 if 'extension' in advanced_filters and advanced_filters['extension']:
                     files_where_clauses.append("name LIKE ?")
                     files_params.append(f"%{advanced_filters['extension']}")
-                    files_where_clauses.append("mimeType != 'folder'")
-                    files_where_clauses.append(
-                        "mimeType != 'application/vnd.google-apps.folder'")
+                    files_where_clauses.append("(mimeType != 'folder' OR mimeType IS NULL)")
+                    files_where_clauses.append("(mimeType != 'application/vnd.google-apps.folder' OR mimeType IS NULL)")
                 if 'is_starred' in advanced_filters and advanced_filters['is_starred']:
                     files_where_clauses.append("starred = 1")
                 if advanced_filters and advanced_filters.get('category'):
@@ -389,12 +395,13 @@ class SearchEngine:
 
                 if advanced_filters.get('path_filter'):
                     pf = advanced_filters['path_filter'].replace(chr(92), '/').lower()
-                    files_where_clauses.append("LOWER(REPLACE(path, '\\', '/')) LIKE ?")
-                    files_params.append(f"{pf}%")
+                    files_where_clauses.append("(py_lower(REPLACE(path, '\\', '/')) LIKE ? AND py_lower(REPLACE(path, '\\', '/')) NOT LIKE ?)")
+                    files_params.append(f"{pf}/%")
+                    files_params.append(f"{pf}/%/%")
 
                 if advanced_filters.get('sandbox_filter'):
                     sf = advanced_filters['sandbox_filter'].replace(chr(92), '/').lower()
-                    files_where_clauses.append("LOWER(REPLACE(path, '\\', '/')) LIKE ?")
+                    files_where_clauses.append("py_lower(REPLACE(path, '\\', '/')) LIKE ?")
                     files_params.append(f"{sf}%")
             query = f"SELECT file_id, name, path, mimeType, source, description, thumbnailLink, thumbnailPath, size, modifiedTime, createdTime, parentId, starred, webContentLink FROM files WHERE {' AND '.join(files_where_clauses)} ORDER BY {order_by_clause} LIMIT ? OFFSET ?"
             if explorer_special:

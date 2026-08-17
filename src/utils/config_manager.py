@@ -12,6 +12,8 @@ DEFAULT_SETTINGS = {
     'read_only_mode': False,
     'sandbox_mode': True,  # Ativo por padrão no desenvolvimento da v2.1
     'sandbox_path': r'L:\Drives Compartilhados\_TestesBanco',
+    'sandbox_drive_id': '0AIME28tN4AEHUk9PVA',
+    'production_drive_id': '0AOB-ISqqs76_Uk9PVA',
     'shared_cache_path': r'L:\Drives Compartilhados\zRecursos_VoxImago\file_index_shared.db',
     'sheets_vocab_url': 'https://docs.google.com/spreadsheets/d/1_etBf2z9sqmdR74j4ADso47XYGgYQXljdjtBo3X74Jw/export?format=csv',
     'sheets_doc_url': 'https://docs.google.com/document/d/1huecd2o-vcoapmPcjguQwjsQAMnaAbxYw4qSXmgOo0Y/export?format=txt',
@@ -73,7 +75,12 @@ class ConfigManager:
         return bool(self.get('sandbox_mode', True))
 
     def get_sandbox_path(self):
-        return self.get('sandbox_path', r'L:\_TestesBanco')
+        return self.get('sandbox_path', r'L:\Drives Compartilhados\_TestesBanco')
+
+    def get_current_drive_id(self):
+        if self.is_sandbox():
+            return self.get('sandbox_drive_id', '0AIME28tN4AEHUk9PVA')
+        return self.get('production_drive_id', '0AOB-ISqqs76_Uk9PVA')
 
     def set_read_only(self, value):
         self.set('read_only_mode', bool(value))

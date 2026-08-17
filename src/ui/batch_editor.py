@@ -56,7 +56,7 @@ class BatchEditorDialog(QDialog):
 
         mode_note = QLabel()
         if self.config_mgr.is_read_only():
-            mode_note.setText("🔒 Modo Somente Leitura Ativo: Ações bloqueadas.")
+            mode_note.setText("🔒 Modo Somente Leitura: As edições serão acumuladas na Fila de Revisão para exportação.")
             mode_note.setStyleSheet("color: #DC3545; font-weight: bold;")
         elif self.config_mgr.is_sandbox():
             mode_note.setText("🧪 As edições serão agendadas para o ambiente Sandbox (L:\\_TestesBanco).")
@@ -77,9 +77,6 @@ class BatchEditorDialog(QDialog):
         self.btn_add_to_queue.setStyleSheet(
             "background-color: #007BFF; color: white; font-weight: bold; padding: 6px 14px;")
         self.btn_add_to_queue.clicked.connect(self._add_to_queue)
-        if self.config_mgr.is_read_only():
-            self.btn_add_to_queue.setEnabled(False)
-
         btn_layout.addWidget(self.btn_add_to_queue)
 
         layout.addLayout(btn_layout)

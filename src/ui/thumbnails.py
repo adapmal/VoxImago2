@@ -98,7 +98,9 @@ class FileListDelegate(QStyledItemDelegate):
 
         pixmap = None
         if file_item.get('source') == 'local' or file_item.get('source') == 'drive':
-            local_path = file_item.get('path', '')
+            local_path = file_item.get('physical_path') or file_item.get('orig_path') or file_item.get('path') or ''
+            if local_path and not os.path.exists(local_path) and file_item.get('orig_path') and os.path.exists(file_item['orig_path']):
+                local_path = file_item['orig_path']
             if local_path and not os.path.isdir(local_path):
                 extension = os.path.splitext(
                     local_path)[1].lower() if local_path else ''
@@ -248,10 +250,12 @@ class ThumbnailManager:
 
     def generate_local_video_thumbnail(file_item, base_size=256):
         try:
-            local_path = file_item.get('path')
-
+            local_path = file_item.get('physical_path') or file_item.get('orig_path') or file_item.get('path')
             if not local_path or not os.path.exists(local_path):
-                return None
+                if file_item.get('orig_path') and os.path.exists(file_item['orig_path']):
+                    local_path = file_item['orig_path']
+                else:
+                    return None
             if os.path.isdir(local_path):
                 return None
 
@@ -349,9 +353,12 @@ class ThumbnailManager:
 
     def generate_local_pdf_thumbnail(file_item, base_size=256):
         try:
-            local_path = file_item.get('path')
+            local_path = file_item.get('physical_path') or file_item.get('orig_path') or file_item.get('path')
             if not local_path or not os.path.exists(local_path):
-                return None
+                if file_item.get('orig_path') and os.path.exists(file_item['orig_path']):
+                    local_path = file_item['orig_path']
+                else:
+                    return None
             _, ext = os.path.splitext(local_path)
             if (file_item.get('mimeType') or '').lower() != 'application/pdf' and ext.lower() != '.pdf':
                 return None
@@ -384,9 +391,12 @@ class ThumbnailManager:
             if not file_item:
                 return None
             mime = (file_item.get('mimeType') or '').lower()
-            local_path = file_item.get('path')
+            local_path = file_item.get('physical_path') or file_item.get('orig_path') or file_item.get('path')
             if not local_path or not os.path.exists(local_path):
-                return None
+                if file_item.get('orig_path') and os.path.exists(file_item['orig_path']):
+                    local_path = file_item['orig_path']
+                else:
+                    return None
             if not mime.startswith('image/'):
                 guessed, _ = mimetypes.guess_type(local_path)
                 if not guessed or not guessed.startswith('image/'):
@@ -433,11 +443,14 @@ class ThumbnailManager:
             import rawpy
             import numpy as np
             from PyQt6.QtGui import QImage
-            local_path = file_item.get('path')
+            local_path = file_item.get('physical_path') or file_item.get('orig_path') or file_item.get('path')
             if not local_path or not os.path.exists(local_path):
-                logging.error(
-                    f'[THUMB][RAW][ERRO] Caminho inválido ou arquivo não existe: {local_path}')
-                return None
+                if file_item.get('orig_path') and os.path.exists(file_item['orig_path']):
+                    local_path = file_item['orig_path']
+                else:
+                    logging.error(
+                        f'[THUMB][RAW][ERRO] Caminho inválido ou arquivo não existe: {local_path}')
+                    return None
             raw_exts = ['.raw', '.arw', '.cr2', '.nef',
                         '.dng', '.raf', '.orf', '.srw', '.rw2', '.pef']
             if not any(local_path.lower().endswith(ext) for ext in raw_exts):
@@ -553,7 +566,9 @@ class ThumbnailCache:
     @staticmethod
     def get_thumbnail_cache_key(file_item):
         if file_item.get('source') == 'local':
-            path = file_item.get('path', '')
+            path = file_item.get('physical_path') or file_item.get('orig_path') or file_item.get('path') or ''
+            if path and not os.path.exists(path) and file_item.get('orig_path') and os.path.exists(file_item['orig_path']):
+                path = file_item['orig_path']
             mtime = str(file_item.get('modifiedTime', ''))
             size = str(file_item.get('size', ''))
             key = hashlib.sha1(f"{path}|{mtime}|{size}".encode()).hexdigest()

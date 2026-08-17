@@ -3,12 +3,25 @@
 # Inicializa a interface gráfica e exibe a janela principal.
 
 import sys
+import os
+import logging
 from PyQt6.QtWidgets import QApplication
 from src.ui.ui import DriveFileGalleryApp
 
 
+def setup_logging():
+    os.makedirs('logs', exist_ok=True)
+    log_format = '%(asctime)s [%(levelname)s] %(message)s'
+    handlers = [
+        logging.FileHandler(os.path.join('logs', 'voximago.log'), encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+    logging.basicConfig(level=logging.INFO, format=log_format, handlers=handlers)
+
+
 def main():
-    print('DEBUG: QApplication será criado')
+    setup_logging()
+    logging.info("=== Iniciando VoxImago.MB ===")
     app = QApplication(sys.argv)
     print('DEBUG: QApplication criado')
     window = DriveFileGalleryApp()

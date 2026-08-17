@@ -23,9 +23,12 @@ class FileListModel(QAbstractListModel):
             return file_item
         return QVariant()
 
+    def getFiles(self):
+        return list(self._files)
+
     def setFiles(self, files):
         self.beginResetModel()
-        self._files = files
+        self._files = files or []
         self.endResetModel()
 
     def addFiles(self, files):

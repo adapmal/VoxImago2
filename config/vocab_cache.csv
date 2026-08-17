@@ -1,9 +1,35 @@
-Evento / Atividade,Classificação da Pessoa,Nome dos Missionários,Outros Nomes,Casas / Sítios,Kerigmas,Local Específico,Cidade,País,Condição Técnica,Objetos,Ação / Verbo,Ano
-Missa,Missionário,Pe. Gianpietro,Dom Odilo,Gavi,Querigma do Amor,Capela,São Paulo,Brasil,Foto Posada,Bíblia,Orando,2026
-Votos,Irmão,Pe. Henrique,Dom Cícero,Guadalupe,Querigma do Pecado,Altar,Rio de Janeiro,Itália,Foto Espontânea,Terço,Pregando,2025
-Crisma,Irmã,Ir. Teresinha,Dom Rogério,Oratório,Querigma da Salvação,Refeitório,Roma,Haiti,Vídeo,Cruz,Adorando,2024
-Batismo,Acolhido,Ir. Maria,Luciney Martins,RDP,Querigma da Fé,Pátio,Belém,França,Alta Qualidade,Vela,Abraçando,2023
-Lava-Pés,Cooperador,Pe. Renato,Chiara Carra,Belém,Querigma do Espírito,Praça da Sé,Milão,Espanha,Recorte,Cálice,Caminhando,2022
-Dia dos Pobres,Seminarista,Pe. Cícero,Bea Franco,São José do Belém,Querigma da Comunhão,Catedral,Paris,Portugal,RAW,Hóstia,Cantando,2021
-Escola de Missão,Voluntário,Ir. Clara,Josiane,Amor em Cacau,Querigma da Missão,Tenda,Port-au-Prince,Moçambique,Convertida,Violão,Sorrindo,2020
-Missa 20 anos,Benfeitor,Ir. Francisco,Agnaldo,Casa de Acolhida,Evangelização,Santuário,Fortaleza,Argentina,Banner,Microfone,Comungando,2019
+﻿Evento/Atividade/Motivação da Foto,Classificação Pessoas,Nomes Missionário,Nomes Outros,Sítio de Acolhida,Kerigmas,Local específico,Cidade,País,Condição técnica da foto,Objetos,Ação/substantivo,Ano
+Adoração,acolhido,AndréAlves,DomCíceroAlves,Araceli*,Ajarai,Bazar,Jarinu,Brasil,&boa,bíblia,abraçando,1997
+Aniversário (XXanos),adolescente,AndréLuiz,DomOdiloPedroScherer,Balsa,Caná,Cozinha,Jundiaí,Itália,&excelente,bolo,Adorando,1998
+Aula Online/reunião online,autoridade,Cacilda,DomGil,BomSamaritano,Efatha,Cracolândia,Roma,Haiti,&ótima,cruz,ajudando,1999
+Casamento/matrimônio,cadeirante,CamilaJarenko,JéssicaOrtiz,Embú,EscolaDeMissão,Medjugorje,SãoPaulo,Japão,expressivo,eucaristia,Bebendo,2000
+Confissão,casal,ChiaraCarraro,JúlioLancellotti,Gavi,Fanuel,Molokai,RioGrandedaSerra,Bósnia,posada,Jesus,Brincando,2001
+DiaMundialdoPobre,colaborador,ChiaraSpolaore,,Guadalupe,Jeshuá,NelsonCruz,,Vaticano,pretoebranco,NossaSenhora,Cantando,2002
+Diálogo,criança,DivãSousa,,Mães,Ruah,NovaGuadalupe,,,ruim,Relíquia,Comendo,2003
+Domingo Belém Especial,grupo,Gianpietro,,Mauá,,PraçaDaSé,,,vertical,sacrário,conversando,2004
+Encontro,IrmãoDeRua,GilsonFrank,,Mulheres,,Igreja,,,horizontal,Salgado,dançando,2005
+Formação,jovem,GlóriaMaria,,Paraná,,Escola,,,clássica,terço,Doando,2006
+Missa,missionário,HélioFerreira,,Penha,,Natureza,,,,trufa,acolhendo,2007
+MissãoDeRua,padre,Heloisa,,RainhadaPaz,,Rua,,,,altar,Estudando,2008
+Natal,papa,JéssicaBertoldo,,SãoMiguelArcanjo,,obra,,,,Ostensório,Lendo,2009
+Partilha,proibido,JosianeAngelon,,SãoMiguelPaulista,,lavanderia,,,,Diarioespiritual,Palestrando/palestrante,2010
+Páscoa,provedor,KarenCristina,,Sé,,Capela,,,,Horta,Rezando,2011
+Pentecostes,solo,LaísCristina,,Suzano,,CatedraldaSé,,,,ônibus,sentado,2012
+Quaresma,vozinho,LaísdaSilva,,SãoGabrielArcanjo,,,,,,,Sorrindo,2013
+Sacramento,Doente,MariaCidinha,,Japi,,,,,,,Tocando(musica),2014
+Vacinação,,MariachiaraCarraro,,SãoBento,,,,,,,trabalhando,2015
+Viagem,,MariaCustódia,,,,,,,,,Vendendo,2016
+Visita,,MariaVittoria,,,,,,,,,beijando,2017
+Procissão,,Mikaela,,,,,,,,,,2018
+Saúde,,Paulinho,,,,,,,,,,2019
+Higiene,,RenataLopes,,,,,,,,,,2020
+Chegando,,Renato,,,,,,,,,,2021
+,,RenatoGodoy,,,,,,,,,,2022
+,,SilviaSilvestri,,,,,,,,,,2023
+,,StefaniaBallin,,,,,,,,,,2024
+,,TamiresMartins,,,,,,,,,,2025
+,,TerezinhaLeste,,,,,,,,,,2026
+,,ValessaFarias,,,,,,,,,,
+,,VanessaMatias,,,,,,,,,,
+,,BrendaSantos,,,,,,,,,,
+,,JessicaJago,,,,,,,,,,

@@ -7,7 +7,7 @@ from google.auth.transport.requests import Request
 from src.utils.utils import load_settings
 import os
 
-SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
+SCOPES = ['https://www.googleapis.com/auth/drive']
 TOKEN_FILE = 'config/token.json'
 CREDENTIALS_FILE = 'config/credentials.json'
 

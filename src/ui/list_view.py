@@ -24,9 +24,11 @@ class FileListView(QListView):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setSelectionRectVisible(False)  # Desativa o quadradinho/rubberband retangular
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
         self.drag_start_position = None
+        self._pressed_selected_index = None
         self.doubleClicked.connect(self._emit_double_click)
 
     def setModel(self, model):
@@ -56,19 +58,47 @@ class FileListView(QListView):
         self.fileDoubleClicked.emit(file_item)
 
     def mousePressEvent(self, event):
-        super().mousePressEvent(event)
         if event.button() == Qt.MouseButton.LeftButton:
             index = self.indexAt(event.pos())
-            if index.isValid():
-                self.drag_start_position = event.pos()
-            else:
+            modifiers = event.modifiers()
+            has_modifiers = bool(modifiers & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier))
+            
+            # Clicar em área vazia desmarca todos os itens sem criar caixa/quadradinho de seleção
+            if not index.isValid():
+                self._pressed_selected_index = None
                 self.drag_start_position = None
+                self.clearSelection()
+                return
+
+            # Se clicou sobre um item já selecionado sem Ctrl/Shift, preserva a seleção para arrastar em lote
+            if index in self.selectedIndexes() and not has_modifiers:
+                self.drag_start_position = event.pos()
+                self._pressed_selected_index = index
+                return
+
+            self._pressed_selected_index = None
+            self.drag_start_position = event.pos()
+
+        super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        if self.drag_start_position is not None and (event.pos() - self.drag_start_position).manhattanLength() > QApplication.startDragDistance():
-            self.startDrag(Qt.DropAction.CopyAction)
-            self.drag_start_position = None
+        if self.drag_start_position is not None:
+            if (event.pos() - self.drag_start_position).manhattanLength() > QApplication.startDragDistance():
+                self._pressed_selected_index = None
+                self.startDrag(Qt.DropAction.MoveAction | Qt.DropAction.CopyAction)
+                self.drag_start_position = None
+                return
         super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and getattr(self, '_pressed_selected_index', None) is not None:
+            idx = self._pressed_selected_index
+            self._pressed_selected_index = None
+            self.drag_start_position = None
+            if idx.isValid() and self.selectionModel():
+                from PyQt6.QtCore import QItemSelectionModel
+                self.selectionModel().setCurrentIndex(idx, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+        super().mouseReleaseEvent(event)
 
     def startDrag(self, supportedActions):
         indexes = self.selectedIndexes()
@@ -82,19 +112,34 @@ class FileListView(QListView):
 
         mime_data = QMimeData()
         urls = []
+        file_items = []
         for index in indexes:
             file_item = index.data(Qt.ItemDataRole.UserRole)
-            if file_item.get('source') == 'local' and file_item.get('path'):
-                urls.append(QUrl.fromLocalFile(file_item['path']))
-            elif file_item.get('source') == 'drive' and file_item.get('webViewLink'):
-                urls.append(QUrl(file_item['webViewLink']))
+            if file_item:
+                file_items.append(file_item)
+                if file_item.get('source') == 'local' and file_item.get('path'):
+                    urls.append(QUrl.fromLocalFile(file_item['path']))
+                elif file_item.get('source') == 'drive' and file_item.get('webViewLink'):
+                    urls.append(QUrl(file_item['webViewLink']))
+
         mime_data.setUrls(urls)
+        try:
+            import json
+            mime_data.setData("application/x-voximago-file-items", json.dumps(file_items).encode('utf-8'))
+        except Exception:
+            pass
 
         drag = QDrag(self)
         drag.setMimeData(mime_data)
-        drag.exec(Qt.DropAction.CopyAction)
+        drag.exec(Qt.DropAction.MoveAction | Qt.DropAction.CopyAction)
 
     def show_context_menu(self, position):
+        clicked_index = self.indexAt(position)
+        if clicked_index.isValid() and clicked_index not in self.selectedIndexes():
+            if self.selectionModel():
+                from PyQt6.QtCore import QItemSelectionModel
+                self.selectionModel().setCurrentIndex(clicked_index, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+
         selected_indexes = self.selectedIndexes()
         selected_items = [idx.data(Qt.ItemDataRole.UserRole) for idx in selected_indexes if idx.isValid() and idx.data(Qt.ItemDataRole.UserRole)]
 
