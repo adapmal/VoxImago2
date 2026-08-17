@@ -86,7 +86,8 @@ class DriveFileGalleryApp(QMainWindow):
         self.scroll_loading = False
 
         self.thread_pool = QThreadPool.globalInstance()
-        self.thread_pool.setMaxThreadCount(8)
+        self.thread_pool.setMaxThreadCount(3)
+
 
         self.tray_icon = QSystemTrayIcon(self)
         self.tray_icon.setIcon(QIcon("assets/VMico.png"))
@@ -152,7 +153,8 @@ class DriveFileGalleryApp(QMainWindow):
         
         self.incremental_sync_timer = QTimer()
         self.incremental_sync_timer.timeout.connect(self._run_incremental_sync)
-        self.incremental_sync_timer.start(1 * 60 * 1000)  # 1 minuto
+        self.incremental_sync_timer.start(15 * 60 * 1000)  # 15 minutos
+
 
         self.completer_model = QStringListModel()
 
@@ -798,6 +800,10 @@ class DriveFileGalleryApp(QMainWindow):
             return
             
         import logging
+        if hasattr(self, 'inc_sync_thread') and self.inc_sync_thread and self.inc_sync_thread.isRunning():
+            logging.info("⏳ Sincronização incremental já está em andamento, ignorando ciclo.")
+            return
+
         logging.info("⏳ Disparando Sincronização Incremental (Background)...")
         self.status_bar.showMessage("🔄 Verificando atualizações no Google Drive...", 2500)
         
@@ -813,6 +819,7 @@ class DriveFileGalleryApp(QMainWindow):
         def on_inc_finished(count):
             self.inc_sync_thread.quit()
             self.inc_sync_thread.wait(2000)
+            self.inc_sync_thread.deleteLater()
             if count > 0:
                 self.status_bar.showMessage(f"✅ Sincronização: {count} arquivo(s) atualizado(s) da nuvem.", 5000)
                 self._force_refresh_after_sync()
@@ -822,6 +829,7 @@ class DriveFileGalleryApp(QMainWindow):
         def on_inc_failed(err):
             self.inc_sync_thread.quit()
             self.inc_sync_thread.wait(2000)
+            self.inc_sync_thread.deleteLater()
             import logging
             logging.error(f"Sincronização incremental falhou: {err}")
             self.status_bar.showMessage(f"⚠️ Erro no sync em segundo plano: {err}", 4000)
@@ -830,6 +838,7 @@ class DriveFileGalleryApp(QMainWindow):
         self.inc_sync_worker.sync_failed.connect(on_inc_failed)
         
         self.inc_sync_thread.start()
+
 
     def update_ui_for_auth_state(self, is_auth):
         self.main_bar.category_combo.setEnabled(True)

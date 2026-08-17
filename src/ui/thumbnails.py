@@ -22,9 +22,11 @@ try:
     import pillow_heif
     pillow_heif.register_heif_opener()
 except ImportError:
-    pass
+    import threading
 
 THUMBNAIL_CACHE_DIR = 'assets/thumbnail_cache'
+_media_lock = threading.Lock()
+
 
 
 class ThumbnailTask(QRunnable):
@@ -302,38 +304,43 @@ class ThumbnailManager:
                 logging.error(
                     f"[THUMB][VIDEO][ERRO] Falha ao importar OpenCV/numpy: {e}")
                 return None
-            cap = cv2.VideoCapture(local_path)
-            if not cap.isOpened():
-                logging.warning(
-                    f"[THUMB][VIDEO][ERRO] Não foi possível abrir o vídeo: {local_path}")
-                return None
-            ret, frame = cap.read()
-            if not ret:
-                logging.info(
-                    f"[THUMB][VIDEO][WARN] Frame inicial não lido, tentando 500ms...")
-                cap.set(cv2.CAP_PROP_POS_MSEC, 500)
+            with _media_lock:
+                cap = cv2.VideoCapture(local_path)
+                if not cap.isOpened():
+                    logging.warning(
+                        f"[THUMB][VIDEO][ERRO] Não foi possível abrir o vídeo: {local_path}")
+                    return None
                 ret, frame = cap.read()
                 if not ret:
-                    logging.warning(
-                        f"[THUMB][VIDEO][ERRO] Não foi possível ler frame do vídeo: {local_path}")
-                    cap.release()
+                    logging.info(
+                        f"[THUMB][VIDEO][WARN] Frame inicial não lido, tentando 500ms...")
+                    cap.set(cv2.CAP_PROP_POS_MSEC, 500)
+                    ret, frame = cap.read()
+                    if not ret:
+                        logging.warning(
+                            f"[THUMB][VIDEO][ERRO] Não foi possível ler frame do vídeo: {local_path}")
+                        cap.release()
+                        return None
+                cap.release()
+                if frame is None or frame.size == 0:
                     return None
-            cap.release()
-            try:
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            except Exception as e:
-                logging.error(
-                    f"[THUMB][VIDEO][ERRO] Falha ao converter frame para RGB: {e}")
-                return None
-            h, w, ch = frame_rgb.shape
-            bytes_per_line = ch * w
-            try:
-                img = QImage(frame_rgb.data, w, h, bytes_per_line,
-                             QImage.Format.Format_RGB888).copy()
-            except Exception as e:
-                logging.error(
-                    f"[THUMB][VIDEO][ERRO] Falha ao criar QImage: {e}")
-                return None
+                try:
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    frame_rgb = np.ascontiguousarray(frame_rgb)
+                except Exception as e:
+                    logging.error(
+                        f"[THUMB][VIDEO][ERRO] Falha ao converter frame para RGB: {e}")
+                    return None
+                h, w, ch = frame_rgb.shape
+                bytes_per_line = ch * w
+                try:
+                    img = QImage(frame_rgb.data, w, h, bytes_per_line,
+                                 QImage.Format.Format_RGB888).copy()
+                except Exception as e:
+                    logging.error(
+                        f"[THUMB][VIDEO][ERRO] Falha ao criar QImage: {e}")
+                    return None
+
             img = img.scaled(base_size, base_size, Qt.AspectRatioMode.KeepAspectRatio,
                              Qt.TransformationMode.SmoothTransformation)
             cache_path = ThumbnailCache.get_thumbnail_cache_path(
@@ -458,48 +465,51 @@ class ThumbnailManager:
                     f'[THUMB][RAW][ERRO] Extensão não suportada para RAW: {local_path}')
                 return None
             try:
-                with rawpy.imread(local_path) as raw:
-                    thumb = raw.extract_thumb()
-                    from PIL import Image
-                    if thumb.format == rawpy.ThumbFormat.JPEG:
-                        import imageio.v3 as iio
-                        img = iio.imread(thumb.data)
-                    elif thumb.format == rawpy.ThumbFormat.BITMAP:
-                        from io import BytesIO
-                        try:
-                            pil_img = Image.open(BytesIO(thumb.data))
-                            pil_img = pil_img.convert('RGB')
-                            img = np.array(pil_img)
-                        except Exception as pil_e:
+                with _media_lock:
+                    with rawpy.imread(local_path) as raw:
+                        thumb = raw.extract_thumb()
+                        from PIL import Image
+                        if thumb.format == rawpy.ThumbFormat.JPEG:
+                            import imageio.v3 as iio
+                            img = iio.imread(thumb.data)
+                        elif thumb.format == rawpy.ThumbFormat.BITMAP:
+                            from io import BytesIO
+                            try:
+                                pil_img = Image.open(BytesIO(thumb.data))
+                                pil_img = pil_img.convert('RGB')
+                                img = np.array(pil_img)
+                            except Exception as pil_e:
+                                logging.error(
+                                    f'[THUMB][RAW][ERRO] Falha ao abrir TIFF embutido: {pil_e} | arquivo: {local_path}')
+                                return None
+                        else:
                             logging.error(
-                                f'[THUMB][RAW][ERRO] Falha ao abrir TIFF embutido: {pil_e} | arquivo: {local_path}')
+                                f'[THUMB][RAW][ERRO] Formato de thumb RAW não suportado: {thumb.format} | arquivo: {local_path}')
                             return None
-                    else:
-                        logging.error(
-                            f'[THUMB][RAW][ERRO] Formato de thumb RAW não suportado: {thumb.format} | arquivo: {local_path}')
-                        return None
-                    try:
-                        pil_img = Image.fromarray(img)
-                        pil_img.thumbnail(
-                            (base_size, base_size), Image.LANCZOS)
-                        img = np.array(pil_img)
-                    except Exception as resize_e:
-                        logging.error(
-                            f'[THUMB][RAW][ERRO] Falha ao redimensionar thumb: {resize_e} | arquivo: {local_path}')
-                        return None
-                    if img is None or img.size == 0 or len(img.shape) != 3:
-                        logging.error(
-                            f'[THUMB][RAW][ERRO] Imagem extraída do RAW é inválida. | arquivo: {local_path}')
-                        return None
-                    h, w, ch = img.shape
-                    bytes_per_line = ch * w
-                    try:
-                        qimg = QImage(img.data, w, h, bytes_per_line,
-                                      QImage.Format.Format_RGB888).copy()
-                    except Exception as qimg_e:
-                        logging.error(
-                            f'[THUMB][RAW][ERRO] Falha ao criar QImage: {qimg_e} | arquivo: {local_path}')
-                        return None
+                        try:
+                            pil_img = Image.fromarray(img)
+                            pil_img.thumbnail(
+                                (base_size, base_size), Image.LANCZOS)
+                            img = np.array(pil_img)
+                        except Exception as resize_e:
+                            logging.error(
+                                f'[THUMB][RAW][ERRO] Falha ao redimensionar thumb: {resize_e} | arquivo: {local_path}')
+                            return None
+                        if img is None or img.size == 0 or len(img.shape) != 3:
+                            logging.error(
+                                f'[THUMB][RAW][ERRO] Imagem extraída do RAW é inválida. | arquivo: {local_path}')
+                            return None
+                        img = np.ascontiguousarray(img)
+                        h, w, ch = img.shape
+                        bytes_per_line = ch * w
+                        try:
+                            qimg = QImage(img.data, w, h, bytes_per_line,
+                                          QImage.Format.Format_RGB888).copy()
+                        except Exception as qimg_e:
+                            logging.error(
+                                f'[THUMB][RAW][ERRO] Falha ao criar QImage: {qimg_e} | arquivo: {local_path}')
+                            return None
+
                     cache_path = ThumbnailCache.get_thumbnail_cache_path(
                         file_item, 'png')
                     ThumbnailCache.ensure_thumbnail_cache_dir()

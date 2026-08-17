@@ -1,3 +1,5 @@
 @echo off
-py -3.12 app.py
-pause
+cd /d "%~dp0"
+py app.py
+if errorlevel 1 pause
+
