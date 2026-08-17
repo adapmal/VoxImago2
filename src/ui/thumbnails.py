@@ -18,11 +18,13 @@ import hashlib
 import mimetypes
 import logging
 import requests
+import threading
 try:
     import pillow_heif
     pillow_heif.register_heif_opener()
 except ImportError:
-    import threading
+    pass
+
 
 THUMBNAIL_CACHE_DIR = 'assets/thumbnail_cache'
 _media_lock = threading.Lock()
