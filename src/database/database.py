@@ -47,21 +47,42 @@ class FileIndexer:
             os.makedirs(db_dir, exist_ok=True)
             print(f"📁 Pasta '{db_dir}' criada automaticamente")
 
-        # Se o banco local não existir ou estiver vazio (ex: clone novo do GitHub), restaurar da nuvem
-        if (not os.path.exists(self.db_name) or os.path.getsize(self.db_name) < 1024 * 1024):
-            shared_candidates = [
-                r"L:\Drives Compartilhados\zRecursos_VoxImago\file_index_shared.db",
-                r"L:\.voximago_system\shared_index.db"
-            ]
-            for s_path in shared_candidates:
+        # Sincronização / Restauração inteligente a partir da nuvem (Drive Compartilhado)
+        shared_candidates = [
+            r"L:\Drives Compartilhados\zRecursos_VoxImago\file_index_shared.db",
+            r"L:\.voximago_system\shared_index.db"
+        ]
+
+        local_exists = os.path.exists(self.db_name) and os.path.getsize(self.db_name) >= 1024 * 1024
+
+        for s_path in shared_candidates:
+            try:
                 if os.path.exists(s_path) and os.path.getsize(s_path) > 1024 * 1024:
-                    try:
-                        print(f"📦 Restaurando banco de dados local a partir do Drive Compartilhado ({s_path})...")
+                    should_copy = False
+                    if not local_exists:
+                        print(f"📦 Banco local ausente ou vazio. Restaurando da nuvem ({s_path})...")
+                        should_copy = True
+                    else:
+                        local_mtime = os.path.getmtime(self.db_name)
+                        remote_mtime = os.path.getmtime(s_path)
+                        if remote_mtime > local_mtime:
+                            print(f"🔄 Banco compartilhado na nuvem é mais recente ({s_path}). Atualizando banco local...")
+                            should_copy = True
+
+                    if should_copy:
+                        # Limpar arquivos WAL / SHM antigos antes de copiar
+                        for ext in ["-wal", "-shm"]:
+                            wal_file = self.db_name + ext
+                            if os.path.exists(wal_file):
+                                try:
+                                    os.remove(wal_file)
+                                except Exception:
+                                    pass
                         shutil.copy2(s_path, self.db_name)
-                        print("✅ Banco de dados restaurado com sucesso da nuvem!")
+                        print("✅ Banco de dados local sincronizado com sucesso com a versão da nuvem!")
                         break
-                    except Exception as e_copy:
-                        print(f"⚠️ Não foi possível copiar banco compartilhado: {e_copy}")
+            except Exception as e_copy:
+                print(f"⚠️ Não foi possível sincronizar com o banco compartilhado: {e_copy}")
 
         self.conn = sqlite3.connect(self.db_name, check_same_thread=False, timeout=30.0)
         self.conn.create_function("py_lower", 1, lambda s: s.lower() if s else s)

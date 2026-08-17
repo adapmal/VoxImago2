@@ -29,24 +29,37 @@ class FileListView(QListView):
         self.customContextMenuRequested.connect(self.show_context_menu)
         self.drag_start_position = None
         self._pressed_selected_index = None
+        self._anchor_index = None
         self.doubleClicked.connect(self._emit_double_click)
 
     def setModel(self, model):
         super().setModel(model)
+        self._anchor_index = None
         if self.selectionModel():
             self.selectionModel().selectionChanged.connect(self._emit_selection)
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Delete:
+        if event.key() == Qt.Key.Key_Space:
+            self.show_quick_preview()
+            return
+        elif event.key() == Qt.Key.Key_Delete:
             if self.selectedIndexes():
                 self.deleteRequested.emit()
+            return
         super().keyPressEvent(event)
+        # Atualiza a âncora ao navegar com as setas do teclado sem Shift
+        if not (event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+            cur = self.currentIndex()
+            if cur.isValid():
+                self._anchor_index = cur
 
     def _emit_selection(self, selected, deselected):
-        indexes = self.selectedIndexes()
+        indexes = sorted(self.selectedIndexes(), key=lambda idx: idx.row())
         items = []
         for index in indexes:
-            items.append(index.data(Qt.ItemDataRole.UserRole))
+            item_data = index.data(Qt.ItemDataRole.UserRole)
+            if item_data:
+                items.append(item_data)
         if items:
             self.fileSelected.emit(items[0])
             self.filesSelected.emit(items)
@@ -61,23 +74,69 @@ class FileListView(QListView):
         if event.button() == Qt.MouseButton.LeftButton:
             index = self.indexAt(event.pos())
             modifiers = event.modifiers()
-            has_modifiers = bool(modifiers & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier))
-            
-            # Clicar em área vazia desmarca todos os itens sem criar caixa/quadradinho de seleção
+            has_shift = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
+            has_ctrl = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
+
+            # Clicar em área vazia desmarca todos os itens
             if not index.isValid():
                 self._pressed_selected_index = None
+                self._anchor_index = None
                 self.drag_start_position = None
                 self.clearSelection()
                 return
 
             # Se clicou sobre um item já selecionado sem Ctrl/Shift, preserva a seleção para arrastar em lote
-            if index in self.selectedIndexes() and not has_modifiers:
+            if index in self.selectedIndexes() and not (has_shift or has_ctrl):
                 self.drag_start_position = event.pos()
                 self._pressed_selected_index = index
                 return
 
             self._pressed_selected_index = None
             self.drag_start_position = event.pos()
+
+            if has_shift:
+                # Seleção contínua linear confiável (do primeiro item ao último)
+                anchor = self._anchor_index if (self._anchor_index is not None and self._anchor_index.isValid()) else self.currentIndex()
+                if not anchor or not anchor.isValid():
+                    selected = self.selectedIndexes()
+                    if selected:
+                        anchor = selected[0]
+                    else:
+                        anchor = index
+
+                start_row = min(anchor.row(), index.row())
+                end_row = max(anchor.row(), index.row())
+
+                from PyQt6.QtCore import QItemSelection, QItemSelectionModel
+                model = self.model()
+                if model and self.selectionModel():
+                    sel_range = QItemSelection(
+                        model.index(start_row, 0),
+                        model.index(end_row, 0)
+                    )
+                    if has_ctrl:
+                        self.selectionModel().select(sel_range, QItemSelectionModel.SelectionFlag.Select)
+                    else:
+                        self.selectionModel().select(sel_range, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+                    self.selectionModel().setCurrentIndex(index, QItemSelectionModel.SelectionFlag.NoUpdate)
+                return
+
+            elif has_ctrl:
+                # Seleção toggle individual com Ctrl
+                if self.selectionModel():
+                    from PyQt6.QtCore import QItemSelectionModel
+                    self.selectionModel().select(index, QItemSelectionModel.SelectionFlag.Toggle)
+                    self.selectionModel().setCurrentIndex(index, QItemSelectionModel.SelectionFlag.NoUpdate)
+                    self._anchor_index = index
+                return
+
+            else:
+                # Clique simples sem modificadores: seleciona apenas o item e define nova âncora
+                self._anchor_index = index
+                if self.selectionModel():
+                    from PyQt6.QtCore import QItemSelectionModel
+                    self.selectionModel().setCurrentIndex(index, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+                return
 
         super().mousePressEvent(event)
 
@@ -98,6 +157,7 @@ class FileListView(QListView):
             if idx.isValid() and self.selectionModel():
                 from PyQt6.QtCore import QItemSelectionModel
                 self.selectionModel().setCurrentIndex(idx, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+                self._anchor_index = idx
         super().mouseReleaseEvent(event)
 
     def startDrag(self, supportedActions):
@@ -180,11 +240,6 @@ class FileListView(QListView):
                         'Drives compartilhados', 'Shared drives')
                 QApplication.clipboard().setText(caminho)
 
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Space:
-            self.show_quick_preview()
-        else:
-            super().keyPressEvent(event)
 
     def show_quick_preview(self):
         indexes = self.selectedIndexes()

@@ -129,10 +129,13 @@ temp/
 tmp/
 
 # =================================
-# ⚙️ CONFIGURAÇÕES LOCAIS
+# ⚙️ CONFIGURAÇÕES E DADOS LOCAIS
 # =================================
 config/settings.json
 settings.json
+config/staging_queue.json
+staging_queue.json
+config/backups/
 local_settings.py
 .env.local
 
