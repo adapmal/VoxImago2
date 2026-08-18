@@ -12,7 +12,7 @@ from src.drive.processing import start_drive_folder_processing
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QLabel, QMessageBox, QDialog, QDialogButtonBox, QProgressBar, QSplitter, QVBoxLayout, QProgressDialog, QListView, QSystemTrayIcon, QMenu,
-    QAbstractItemView
+    QAbstractItemView, QApplication
 )
 
 from PyQt6.QtGui import QIcon, QAction
@@ -219,8 +219,13 @@ class DriveFileGalleryApp(QMainWindow):
             else:
                 mode = "grid"
 
+        self.file_list_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.file_list_view.setResizeMode(QListView.ResizeMode.Adjust)
+        self.file_list_view.setMovement(QListView.Movement.Static)
+
         if mode == "grid":
             self.file_list_view.setViewMode(QListView.ViewMode.IconMode)
+            self.file_list_view.setWrapping(True)
             self.file_list_view.setIconSize(QSize(200, 200))
             self.file_list_view.setGridSize(QSize(240, 280))
             self.file_list_view.setSpacing(8)
@@ -230,8 +235,9 @@ class DriveFileGalleryApp(QMainWindow):
             self.file_list_view.verticalScrollBar().setPageStep(240)
         else:
             self.file_list_view.setViewMode(QListView.ViewMode.ListMode)
+            self.file_list_view.setWrapping(False)
             self.file_list_view.setIconSize(QSize(48, 48))
-            self.file_list_view.setGridSize(QSize(60, 60))
+            self.file_list_view.setGridSize(QSize())
             self.file_list_view.setSpacing(4)
             self.action_grid_view.setChecked(False)
             self.action_list_view.setChecked(True)
@@ -1729,15 +1735,96 @@ class DriveFileGalleryApp(QMainWindow):
             if getattr(self, 'current_folder_path_filter', None):
                 self.current_page = 0
                 self.all_files_loaded = False
-                list_update.clear_display(self)
-                list_update.load_next_batch(self)
+    def focus_staging_item(self, staging_item):
+        """Ao clicar em um item na janela da Fila, navega na árvore para a pasta do arquivo e o seleciona na grade e detalhes."""
+        if not staging_item:
+            return
+
+        fid = staging_item.file_id
+        fname = staging_item.file_name
+        fpath = staging_item.path or staging_item.old_value or ''
+
+        # Se não tiver caminho direto registrado, busca no SQLite
+        if not fpath and hasattr(self, 'indexer') and self.indexer:
+            try:
+                self.indexer.ensure_conn()
+                self.indexer.cursor.execute("SELECT path FROM files WHERE file_id = ? OR name = ? LIMIT 1", (fid, fname))
+                r = self.indexer.cursor.fetchone()
+                if r and r[0]:
+                    fpath = r[0]
+            except Exception:
+                pass
+
+        if not fpath:
+            return
+
+        fpath = os.path.normpath(fpath)
+        folder_path = os.path.normpath(os.path.dirname(fpath))
+
+        # 1. Expandir e selecionar a pasta na Árvore de Diretórios
+        if hasattr(self, 'folder_tree') and self.folder_tree:
+            self.folder_tree.select_and_expand_folder(folder_path)
+
+        # 2. Localizar e iluminar/selecionar o arquivo na grade do meio
+        def _find_and_select():
+            if not hasattr(self, 'file_list_model') or not self.file_list_model:
+                return
+
+            target_idx = -1
+            target_file_obj = None
+            for idx, f in enumerate(self.file_list_model._files):
+                p = os.path.normpath(f.get('path') or '')
+                if p.lower() == fpath.lower() or f.get('name') == fname or f.get('id') == fid or f.get('file_id') == fid:
+                    target_idx = idx
+                    target_file_obj = f
+                    break
+
+            if target_idx >= 0:
+                q_idx = self.file_list_model.index(target_idx, 0)
+                if q_idx.isValid() and self.file_list_view.selectionModel():
+                    self.file_list_view.setCurrentIndex(q_idx)
+                    self.file_list_view.selectionModel().setCurrentIndex(
+                        q_idx, QItemSelectionModel.SelectionFlag.ClearAndSelect
+                    )
+                    self.file_list_view.scrollTo(q_idx, QAbstractItemView.ScrollHint.PositionAtCenter)
+                if target_file_obj and hasattr(self, 'details_panel') and self.details_panel:
+                    self.details_panel.update_details(target_file_obj)
+                if hasattr(self, 'status_bar') and self.status_bar:
+                    self.status_bar.showMessage(f"🔍 Item em foco: {fname}", 4000)
+            else:
+                # Se não estiver no primeiro lote, tenta carregar mais um lote
+                if not self.all_files_loaded and len(self.file_list_model._files) < 300:
+                    list_update.load_next_batch(self)
+                    QTimer.singleShot(40, _find_and_select)
+
+        QTimer.singleShot(70, _find_and_select)
 
     def on_vocab_tag_selected(self, tag_text):
+        focus_widget = QApplication.focusWidget()
+        is_search_focused = (focus_widget == getattr(self.main_bar, 'search_entry', None))
+
+        # Se há foto(s) selecionada(s) ou o painel de detalhes está visível com fotos ativas:
+        has_selected_files = bool(
+            self.file_list_view.selectedIndexes() or
+            (hasattr(self, 'details_panel') and self.details_panel and self.details_panel.isVisible() and
+             (getattr(self.details_panel, 'current_file_item', None) or getattr(self.details_panel, 'current_files_list', None)))
+        )
+
+        if not is_search_focused and has_selected_files:
+            if hasattr(self, 'details_panel') and self.details_panel:
+                self.details_panel._add_tag_directly(tag_text)
+                if hasattr(self, 'status_bar') and self.status_bar:
+                    self.status_bar.showMessage(f"🏷️ Tag '{tag_text}' adicionada à foto / lote selecionado.", 3000)
+                return
+
+        # Caso contrário, insere no campo de pesquisa da barra principal
         current = self.main_bar.search_entry.text().strip()
         if not current:
             self.main_bar.search_entry.setText(tag_text)
         elif tag_text.lower() not in current.lower():
             self.main_bar.search_entry.setText(f"{current} {tag_text}")
+        if hasattr(self, 'status_bar') and self.status_bar:
+            self.status_bar.showMessage(f"🔍 Tag '{tag_text}' adicionada ao campo de busca.", 3000)
 
     def _on_vocab_updated(self):
         from src.ui.vocab_panel import VocabManager
@@ -1773,22 +1860,55 @@ class DriveFileGalleryApp(QMainWindow):
             self.details_panel.clear_details()
 
     def on_double_click(self, file_item):
-        if file_item and file_item.get('mimeType') in ['application/vnd.google-apps.folder', 'folder']:
+        if not file_item:
+            return
+
+        if file_item.get('mimeType') in ['application/vnd.google-apps.folder', 'folder']:
             self.search_term = ""
             self.main_bar.search_entry.clear()
             self.current_page = 0
             self.all_files_loaded = False
             list_update.clear_display(self)
-            self.current_folder_id = file_item['id']
+            self.current_folder_id = file_item.get('id') or file_item.get('file_id')
             list_update.load_next_batch(self)
-        elif file_item:
-            if file_item.get('source') == 'local' and file_item.get('path'):
+            return
+
+        # Para arquivos (fotos, vídeos, documentos):
+        fpath = file_item.get('path')
+        if not fpath:
+            # Tentar buscar no banco SQLite se houver caminho físico correspondente
+            fid = file_item.get('file_id') or file_item.get('id')
+            fname = file_item.get('name')
+            if hasattr(self, 'indexer') and self.indexer:
                 try:
-                    os.startfile(file_item['path'])
-                except Exception as e:
+                    self.indexer.ensure_conn()
+                    self.indexer.cursor.execute("SELECT path FROM files WHERE (file_id = ? OR name = ?) AND path IS NOT NULL LIMIT 1", (fid, fname))
+                    row = self.indexer.cursor.fetchone()
+                    if row and row[0]:
+                        fpath = row[0]
+                except Exception:
                     pass
-            elif file_item.get('source') == 'drive' and file_item.get('webViewLink'):
-                webbrowser.open(file_item['webViewLink'])
+
+        if fpath:
+            norm_p = os.path.normpath(fpath)
+            if os.path.exists(norm_p):
+                try:
+                    os.startfile(norm_p)
+                    return
+                except Exception:
+                    try:
+                        from PyQt6.QtGui import QDesktopServices
+                        from PyQt6.QtCore import QUrl
+                        QDesktopServices.openUrl(QUrl.fromLocalFile(norm_p))
+                        return
+                    except Exception:
+                        pass
+
+        # Se não houver arquivo local, abre na nuvem (Google Drive)
+        if file_item.get('webViewLink'):
+            webbrowser.open(file_item['webViewLink'])
+        elif file_item.get('webContentLink'):
+            webbrowser.open(file_item['webContentLink'])
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Backspace:

@@ -161,6 +161,7 @@ class StagingQueue:
 
 class StagingQueueDialog(QDialog):
     executionCompleted = pyqtSignal(int)  # Emitido com o número de alterações aplicadas
+    itemFocusRequested = pyqtSignal(object)  # (StagingItem) Solicitado foco no arquivo na interface principal
 
     def __init__(self, parent=None, drive_service=None, db_indexer=None):
         super().__init__(parent)
@@ -169,8 +170,9 @@ class StagingQueueDialog(QDialog):
         self.db_indexer = db_indexer
         self.config_mgr = ConfigManager()
 
-        self.setWindowTitle("Fila de Revisão de Alterações (Staging Queue)")
-        self.setMinimumSize(700, 500)
+        self.setWindowTitle("📋 Fila de Revisão de Alterações (Staging Queue)")
+        self.setWindowFlags(Qt.WindowType.Window)  # Janela independente destacável
+        self.setMinimumSize(780, 520)
 
         self._init_ui()
         self._populate_list()
@@ -302,6 +304,9 @@ class StagingQueueDialog(QDialog):
                         f"<b>Descrição Anterior:</b> <i>{item.old_value or '(vazia)'}</i>"
                     )
                 self.details_label.setText(details)
+
+                # Emitir sinal para focar e iluminar o arquivo na árvore e no grid
+                self.itemFocusRequested.emit(item)
                 return
         self.details_label.setText("Selecione um item para ver o detalhamento da alteração.")
 
@@ -491,6 +496,8 @@ class StagingQueueDialog(QDialog):
         return fid
 
     def _execute_single_item(self, item):
+        drive_file_id = self._get_drive_file_id(item) if self.drive_service else None
+
         # 1. Processar alteração de tags / descrição
         if item.action_type in ('add_tags', 'remove_tags', 'set_description'):
             new_desc = item.old_value
@@ -514,9 +521,6 @@ class StagingQueueDialog(QDialog):
                 self.db_indexer.update_description(item.file_id, new_desc, commit=True)
                 if item.path and item.path != item.file_id:
                     self.db_indexer.update_description(item.path, new_desc, commit=True)
-
-            # Traduzir caminho local para ID do Drive se necessário
-            drive_file_id = self._get_drive_file_id(item)
 
             # Atualizar na API do Google Drive se o serviço de drive estiver ativo
             if self.drive_service and drive_file_id:
@@ -546,7 +550,6 @@ class StagingQueueDialog(QDialog):
         elif item.action_type == 'move':
             src_path = item.old_value or item.path
             dst_path = item.new_value
-            drive_file_id = self._get_drive_file_id(item)
 
             # 1. Mover arquivo localmente no disco
             if src_path and os.path.exists(src_path):

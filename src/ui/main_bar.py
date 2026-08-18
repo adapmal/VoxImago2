@@ -394,13 +394,25 @@ class MainBar(QFrame):
 
     def _open_staging_dialog(self):
         from src.ui.staging_queue import StagingQueueDialog
-        dialog = StagingQueueDialog(self, drive_service=self.window().service, db_indexer=self.window().indexer)
-        def on_queue_done(count):
-            if count > 0:
-                if hasattr(self.window(), 'indexer'):
-                    self.window().indexer.export_to_shared_cache()
-                self.window()._force_refresh_after_sync()
-        dialog.executionCompleted.connect(on_queue_done)
-        dialog.exec()
+        win = self.window()
+        if not hasattr(win, '_staging_dialog') or win._staging_dialog is None:
+            win._staging_dialog = StagingQueueDialog(
+                win,
+                drive_service=getattr(win, 'service', None),
+                db_indexer=getattr(win, 'indexer', None)
+            )
+            if hasattr(win, 'focus_staging_item'):
+                win._staging_dialog.itemFocusRequested.connect(win.focus_staging_item)
+
+            def on_queue_done(count):
+                if count > 0:
+                    if hasattr(win, 'indexer'):
+                        win.indexer.export_to_shared_cache()
+                    win._force_refresh_after_sync()
+            win._staging_dialog.executionCompleted.connect(on_queue_done)
+
+        win._staging_dialog.show()
+        win._staging_dialog.raise_()
+        win._staging_dialog.activateWindow()
 
 

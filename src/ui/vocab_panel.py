@@ -8,7 +8,7 @@ import csv
 import logging
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
-    QPushButton, QScrollArea, QFrame, QSizePolicy, QTableWidget, QTableWidgetItem, QMessageBox
+    QPushButton, QScrollArea, QFrame, QSizePolicy, QTableWidget, QTableWidgetItem, QMessageBox, QDialog
 )
 from PyQt6.QtCore import pyqtSignal, Qt
 from src.utils.config_manager import ConfigManager
@@ -97,6 +97,20 @@ class VocabManager:
         return [t for t in self.get_all_tags() if q_lower in t.lower()]
 
 
+class DetachedVocabDialog(QDialog):
+    """Janela flutuante independente para o Vocabulário Controlado."""
+    def __init__(self, vocab_panel, parent=None):
+        super().__init__(parent)
+        self.vocab_panel = vocab_panel
+        self.setWindowTitle("🏷️ Vocabulário Controlado Oficial - VoxImago")
+        self.setWindowFlags(Qt.WindowType.Window)
+        self.resize(1100, 520)
+
+    def closeEvent(self, event):
+        event.ignore()
+        self.hide()
+
+
 class VocabPanel(QWidget):
     tagSelected = pyqtSignal(str)  # Emitido quando uma tag é clicada
     vocabUpdated = pyqtSignal()   # Emitido quando a planilha é salva ou sincronizada
@@ -105,6 +119,8 @@ class VocabPanel(QWidget):
         super().__init__(parent)
         self.parent_app = parent
         self.vocab_mgr = VocabManager()
+        self._is_detached = False
+        self.detached_dialog = None
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self.setMinimumHeight(200)
         self._init_ui()
@@ -159,6 +175,16 @@ class VocabPanel(QWidget):
         self.btn_cancel.setVisible(False)
         top_bar.addWidget(self.btn_cancel)
 
+        self.btn_detach = QPushButton("🗗 Janela Separada")
+        self.btn_detach.setFixedHeight(26)
+        self.btn_detach.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_detach.setToolTip("Desacoplar este painel para uma janela flutuante independente que pode ser movida para outra tela")
+        self.btn_detach.setStyleSheet(
+            "QPushButton { background-color: #6C757D; color: white; border-radius: 4px; padding: 2px 10px; font-weight: bold; font-size: 11px; }"
+            "QPushButton:hover { background-color: #5A6268; }"
+        )
+        self.btn_detach.clicked.connect(self.toggle_detached)
+        top_bar.addWidget(self.btn_detach)
 
         self.btn_close = QPushButton("✕ Recolher")
         self.btn_close.setFixedHeight(26)
@@ -199,8 +225,64 @@ class VocabPanel(QWidget):
         self.hide()  # Inicialmente recolhido
 
     def toggle_visibility(self):
-        self.setVisible(not self.isVisible())
+        if getattr(self, '_is_detached', False) and getattr(self, 'detached_dialog', None):
+            if self.detached_dialog.isVisible():
+                self.detached_dialog.hide()
+            else:
+                self.detached_dialog.show()
+                self.detached_dialog.raise_()
+                self.detached_dialog.activateWindow()
+        else:
+            self.setVisible(not self.isVisible())
 
+    def toggle_detached(self):
+        if getattr(self, '_is_detached', False):
+            self.attach_to_main_window()
+        else:
+            self.detach_to_window()
+
+    def detach_to_window(self):
+        if getattr(self, '_is_detached', False):
+            if hasattr(self, 'detached_dialog') and self.detached_dialog:
+                self.detached_dialog.show()
+                self.detached_dialog.raise_()
+                self.detached_dialog.activateWindow()
+            return
+
+        self._is_detached = True
+        self.btn_detach.setText("🗖 Acoplar ao App")
+        self.btn_detach.setToolTip("Retornar o painel de vocabulário para dentro da janela principal")
+        self.btn_close.setVisible(False)
+
+        self.detached_dialog = DetachedVocabDialog(self, parent=self.parent_app)
+        dlg_layout = QVBoxLayout(self.detached_dialog)
+        dlg_layout.setContentsMargins(4, 4, 4, 4)
+        dlg_layout.addWidget(self)
+
+        self.show()
+        self.detached_dialog.show()
+        self.detached_dialog.raise_()
+        self.detached_dialog.activateWindow()
+
+    def attach_to_main_window(self):
+        if not getattr(self, '_is_detached', False):
+            return
+
+        self._is_detached = False
+        self.btn_detach.setText("🗗 Janela Separada")
+        self.btn_detach.setToolTip("Desacoplar este painel para uma janela flutuante independente")
+        self.btn_close.setVisible(True)
+
+        if hasattr(self, 'detached_dialog') and self.detached_dialog:
+            self.detached_dialog.layout().removeWidget(self)
+            self.detached_dialog.close()
+            self.detached_dialog = None
+
+        if self.parent_app and hasattr(self.parent_app, 'centralWidget') and self.parent_app.centralWidget():
+            main_layout = self.parent_app.centralWidget().layout()
+            if main_layout:
+                main_layout.insertWidget(1, self)
+        self.show()
 
     def _sync_vocab(self):
         self.btn_sync.setText("🔄 Atualizando...")

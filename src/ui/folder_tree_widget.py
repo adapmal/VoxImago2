@@ -8,15 +8,51 @@ import os
 import json
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTreeView,
-    QHeaderView, QAbstractItemView
+    QHeaderView, QAbstractItemView, QPushButton, QInputDialog,
+    QMessageBox, QMenu
 )
-from PyQt6.QtGui import QFileSystemModel, QDragEnterEvent, QDragMoveEvent, QDropEvent
-from PyQt6.QtCore import pyqtSignal, Qt, QDir, QUrl
+from PyQt6.QtGui import QFileSystemModel, QDragEnterEvent, QDragMoveEvent, QDropEvent, QCursor
+from PyQt6.QtCore import pyqtSignal, Qt, QDir, QUrl, QModelIndex
 from src.utils.config_manager import ConfigManager
 
 
+class FolderFileSystemModel(QFileSystemModel):
+    """QFileSystemModel customizado que apenas exibe triângulos expansores se a pasta tiver subpastas reais."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._subdirs_cache = {}
+
+    def hasChildren(self, parent=QModelIndex()):
+        if not parent.isValid():
+            return super().hasChildren(parent)
+
+        path = self.filePath(parent)
+        if not path or not os.path.isdir(path):
+            return False
+
+        if path in self._subdirs_cache:
+            return self._subdirs_cache[path]
+
+        has_subdirs = False
+        try:
+            with os.scandir(path) as it:
+                for entry in it:
+                    if entry.is_dir(follow_symlinks=False) and not entry.name.startswith('.'):
+                        has_subdirs = True
+                        break
+        except Exception:
+            has_subdirs = False
+
+        self._subdirs_cache[path] = has_subdirs
+        return has_subdirs
+
+    def clear_subdirs_cache(self):
+        self._subdirs_cache.clear()
+
+
 class DropEnabledTreeView(QTreeView):
-    """QTreeView customizado que aceita drops de arquivos arrastados da grade."""
+    """QTreeView customizado que aceita drops de arquivos arrastados da grade sem trocar a pasta ativa."""
     
     filesDropped = pyqtSignal(list, str)  # (list_of_items_or_paths, target_folder_path)
 
@@ -40,7 +76,7 @@ class DropEnabledTreeView(QTreeView):
             if isinstance(model, QFileSystemModel):
                 path = model.filePath(index)
                 if os.path.isdir(path):
-                    self.setCurrentIndex(index)
+                    # Aceita o drop sobre a pasta sem chamar setCurrentIndex (mantendo a pasta de origem ativa)
                     event.acceptProposedAction()
                     return
         event.ignore()
@@ -99,7 +135,7 @@ class FolderTreeWidget(QWidget):
         self.root_dir = root_dir or self._determine_root_dir()
 
         self.setMinimumWidth(220)
-        self.setMaximumWidth(320)
+        self.setMaximumWidth(340)
 
         self._init_ui()
 
@@ -131,12 +167,25 @@ class FolderTreeWidget(QWidget):
 
         header_layout = QHBoxLayout()
         self.title_label = QLabel("📂 Árvore de Pastas")
-        self.title_label.setStyleSheet("font-weight: bold; font-size: 14px;")
+        self.title_label.setStyleSheet("font-weight: bold; font-size: 13px;")
         header_layout.addWidget(self.title_label)
+
+        header_layout.addStretch()
+
+        self.btn_new_folder = QPushButton("➕ Nova")
+        self.btn_new_folder.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_new_folder.setToolTip("Criar nova subpasta dentro da pasta selecionada")
+        self.btn_new_folder.setStyleSheet(
+            "QPushButton { background-color: #E9ECEF; color: #212529; border: 1px solid #CED4DA; border-radius: 4px; padding: 2px 7px; font-size: 11px; font-weight: bold; }"
+            "QPushButton:hover { background-color: #007BFF; color: white; border-color: #0056B3; }"
+        )
+        self.btn_new_folder.clicked.connect(lambda: self.create_new_folder())
+        header_layout.addWidget(self.btn_new_folder)
+
         layout.addLayout(header_layout)
 
-        # Modelo do Sistema de Arquivos
-        self.model = QFileSystemModel()
+        # Modelo do Sistema de Arquivos (com detecção real de subpastas para triângulos)
+        self.model = FolderFileSystemModel(self)
         self.model.setFilter(QDir.Filter.Dirs | QDir.Filter.NoDotAndDotDot)
         self.model.setRootPath(self.root_dir)
 
@@ -156,12 +205,111 @@ class FolderTreeWidget(QWidget):
         self.tree_view.setIndentation(16)
         self.tree_view.setStyleSheet("QTreeView { border: 1px solid #CED4DA; border-radius: 4px; font-size: 12px; }")
 
+        self.tree_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree_view.customContextMenuRequested.connect(self._show_tree_context_menu)
+
         self.tree_view.selectionModel().selectionChanged.connect(self._on_selection_changed)
         self.tree_view.filesDropped.connect(self.filesDroppedOnFolder.emit)
         layout.addWidget(self.tree_view)
 
         # Atualizar visualização quando o modo Sandbox alternar
         self.config_mgr.modeChanged.connect(self._on_mode_changed)
+
+    def _show_tree_context_menu(self, position):
+        index = self.tree_view.indexAt(position)
+        target_path = self.model.filePath(index) if index.isValid() else self.root_dir
+
+        menu = QMenu(self)
+        action_new = menu.addAction("📁 Criar Nova Pasta Aqui...")
+        action_open_explorer = menu.addAction("📂 Abrir no Explorer")
+        menu.addSeparator()
+        action_refresh = menu.addAction("🔄 Recarregar Árvore")
+
+        action_new.triggered.connect(lambda: self.create_new_folder(target_path))
+        action_open_explorer.triggered.connect(lambda: os.startfile(target_path) if os.path.exists(target_path) else None)
+        action_refresh.triggered.connect(self._refresh_tree)
+
+        menu.exec(self.tree_view.viewport().mapToGlobal(position))
+
+    def _refresh_tree(self):
+        self.model.clear_subdirs_cache()
+        self.model.setRootPath(self.root_dir)
+        self.tree_view.setRootIndex(self.model.index(self.root_dir))
+
+    def create_new_folder(self, target_parent_path=None):
+        if self.config_mgr.is_read_only():
+            QMessageBox.warning(self, "Modo Somente Leitura", "A criação de pastas no disco está desabilitada no modo Somente Leitura.")
+            return
+
+        if not target_parent_path:
+            indexes = self.tree_view.selectedIndexes()
+            if indexes:
+                target_parent_path = self.model.filePath(indexes[0])
+            else:
+                target_parent_path = self.root_dir
+
+        if not target_parent_path or not os.path.exists(target_parent_path):
+            target_parent_path = self.root_dir
+
+        parent_name = os.path.basename(target_parent_path) or target_parent_path
+
+        folder_name, ok = QInputDialog.getText(
+            self,
+            "Criar Nova Pasta",
+            f"Criar nova pasta dentro de:\n📂 {parent_name}\n\nNome da pasta:",
+        )
+        if not ok or not folder_name.strip():
+            return
+
+        folder_name = folder_name.strip()
+        invalid_chars = ['\\', '/', ':', '*', '?', '"', '<', '>', '|']
+        if any(c in folder_name for c in invalid_chars):
+            QMessageBox.warning(
+                self, "Nome Inválido",
+                "O nome da pasta não pode conter os seguintes caracteres:\n\\ / : * ? \" < > |"
+            )
+            return
+
+        new_path = os.path.normpath(os.path.join(target_parent_path, folder_name))
+        if os.path.exists(new_path):
+            QMessageBox.warning(self, "Pasta Já Existe", f"A pasta '{folder_name}' já existe neste local.")
+            return
+
+        try:
+            os.makedirs(new_path, exist_ok=True)
+
+            # Registrar a pasta no banco de dados SQLite local
+            win = self.window()
+            if hasattr(win, 'indexer') and win.indexer:
+                try:
+                    import time
+                    now = int(time.time())
+                    win.indexer.ensure_conn()
+                    win.indexer.cursor.execute(
+                        "INSERT OR REPLACE INTO files (file_id, name, path, mimeType, source, description, parentId, createdTime, modifiedTime) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (new_path, folder_name, new_path, 'folder', 'local', '', target_parent_path, now, now)
+                    )
+                    win.indexer.conn.commit()
+                except Exception as e_db:
+                    pass
+
+            # Limpar cache e expandir pasta pai
+            self.model.clear_subdirs_cache()
+            parent_idx = self.model.index(target_parent_path)
+            if parent_idx.isValid():
+                self.tree_view.expand(parent_idx)
+
+            # Selecionar a nova pasta criada
+            new_idx = self.model.index(new_path)
+            if new_idx.isValid():
+                self.tree_view.setCurrentIndex(new_idx)
+                self.folderSelected.emit(new_path)
+
+            if hasattr(win, 'status_bar') and win.status_bar:
+                win.status_bar.showMessage(f"✅ Pasta '{folder_name}' criada com sucesso!", 4000)
+
+        except Exception as err:
+            QMessageBox.critical(self, "Erro ao Criar Pasta", f"Não foi possível criar a pasta:\n{err}")
 
     def _on_selection_changed(self, selected, deselected):
         indexes = self.tree_view.selectedIndexes()
@@ -177,5 +325,33 @@ class FolderTreeWidget(QWidget):
     def set_root_directory(self, path):
         if path and os.path.exists(path):
             self.root_dir = path
+            self.model.clear_subdirs_cache()
             self.model.setRootPath(self.root_dir)
             self.tree_view.setRootIndex(self.model.index(self.root_dir))
+
+    def select_and_expand_folder(self, folder_path):
+        """Expande os níveis intermediários e seleciona a pasta alvo na árvore."""
+        if not folder_path or not os.path.exists(folder_path):
+            return
+
+        norm_p = os.path.normpath(folder_path)
+        root_norm = os.path.normpath(self.root_dir)
+
+        # Montar a cadeia de pastas pai a partir da raiz até o destino
+        parents = []
+        curr = norm_p
+        while curr and curr.lower() != root_norm.lower() and os.path.dirname(curr) != curr:
+            parents.append(curr)
+            curr = os.path.dirname(curr)
+
+        # Expandir de cima para baixo
+        for p in reversed(parents):
+            idx = self.model.index(p)
+            if idx.isValid():
+                self.tree_view.expand(idx)
+
+        target_idx = self.model.index(norm_p)
+        if target_idx.isValid():
+            self.tree_view.setCurrentIndex(target_idx)
+            self.tree_view.scrollTo(target_idx, QAbstractItemView.ScrollHint.PositionAtCenter)
+            self.folderSelected.emit(norm_p)

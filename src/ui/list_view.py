@@ -25,6 +25,11 @@ class FileListView(QListView):
         super().__init__(parent)
         self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setSelectionRectVisible(False)  # Desativa o quadradinho/rubberband retangular
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setResizeMode(QListView.ResizeMode.Adjust)
+        self.setMovement(QListView.Movement.Static)
+        self.setWrapping(True)
+        self.setWordWrap(True)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
         self.drag_start_position = None
@@ -68,7 +73,18 @@ class FileListView(QListView):
 
     def _emit_double_click(self, index):
         file_item = index.data(Qt.ItemDataRole.UserRole)
-        self.fileDoubleClicked.emit(file_item)
+        if file_item:
+            self.fileDoubleClicked.emit(file_item)
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            index = self.indexAt(event.pos())
+            if index.isValid():
+                file_item = index.data(Qt.ItemDataRole.UserRole)
+                if file_item:
+                    self.fileDoubleClicked.emit(file_item)
+                    return
+        super().mouseDoubleClickEvent(event)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -138,26 +154,36 @@ class FileListView(QListView):
                     self.selectionModel().setCurrentIndex(index, QItemSelectionModel.SelectionFlag.ClearAndSelect)
                 return
 
+        # Para outros botões (ex: botão direito), mantém o padrão
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        # Iniciar Drag & Drop apenas se houver movimento suficiente a partir de um clique em item
         if self.drag_start_position is not None:
             if (event.pos() - self.drag_start_position).manhattanLength() > QApplication.startDragDistance():
                 self._pressed_selected_index = None
                 self.startDrag(Qt.DropAction.MoveAction | Qt.DropAction.CopyAction)
                 self.drag_start_position = None
                 return
-        super().mouseMoveEvent(event)
+        # NÃO chama super().mouseMoveEvent() quando o botão esquerdo está pressionado para evitar a seleção por polígono/retângulo (rubberband)
+        if not (event.buttons() & Qt.MouseButton.LeftButton):
+            super().mouseMoveEvent(event)
+        else:
+            event.accept()
 
     def mouseReleaseEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton and getattr(self, '_pressed_selected_index', None) is not None:
-            idx = self._pressed_selected_index
-            self._pressed_selected_index = None
+        if event.button() == Qt.MouseButton.LeftButton:
+            if getattr(self, '_pressed_selected_index', None) is not None:
+                idx = self._pressed_selected_index
+                self._pressed_selected_index = None
+                self.drag_start_position = None
+                if idx.isValid() and self.selectionModel():
+                    from PyQt6.QtCore import QItemSelectionModel
+                    self.selectionModel().setCurrentIndex(idx, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+                    self._anchor_index = idx
             self.drag_start_position = None
-            if idx.isValid() and self.selectionModel():
-                from PyQt6.QtCore import QItemSelectionModel
-                self.selectionModel().setCurrentIndex(idx, QItemSelectionModel.SelectionFlag.ClearAndSelect)
-                self._anchor_index = idx
+            event.accept()
+            return
         super().mouseReleaseEvent(event)
 
     def startDrag(self, supportedActions):
