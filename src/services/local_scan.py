@@ -89,9 +89,9 @@ class LocalScan(QObject):
                 if not self.is_running:
                     break
                 for name in dirs:
-                    dir_path = os.path.join(root, name)
-                    parent_id = '' if root == scan_path else os.path.dirname(
-                        dir_path)
+                    dir_path = os.path.normpath(os.path.join(root, name))
+                    parent_id = '' if root == scan_path else os.path.normpath(os.path.dirname(
+                        dir_path))
                     try:
                         modified = int(os.path.getmtime(dir_path))
                         created = int(os.path.getctime(dir_path))
@@ -136,9 +136,10 @@ class LocalScan(QObject):
                         break
                     if name.lower() == 'desktop.ini':
                         continue
-                    file_path = os.path.join(root, name)
-                    parent_id = '' if root == scan_path else os.path.dirname(
-                        file_path)
+                    file_path = os.path.normpath(os.path.join(root, name))
+                    parent_id = '' if root == scan_path else os.path.normpath(os.path.dirname(
+                        file_path))
+
                     try:
                         size = os.path.getsize(file_path)
                         modified = int(os.path.getmtime(file_path))
