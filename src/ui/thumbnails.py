@@ -91,8 +91,30 @@ class FileListDelegate(QStyledItemDelegate):
 
         from src.ui.staging_queue import StagingQueue
         queue = StagingQueue()
-        fid = file_item.get('file_id') or file_item.get('id')
-        is_deleted = any(it.file_id == fid and it.action_type == 'delete' for it in queue.items)
+        raw_fid = file_item.get('file_id') or file_item.get('id') or ''
+        raw_path = file_item.get('path', '')
+        norm_fid = os.path.normcase(os.path.normpath(raw_fid)) if raw_fid else ''
+        norm_path = os.path.normcase(os.path.normpath(raw_path)) if raw_path else ''
+
+        is_deleted = False
+        is_staged_green = False
+        staged_text = ""
+
+        for it in queue.items:
+            it_fid = os.path.normcase(os.path.normpath(it.file_id)) if it.file_id else ''
+            it_path = os.path.normcase(os.path.normpath(it.path)) if it.path else ''
+            matches = (it_fid and (it_fid == norm_fid or it_fid == norm_path)) or (it_path and (it_path == norm_path or it_path == norm_fid))
+            
+            if matches:
+                if it.action_type == 'delete':
+                    is_deleted = True
+                elif it.action_type == 'move':
+                    is_staged_green = True
+                    staged_text = "🟢 Mover (Fila)"
+                elif it.action_type in ('set_description', 'add_tags', 'remove_tags', 'rename'):
+                    is_staged_green = True
+                    staged_text = "🟢 Em Fila"
+
         if is_deleted:
             painter.setOpacity(0.3)
 
@@ -195,7 +217,25 @@ class FileListDelegate(QStyledItemDelegate):
             painter.setPen(Qt.GlobalColor.gray)
             painter.drawText(rect.left()+64, rect.top()+38, f"({source_name})")
 
+        # Desenhar borda verde e badge de status para itens na Fila
+        if is_staged_green:
+            pen = QPen(QColor("#28A745"), 2)
+            painter.setPen(pen)
+            painter.setBrush(Qt.GlobalColor.transparent)
+            painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), 4, 4)
+
+            if staged_text:
+                badge_w = 96
+                badge_rect = QRect(rect.right() - badge_w - 4, rect.top() + 4, badge_w, 18)
+                painter.setBrush(QColor("#28A745"))
+                painter.setPen(Qt.GlobalColor.transparent)
+                painter.drawRoundedRect(badge_rect, 4, 4)
+                painter.setPen(QColor("#FFFFFF"))
+                painter.setFont(QFont("Arial", 8, QFont.Weight.Bold))
+                painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, staged_text)
+
         painter.restore()
+
 
     def editorEvent(self, event, model, option, index):
         return super().editorEvent(event, model, option, index)

@@ -40,7 +40,11 @@ class StagingItem:
             return f"📦 Mover para a pasta: '{dst_folder}'"
         elif self.action_type == 'delete':
             return f"🗑️ Excluir arquivo"
+        elif self.action_type == 'create_folder':
+            folder_name = os.path.basename(self.new_value)
+            return f"📁🟢 Criar nova pasta (Fila): '{folder_name}'"
         return f"[{self.action_type}] {self.new_value}"
+
 
 
 QUEUE_CACHE_FILE = os.path.join('config', 'staging_queue.json')

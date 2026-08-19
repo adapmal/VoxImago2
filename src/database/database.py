@@ -303,6 +303,11 @@ class FileIndexer:
                 data_files = []
                 for item in files_list:
                     fid = item.get('id')
+                    raw_path = item.get('path')
+                    if item.get('source') == 'local' and raw_path:
+                        raw_path = os.path.normcase(os.path.normpath(raw_path))
+                        fid = raw_path
+
                     incoming_desc = item.get('description')
                     if (item.get('source') == 'local') and (not incoming_desc):
                         effective_desc = existing_desc.get(fid) or ''
@@ -318,10 +323,11 @@ class FileIndexer:
                     data_files.append((
                         fid,
                         name,
-                        item.get('path'),
+                        raw_path,
                         item.get('mimeType'),
                         item.get('source'),
                         effective_desc,
+
                         item.get('thumbnailLink'),
                         item.get('thumbnailPath'),
                         item.get('size', 0),

@@ -237,21 +237,32 @@ class FileDetailsPanel(QFrame):
         else:
             self.created_label.setText("N/A")
 
-        # Inspecionar explicitamente a Fila de Staging
-        fid = file_item.get('file_id') or file_item.get('id')
+        # Inspecionar explicitamente a Fila de Staging (com caminhos normalizados)
+        raw_fid = file_item.get('file_id') or file_item.get('id') or ''
+        raw_path = file_item.get('path', '')
+        norm_fid = os.path.normcase(os.path.normpath(raw_fid)) if raw_fid else ''
+        norm_path = os.path.normcase(os.path.normpath(raw_path)) if raw_path else ''
+
         staged_added = []
         staged_removed = []
-        for it in list(self.staging_queue.items):
-            if it.file_id == fid and it.action_type in ('set_description', 'add_tags', 'remove_tags'):
-                old_tags = set(self.tag_chips_widget._parse_tags(it.old_value))
-                new_tags = set(self.tag_chips_widget._parse_tags(it.new_value))
-                staged_added = list(new_tags - old_tags)
-                staged_removed = list(old_tags - new_tags)
-                break
+        orig_db_desc = file_item.get('description', '')
 
-        # Carregar tags usando intenção explícita (Branco = salvas, Verde = adicionadas, Vermelho = removidas)
-        self.tag_chips_widget.set_tags(file_item.get('description', ''), staged_added, staged_removed)
+        for it in list(self.staging_queue.items):
+            it_fid = os.path.normcase(os.path.normpath(it.file_id)) if it.file_id else ''
+            it_path = os.path.normcase(os.path.normpath(it.path)) if it.path else ''
+            if (it_fid and (it_fid == norm_fid or it_fid == norm_path)) or (it_path and (it_path == norm_path or it_path == norm_fid)):
+                if it.action_type in ('set_description', 'add_tags', 'remove_tags'):
+                    old_tags = set(self.tag_chips_widget._parse_tags(it.old_value))
+                    new_tags = set(self.tag_chips_widget._parse_tags(it.new_value))
+                    staged_added = list(new_tags - old_tags)
+                    staged_removed = list(old_tags - new_tags)
+                    orig_db_desc = it.old_value
+                    break
+
+        # Carregar tags usando intenção explícita (Branco = salvas no banco, Verde = adicionadas na fila, Vermelho = removidas na fila)
+        self.tag_chips_widget.set_tags(orig_db_desc, staged_added, staged_removed)
         self._apply_permission_mode()
+
 
         self.open_drive_button.setVisible(True)
 
@@ -531,23 +542,26 @@ class FileDetailsPanel(QFrame):
             self._refresh_suggestions_view()
             return
             
-        if not self.current_file_item:
-            return
-
-        fid = self.current_file_item.get('file_id') or self.current_file_item.get('id')
+        raw_fid = self.current_file_item.get('file_id') or self.current_file_item.get('id') or ''
+        raw_path = self.current_file_item.get('path', '')
+        norm_fid = os.path.normcase(os.path.normpath(raw_fid)) if raw_fid else ''
+        norm_path = os.path.normcase(os.path.normpath(raw_path)) if raw_path else ''
         fname = self.current_file_item.get('name', '')
-        fpath = self.current_file_item.get('path', '')
         old_desc = self.current_file_item.get('description', '')
 
         for it in list(self.staging_queue.items):
-            if it.file_id == fid and it.action_type in ('set_description', 'add_tags', 'remove_tags'):
-                self.staging_queue.remove_item(it)
+            it_fid = os.path.normcase(os.path.normpath(it.file_id)) if it.file_id else ''
+            it_path = os.path.normcase(os.path.normpath(it.path)) if it.path else ''
+            if (it_fid and (it_fid == norm_fid or it_fid == norm_path)) or (it_path and (it_path == norm_path or it_path == norm_fid)):
+                if it.action_type in ('set_description', 'add_tags', 'remove_tags'):
+                    self.staging_queue.remove_item(it)
 
         if new_desc != old_desc:
-            item = StagingItem(fid, fname, fpath, 'set_description', old_value=old_desc, new_value=new_desc)
+            item = StagingItem(raw_fid or raw_path, fname, raw_path, 'set_description', old_value=old_desc, new_value=new_desc)
             self.staging_queue.add_item(item)
             
         self._refresh_suggestions_view()
+
 
     def _on_name_edited(self, new_name):
         if self._is_updating or not self.current_file_item:

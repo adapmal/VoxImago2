@@ -58,6 +58,32 @@ class FolderTreeDelegate(QStyledItemDelegate):
 
     def paint(self, painter, option, index):
         super().paint(painter, option, index)
+        model = self.tree_view.model()
+        if model and hasattr(model, 'filePath'):
+            folder_path = os.path.normcase(os.path.normpath(model.filePath(index)))
+            from src.ui.staging_queue import StagingQueue
+            queue = StagingQueue()
+            is_staged_folder = False
+            for it in queue.items:
+                if it.action_type == 'create_folder' and os.path.normcase(os.path.normpath(it.new_value)) == folder_path:
+                    is_staged_folder = True
+                    break
+                elif it.action_type == 'move' and os.path.normcase(os.path.normpath(it.new_value)) == folder_path:
+                    is_staged_folder = True
+                    break
+
+            if is_staged_folder:
+                painter.save()
+                pen = QPen(QColor("#28A745"), 2)
+                painter.setPen(pen)
+                rect = option.rect.adjusted(1, 1, -1, -1)
+                painter.drawRect(rect)
+                painter.setPen(QColor("#28A745"))
+                font = QFont("Arial", 8, QFont.Weight.Bold)
+                painter.setFont(font)
+                painter.drawText(rect.right() - 42, rect.top() + 14, "🟢 Fila")
+                painter.restore()
+
         if index == getattr(self.tree_view, '_current_drag_target_index', None):
             painter.save()
             pen = QPen(QColor("#007BFF"), 2)
@@ -65,6 +91,7 @@ class FolderTreeDelegate(QStyledItemDelegate):
             rect = option.rect.adjusted(1, 1, -1, -1)
             painter.drawRect(rect)
             painter.restore()
+
 
 
 class DropEnabledTreeView(QTreeView):
@@ -271,10 +298,6 @@ class FolderTreeWidget(QWidget):
         self.tree_view.setRootIndex(self.model.index(self.root_dir))
 
     def create_new_folder(self, target_parent_path=None):
-        if self.config_mgr.is_read_only():
-            QMessageBox.warning(self, "Modo Somente Leitura", "A criação de pastas no disco está desabilitada no modo Somente Leitura.")
-            return
-
         if not target_parent_path:
             indexes = self.tree_view.selectedIndexes()
             if indexes:
@@ -300,7 +323,7 @@ class FolderTreeWidget(QWidget):
         if any(c in folder_name for c in invalid_chars):
             QMessageBox.warning(
                 self, "Nome Inválido",
-                "O nome da pasta não pode conter os seguintes caracteres:\n\\ / : * ? \" < > |"
+                "O nome da pasta não pode conter os seguintes caracteres:\n\\ / : * ? \" < > |\n"
             )
             return
 
@@ -308,6 +331,18 @@ class FolderTreeWidget(QWidget):
         if os.path.exists(new_path):
             QMessageBox.warning(self, "Pasta Já Existe", f"A pasta '{folder_name}' já existe neste local.")
             return
+
+        if self.config_mgr.is_read_only():
+            from src.ui.staging_queue import StagingQueue, StagingItem
+            queue = StagingQueue()
+            st_item = StagingItem(new_path, folder_name, new_path, 'create_folder', old_value="", new_value=new_path)
+            queue.add_item(st_item)
+            win = self.window()
+            if hasattr(win, 'status_bar') and win.status_bar:
+                win.status_bar.showMessage(f"🟢 Nova pasta '{folder_name}' agendada na Fila (Modo Somente Leitura)!", 4000)
+            self.tree_view.viewport().update()
+            return
+
 
         try:
             os.makedirs(new_path, exist_ok=True)
