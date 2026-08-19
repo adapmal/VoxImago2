@@ -22,9 +22,10 @@ class list_update:
     @staticmethod
     def _apply_virtual_staging_overlay(app, files, norm_filter):
         """
-        Aplica a camada virtual da Fila de Staging:
+        Aplica a camada virtual da Fila de Staging (Proxy Virtual):
         - Oculta arquivos que possuem 'move' pendente saindo da pasta atual.
         - Injeta arquivos que possuem 'move' pendente entrando na pasta atual.
+        - Sobrepõe descrições/tags pendentes na memória para busca e exibição consistentes.
         """
         from src.ui.staging_queue import StagingQueue
         staging_queue = StagingQueue()
@@ -33,8 +34,13 @@ class list_update:
 
         moved_away_ids = set()
         moved_in_staged_items = []
+        deleted_ids = set()
+        desc_overlay = {}  # {file_id / path_lower: updated_description}
 
         for it in staging_queue.items:
+            fid_key = it.file_id
+            path_key = os.path.normpath(it.path).lower() if it.path else None
+
             if it.action_type == 'move':
                 moved_away_ids.add(it.file_id)
                 if it.path:
@@ -47,13 +53,43 @@ class list_update:
                     if dst_folder == norm_filter:
                         moved_in_staged_items.append(it)
 
-        # 1. Remover arquivos que foram movidos para fora desta pasta
+            elif it.action_type == 'delete':
+                deleted_ids.add(it.file_id)
+                if path_key:
+                    deleted_ids.add(path_key)
+
+            elif it.action_type in ('add_tags', 'remove_tags', 'set_description'):
+                curr_desc = desc_overlay.get(fid_key, it.old_value or '')
+                if it.action_type == 'set_description':
+                    new_desc = it.new_value
+                elif it.action_type == 'add_tags':
+                    new_desc = f"{curr_desc} {it.new_value}".strip()
+                elif it.action_type == 'remove_tags':
+                    new_desc = curr_desc
+                desc_overlay[fid_key] = new_desc
+                if path_key:
+                    desc_overlay[path_key] = new_desc
+
+        # 1. Filtrar e atualizar arquivos existentes
         filtered_files = []
         for f in files:
             fid = f.get('file_id') or f.get('id')
             fpath = os.path.normpath(f.get('path', '')).lower() if f.get('path') else None
-            if fid not in moved_away_ids and (not fpath or fpath not in moved_away_ids):
-                filtered_files.append(f)
+
+            # Se foi movido para fora desta pasta, não exibe aqui
+            if fid in moved_away_ids or (fpath and fpath in moved_away_ids):
+                continue
+
+            # Sobrepor tags/descrição pendentes da fila
+            if fid in desc_overlay:
+                f['description'] = desc_overlay[fid]
+            elif fpath and fpath in desc_overlay:
+                f['description'] = desc_overlay[fpath]
+
+            if fid in deleted_ids or (fpath and fpath in deleted_ids):
+                f['is_staged_delete'] = True
+
+            filtered_files.append(f)
 
         # 2. Injetar arquivos que foram movidos para dentro desta pasta
         if norm_filter and moved_in_staged_items:
@@ -71,6 +107,8 @@ class list_update:
                             )
                             r = app.indexer.cursor.fetchone()
                             if r:
+                                fid_val = r[0]
+                                desc_val = desc_overlay.get(fid_val, r[5] or '')
                                 file_row = {
                                     'id': r[0],
                                     'name': r[1],
@@ -79,7 +117,7 @@ class list_update:
                                     'orig_path': it.old_value or it.path,
                                     'mimeType': r[3],
                                     'source': r[4],
-                                    'description': r[5],
+                                    'description': desc_val,
                                     'thumbnailLink': r[6],
                                     'thumbnailPath': r[7],
                                     'size': r[8],
@@ -102,7 +140,7 @@ class list_update:
                             'orig_path': it.old_value or it.path,
                             'mimeType': 'image/jpeg',
                             'source': 'local',
-                            'description': '',
+                            'description': desc_overlay.get(it.file_id, ''),
                             'thumbnailLink': '',
                             'thumbnailPath': '',
                             'size': 0,
@@ -220,6 +258,16 @@ class list_update:
         try:
             if hasattr(app, 'indexer') and app.indexer:
                 app.indexer.ensure_conn()
+                
+            # Sincronização rápida "on-the-fly" da pasta selecionada (apenas para a primeira página)
+            if app.current_page == 0 and getattr(app, 'current_folder_path_filter', None):
+                folder_path = app.current_folder_path_filter
+                if os.path.isdir(folder_path):
+                    try:
+                        list_update._sync_single_folder_on_the_fly(app, folder_path)
+                    except Exception as sf_err:
+                        print(f"Erro no sync on-the-fly da pasta: {sf_err}")
+
             search_all_sources = bool(
                 app.search_term and app.is_authenticated)
             source = app.current_view if not search_all_sources else None
@@ -272,3 +320,100 @@ class list_update:
         app.file_list_model.setFiles(files)
         app.all_files_loaded = len(files) < app.page_size
         app.current_page = 1 if files else 0
+
+    @staticmethod
+    def _sync_single_folder_on_the_fly(app, folder_path):
+        import logging
+        try:
+            entries = os.listdir(folder_path)
+        except Exception:
+            return
+
+        valid_entries = [e for e in entries if e.lower() != 'desktop.ini']
+        app.indexer.ensure_conn()
+        norm_folder = os.path.normpath(folder_path)
+
+        app.indexer.cursor.execute(
+            "SELECT file_id, name, path, mimeType, modifiedTime, size FROM files WHERE parentId = ? AND source = 'local'",
+            (norm_folder,)
+        )
+        db_entries = app.indexer.cursor.fetchall()
+        db_by_name = {row[1]: row for row in db_entries}
+
+        items_to_save = []
+        ids_to_delete = []
+        actual_names = set()
+
+        from src.utils.utils import extrair_ano_banco_imagens
+        from datetime import datetime, timezone
+
+        for name in valid_entries:
+            entry_path = os.path.join(norm_folder, name)
+            actual_names.add(name)
+
+            try:
+                is_dir = os.path.isdir(entry_path)
+                modified = int(os.path.getmtime(entry_path))
+                size = 0 if is_dir else os.path.getsize(entry_path)
+            except Exception:
+                continue
+
+            db_row = db_by_name.get(name)
+
+            if not db_row or db_row[4] != modified or db_row[5] != size:
+                try:
+                    created = int(os.path.getctime(entry_path))
+                    data_mais_antiga = min(created, modified)
+                    ano_caminho = extrair_ano_banco_imagens(entry_path)
+                    if ano_caminho and ano_caminho < datetime.fromtimestamp(data_mais_antiga).year:
+                        data_final = int(datetime(ano_caminho, 1, 1, tzinfo=timezone.utc).timestamp())
+                    else:
+                        data_final = data_mais_antiga
+                except Exception:
+                    data_final = modified
+
+                item = {
+                    'id': entry_path,
+                    'name': name,
+                    'path': entry_path,
+                    'mimeType': 'folder' if is_dir else 'image/jpeg',
+                    'source': 'local',
+                    'description': '',
+                    'thumbnailLink': '',
+                    'thumbnailPath': '',
+                    'size': size,
+                    'modifiedTime': modified,
+                    'createdTime': data_final,
+                    'parentId': norm_folder,
+                    'webContentLink': None
+                }
+                if db_row:
+                    app.indexer.cursor.execute(
+                        "SELECT description, thumbnailLink, thumbnailPath, webContentLink FROM files WHERE file_id = ?",
+                        (db_row[0],)
+                    )
+                    old_data = app.indexer.cursor.fetchone()
+                    if old_data:
+                        item['description'] = old_data[0] or ''
+                        item['thumbnailLink'] = old_data[1] or ''
+                        item['thumbnailPath'] = old_data[2] or ''
+                        item['webContentLink'] = old_data[3]
+
+                items_to_save.append(item)
+
+        for db_name, db_row in db_by_name.items():
+            if db_name not in actual_names:
+                ids_to_delete.append(db_row[0])
+
+        if items_to_save:
+            app.indexer.save_files_in_batch(items_to_save, source='local')
+        if ids_to_delete:
+            placeholders = ','.join('?' for _ in ids_to_delete)
+            app.indexer.cursor.execute(f"DELETE FROM files WHERE file_id IN ({placeholders})", ids_to_delete)
+            app.indexer.cursor.execute(f"DELETE FROM search_index WHERE file_id IN ({placeholders})", ids_to_delete)
+
+        if items_to_save or ids_to_delete:
+            app.indexer.conn.commit()
+            logging.info(
+                f"⚡ [ON-THE-FLY SYNC] {len(items_to_save)} adicionados/atualizados, {len(ids_to_delete)} removidos na pasta {norm_folder}"
+            )

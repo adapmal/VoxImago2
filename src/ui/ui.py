@@ -1693,9 +1693,17 @@ class DriveFileGalleryApp(QMainWindow):
             if not db_orig_path:
                 db_orig_path = item.get('physical_path') or item.get('orig_path') or src_path
 
-            # Remover staging de 'move' anterior para este mesmo arquivo
+            # Se o arquivo já está marcado para exclusão definitiva (delete), ignora a tentativa de mover
+            is_deleted = any(
+                (it.file_id == fid or (it.path and os.path.normpath(it.path).lower() == src_path.lower())) and it.action_type == 'delete'
+                for it in queue.items
+            )
+            if is_deleted:
+                continue
+
+            # Se havia 'move' anterior para este mesmo arquivo, remove para atualizar para a nova pasta
             for it in list(queue.items):
-                if it.file_id == fid and it.action_type == 'move':
+                if (it.file_id == fid or (it.path and os.path.normpath(it.path).lower() == src_path.lower())) and it.action_type == 'move':
                     queue.remove_item(it)
 
             # Se o destino é a pasta original do banco, a movimentação foi desfeita/revertida!
@@ -1724,19 +1732,25 @@ class DriveFileGalleryApp(QMainWindow):
         list_update.load_next_batch(self)
 
     def _on_staging_queue_changed(self, count):
-        # Apenas atualiza a grade se houver alteração em itens de 'move' ou 'delete'
-        # Alterações de tags/descrição NÃO devem recarregar a grade nem fechar o painel de detalhes!
-        current_move_items = [f"{it.file_id}_{it.action_type}_{it.new_value}" for it in self.main_bar.staging_queue.items if it.action_type in ('move', 'delete')]
-        if not hasattr(self, '_prev_move_items'):
-            self._prev_move_items = []
-            
-        if current_move_items != self._prev_move_items:
-            self._prev_move_items = list(current_move_items)
-            if getattr(self, 'current_folder_path_filter', None):
-                self.current_page = 0
-                self.all_files_loaded = False
+        try:
+            # Apenas atualiza a grade se houver alteração em itens de 'move' ou 'delete'
+            # Alterações de tags/descrição NÃO devem recarregar a grade nem fechar o painel de detalhes!
+            current_move_items = [f"{it.file_id}_{it.action_type}_{it.new_value}" for it in self.main_bar.staging_queue.items if it.action_type in ('move', 'delete')]
+            if not hasattr(self, '_prev_move_items'):
+                self._prev_move_items = []
+                
+            if current_move_items != self._prev_move_items:
+                self._prev_move_items = list(current_move_items)
+                if getattr(self, 'current_folder_path_filter', None):
+                    self.current_page = 0
+                    self.all_files_loaded = False
+                    list_update.clear_display(self)
+                    list_update.load_next_batch(self)
+        except Exception as e:
+            print(f"[UI] Erro ao tratar mudança na fila de staging: {e}")
+
     def focus_staging_item(self, staging_item):
-        """Ao clicar em um item na janela da Fila, navega na árvore para a pasta do arquivo e o seleciona na grade e detalhes."""
+        """Ao clicar em um item na janela da Fila, navega na árvore para a pasta atual do arquivo (incluindo destino de 'move') e o seleciona na grade."""
         if not staging_item:
             return
 
@@ -1759,13 +1773,32 @@ class DriveFileGalleryApp(QMainWindow):
             return
 
         fpath = os.path.normpath(fpath)
+
+        # 1. Verificar se o arquivo possui um movimento de 'move' registrado na fila
+        has_moved_staged = False
+        dst_folder_name = ""
+        if hasattr(self, 'main_bar') and hasattr(self.main_bar, 'staging_queue'):
+            for it in self.main_bar.staging_queue.items:
+                if it.action_type == 'move':
+                    p_match = (it.path and os.path.normpath(it.path).lower() == fpath.lower())
+                    id_match = (it.file_id == fid)
+                    if p_match or id_match:
+                        fpath = os.path.normpath(it.new_value)
+                        has_moved_staged = True
+                        dst_folder_name = os.path.basename(os.path.dirname(fpath))
+                        break
+
         folder_path = os.path.normpath(os.path.dirname(fpath))
 
-        # 1. Expandir e selecionar a pasta na Árvore de Diretórios
+        # 2. Expandir e selecionar a pasta na Árvore de Diretórios
         if hasattr(self, 'folder_tree') and self.folder_tree:
             self.folder_tree.select_and_expand_folder(folder_path)
 
-        # 2. Localizar e iluminar/selecionar o arquivo na grade do meio
+        # 3. Notificação informativa caso o arquivo tenha sido movido para outra pasta na fila
+        if has_moved_staged and hasattr(self, 'status_bar') and self.status_bar:
+            self.status_bar.showMessage(f"📦 Arquivo movido na fila para '{dst_folder_name}' (exibindo na pasta de destino atual).", 5000)
+
+        # 4. Localizar e iluminar/selecionar o arquivo na grade do meio
         def _find_and_select():
             if not hasattr(self, 'file_list_model') or not self.file_list_model:
                 return
@@ -1789,7 +1822,7 @@ class DriveFileGalleryApp(QMainWindow):
                     self.file_list_view.scrollTo(q_idx, QAbstractItemView.ScrollHint.PositionAtCenter)
                 if target_file_obj and hasattr(self, 'details_panel') and self.details_panel:
                     self.details_panel.update_details(target_file_obj)
-                if hasattr(self, 'status_bar') and self.status_bar:
+                if hasattr(self, 'status_bar') and self.status_bar and not has_moved_staged:
                     self.status_bar.showMessage(f"🔍 Item em foco: {fname}", 4000)
             else:
                 # Se não estiver no primeiro lote, tenta carregar mais um lote
@@ -1797,7 +1830,7 @@ class DriveFileGalleryApp(QMainWindow):
                     list_update.load_next_batch(self)
                     QTimer.singleShot(40, _find_and_select)
 
-        QTimer.singleShot(70, _find_and_select)
+        QTimer.singleShot(80, _find_and_select)
 
     def on_vocab_tag_selected(self, tag_text):
         focus_widget = QApplication.focusWidget()

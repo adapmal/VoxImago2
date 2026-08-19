@@ -84,25 +84,50 @@ class IncrementalSyncWorker(QObject):
                     (desc, mod_time, wlink, fid)
                 )
                 
-                # 2. Atualizar registro local correspondente respeitando o escopo do Sandbox
-                if is_sb:
-                    local_indexer.cursor.execute(
-                        "UPDATE files SET description = ?, modifiedTime = ?, webContentLink = ? WHERE name = ? AND source = 'local' AND (path LIKE '%_TestesBanco%' OR file_id LIKE '%_TestesBanco%')",
-                        (desc, mod_time, wlink, fname)
-                    )
-                    local_indexer.cursor.execute(
-                        "UPDATE search_index SET description = ?, normalized_description = ? WHERE file_id = ? OR file_id IN (SELECT file_id FROM files WHERE name = ? AND (path LIKE '%_TestesBanco%' OR file_id LIKE '%_TestesBanco%'))",
-                        (desc, desc.lower(), fid, fname)
-                    )
+                # Se o arquivo não existia na base de dados, ele é novo! Inserir.
+                if local_indexer.cursor.rowcount == 0:
+                    try:
+                        created_time_raw = file.get('createdTime')
+                        created_time = int(datetime.strptime(created_time_raw, "%Y-%m-%dT%H:%M:%S.%fZ").timestamp()) if created_time_raw else mod_time
+                    except Exception:
+                        created_time = mod_time
+
+                    new_item = {
+                        'id': fid,
+                        'name': fname,
+                        'mimeType': file.get('mimeType'),
+                        'source': 'drive',
+                        'description': desc,
+                        'thumbnailLink': file.get('thumbnailLink', ''),
+                        'thumbnailPath': '',
+                        'size': int(file.get('size', 0)) if file.get('size') else 0,
+                        'modifiedTime': mod_time,
+                        'createdTime': created_time,
+                        'parentId': file.get('parents', [''])[0] if file.get('parents') else '',
+                        'path': None,
+                        'webContentLink': wlink,
+                    }
+                    local_indexer.save_files_in_batch([new_item], source='drive')
                 else:
-                    local_indexer.cursor.execute(
-                        "UPDATE files SET description = ?, modifiedTime = ?, webContentLink = ? WHERE name = ? AND source = 'local' AND NOT (path LIKE '%_TestesBanco%' OR file_id LIKE '%_TestesBanco%')",
-                        (desc, mod_time, wlink, fname)
-                    )
-                    local_indexer.cursor.execute(
-                        "UPDATE search_index SET description = ?, normalized_description = ? WHERE file_id = ? OR file_id IN (SELECT file_id FROM files WHERE name = ? AND NOT (path LIKE '%_TestesBanco%' OR file_id LIKE '%_TestesBanco%'))",
-                        (desc, desc.lower(), fid, fname)
-                    )
+                    # 2. Atualizar registro local correspondente respeitando o escopo do Sandbox
+                    if is_sb:
+                        local_indexer.cursor.execute(
+                            "UPDATE files SET description = ?, modifiedTime = ?, webContentLink = ? WHERE name = ? AND source = 'local' AND (path LIKE '%_TestesBanco%' OR file_id LIKE '%_TestesBanco%')",
+                            (desc, mod_time, wlink, fname)
+                        )
+                        local_indexer.cursor.execute(
+                            "UPDATE search_index SET description = ?, normalized_description = ? WHERE file_id = ? OR file_id IN (SELECT file_id FROM files WHERE name = ? AND (path LIKE '%_TestesBanco%' OR file_id LIKE '%_TestesBanco%'))",
+                            (desc, desc.lower(), fid, fname)
+                        )
+                    else:
+                        local_indexer.cursor.execute(
+                            "UPDATE files SET description = ?, modifiedTime = ?, webContentLink = ? WHERE name = ? AND source = 'local' AND NOT (path LIKE '%_TestesBanco%' OR file_id LIKE '%_TestesBanco%')",
+                            (desc, mod_time, wlink, fname)
+                        )
+                        local_indexer.cursor.execute(
+                            "UPDATE search_index SET description = ?, normalized_description = ? WHERE file_id = ? OR file_id IN (SELECT file_id FROM files WHERE name = ? AND NOT (path LIKE '%_TestesBanco%' OR file_id LIKE '%_TestesBanco%'))",
+                            (desc, desc.lower(), fid, fname)
+                        )
 
             local_indexer.conn.commit()
             

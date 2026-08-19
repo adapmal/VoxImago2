@@ -9,9 +9,9 @@ import json
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTreeView,
     QHeaderView, QAbstractItemView, QPushButton, QInputDialog,
-    QMessageBox, QMenu
+    QMessageBox, QMenu, QStyledItemDelegate
 )
-from PyQt6.QtGui import QFileSystemModel, QDragEnterEvent, QDragMoveEvent, QDropEvent, QCursor
+from PyQt6.QtGui import QFileSystemModel, QDragEnterEvent, QDragMoveEvent, QDropEvent, QCursor, QColor, QPen
 from PyQt6.QtCore import pyqtSignal, Qt, QDir, QUrl, QModelIndex
 from src.utils.config_manager import ConfigManager
 
@@ -51,6 +51,22 @@ class FolderFileSystemModel(QFileSystemModel):
         self._subdirs_cache.clear()
 
 
+class FolderTreeDelegate(QStyledItemDelegate):
+    def __init__(self, tree_view, parent=None):
+        super().__init__(parent)
+        self.tree_view = tree_view
+
+    def paint(self, painter, option, index):
+        super().paint(painter, option, index)
+        if index == getattr(self.tree_view, '_current_drag_target_index', None):
+            painter.save()
+            pen = QPen(QColor("#007BFF"), 2)
+            painter.setPen(pen)
+            rect = option.rect.adjusted(1, 1, -1, -1)
+            painter.drawRect(rect)
+            painter.restore()
+
+
 class DropEnabledTreeView(QTreeView):
     """QTreeView customizado que aceita drops de arquivos arrastados da grade sem trocar a pasta ativa."""
     
@@ -62,6 +78,8 @@ class DropEnabledTreeView(QTreeView):
         self.viewport().setAcceptDrops(True)
         self.setDropIndicatorShown(True)
         self.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
+        self._current_drag_target_index = None
+        self.setItemDelegate(FolderTreeDelegate(self, self))
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls() or event.mimeData().hasFormat("application/x-voximago-file-items"):
@@ -71,17 +89,33 @@ class DropEnabledTreeView(QTreeView):
 
     def dragMoveEvent(self, event: QDragMoveEvent):
         index = self.indexAt(event.position().toPoint())
+        prev_target = self._current_drag_target_index
+        
+        target_valid = False
         if index.isValid():
             model = self.model()
             if isinstance(model, QFileSystemModel):
                 path = model.filePath(index)
                 if os.path.isdir(path):
-                    # Aceita o drop sobre a pasta sem chamar setCurrentIndex (mantendo a pasta de origem ativa)
+                    target_valid = True
+                    self._current_drag_target_index = index
                     event.acceptProposedAction()
-                    return
-        event.ignore()
+                    
+        if not target_valid:
+            self._current_drag_target_index = None
+            event.ignore()
+
+        if prev_target != self._current_drag_target_index:
+            self.viewport().update()
+
+    def dragLeaveEvent(self, event):
+        self._current_drag_target_index = None
+        self.viewport().update()
+        super().dragLeaveEvent(event)
 
     def dropEvent(self, event: QDropEvent):
+        self._current_drag_target_index = None
+        self.viewport().update()
         index = self.indexAt(event.position().toPoint())
         if not index.isValid():
             event.ignore()

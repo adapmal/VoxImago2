@@ -43,8 +43,39 @@ class FileListView(QListView):
         if self.selectionModel():
             self.selectionModel().selectionChanged.connect(self._emit_selection)
 
+    def _is_index_deleted(self, index):
+        if not index or not index.isValid():
+            return False
+        item_data = index.data(Qt.ItemDataRole.UserRole)
+        if not item_data:
+            return False
+        fid = item_data.get('file_id') or item_data.get('id')
+        fpath = os.path.normpath(item_data.get('path', '')).lower() if item_data.get('path') else ''
+        try:
+            from src.ui.staging_queue import StagingQueue
+            queue = StagingQueue()
+            for it in queue.items:
+                if it.action_type == 'delete':
+                    if it.file_id == fid or (it.path and os.path.normpath(it.path).lower() == fpath):
+                        return True
+        except Exception:
+            pass
+        return False
+
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Space:
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier and event.key() == Qt.Key.Key_A:
+            # Selecionar todos os itens exceto os deletados
+            model = self.model()
+            if model and self.selectionModel():
+                from PyQt6.QtCore import QItemSelection, QItemSelectionModel
+                sel = QItemSelection()
+                for r in range(model.rowCount()):
+                    idx = model.index(r, 0)
+                    if not self._is_index_deleted(idx):
+                        sel.select(idx, idx)
+                self.selectionModel().select(sel, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+            return
+        elif event.key() == Qt.Key.Key_Space:
             self.show_quick_preview()
             return
         elif event.key() == Qt.Key.Key_Delete:
@@ -111,7 +142,7 @@ class FileListView(QListView):
             self.drag_start_position = event.pos()
 
             if has_shift:
-                # Seleção contínua linear confiável (do primeiro item ao último)
+                # Seleção contínua linear confiável (do primeiro item ao último) pulando itens deletados
                 anchor = self._anchor_index if (self._anchor_index is not None and self._anchor_index.isValid()) else self.currentIndex()
                 if not anchor or not anchor.isValid():
                     selected = self.selectedIndexes()
@@ -126,14 +157,15 @@ class FileListView(QListView):
                 from PyQt6.QtCore import QItemSelection, QItemSelectionModel
                 model = self.model()
                 if model and self.selectionModel():
-                    sel_range = QItemSelection(
-                        model.index(start_row, 0),
-                        model.index(end_row, 0)
-                    )
+                    sel = QItemSelection()
+                    for r in range(start_row, end_row + 1):
+                        idx_r = model.index(r, 0)
+                        if not self._is_index_deleted(idx_r):
+                            sel.select(idx_r, idx_r)
                     if has_ctrl:
-                        self.selectionModel().select(sel_range, QItemSelectionModel.SelectionFlag.Select)
+                        self.selectionModel().select(sel, QItemSelectionModel.SelectionFlag.Select)
                     else:
-                        self.selectionModel().select(sel_range, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+                        self.selectionModel().select(sel, QItemSelectionModel.SelectionFlag.ClearAndSelect)
                     self.selectionModel().setCurrentIndex(index, QItemSelectionModel.SelectionFlag.NoUpdate)
                 return
 
@@ -192,7 +224,8 @@ class FileListView(QListView):
             index = self.indexAt(self.mapFromGlobal(QCursor.pos()))
             if index.isValid():
                 self.setCurrentIndex(index)
-        indexes = self.selectedIndexes()
+        # Filtrar itens que estão marcados para exclusão (itens deletados nunca são movidos)
+        indexes = [idx for idx in self.selectedIndexes() if not self._is_index_deleted(idx)]
         if not indexes:
             return
 
@@ -431,11 +464,16 @@ class FileListView(QListView):
                     layout.addWidget(label)
             elif ext in raw_exts:
                 try:
+                    image = None
                     if rawpy:
-                        with rawpy.imread(file_path) as raw:
-                            rgb = raw.postprocess()
-                            image = Image.fromarray(rgb)
-                    else:
+                        try:
+                            with rawpy.imread(file_path) as raw:
+                                rgb = raw.postprocess()
+                                image = Image.fromarray(rgb)
+                        except Exception as raw_e:
+                            # Fallback para Pillow caso rawpy falhe
+                            pass
+                    if image is None:
                         image = Image.open(file_path)
                     image = image.convert("RGB")
                     image.thumbnail((800, 600))

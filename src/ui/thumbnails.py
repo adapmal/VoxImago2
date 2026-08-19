@@ -468,49 +468,58 @@ class ThumbnailManager:
                 return None
             try:
                 with _media_lock:
-                    with rawpy.imread(local_path) as raw:
-                        thumb = raw.extract_thumb()
-                        from PIL import Image
-                        if thumb.format == rawpy.ThumbFormat.JPEG:
-                            import imageio.v3 as iio
-                            img = iio.imread(thumb.data)
-                        elif thumb.format == rawpy.ThumbFormat.BITMAP:
-                            from io import BytesIO
-                            try:
+                    from PIL import Image
+                    pil_img = None
+                    try:
+                        # 1. Tentar com rawpy
+                        with rawpy.imread(local_path) as raw:
+                            thumb = raw.extract_thumb()
+                            if thumb.format == rawpy.ThumbFormat.JPEG:
+                                import imageio.v3 as iio
+                                img = iio.imread(thumb.data)
+                                pil_img = Image.fromarray(img)
+                            elif thumb.format == rawpy.ThumbFormat.BITMAP:
+                                from io import BytesIO
                                 pil_img = Image.open(BytesIO(thumb.data))
                                 pil_img = pil_img.convert('RGB')
-                                img = np.array(pil_img)
-                            except Exception as pil_e:
-                                logging.error(
-                                    f'[THUMB][RAW][ERRO] Falha ao abrir TIFF embutido: {pil_e} | arquivo: {local_path}')
-                                return None
-                        else:
-                            logging.error(
-                                f'[THUMB][RAW][ERRO] Formato de thumb RAW não suportado: {thumb.format} | arquivo: {local_path}')
-                            return None
+                            else:
+                                raise ValueError("Formato de miniatura embutido nao suportado pelo rawpy")
+                    except Exception as raw_err:
+                        # 2. Fallback direto para Pillow (Pillow consegue abrir muitos DNGs/TIFFs)
+                        logging.debug(f"[THUMB][RAW][INFO] Falha ao extrair miniatura com rawpy ({raw_err}). Tentando Pillow para: {local_path}")
                         try:
-                            pil_img = Image.fromarray(img)
-                            pil_img.thumbnail(
-                                (base_size, base_size), Image.LANCZOS)
-                            img = np.array(pil_img)
-                        except Exception as resize_e:
-                            logging.error(
-                                f'[THUMB][RAW][ERRO] Falha ao redimensionar thumb: {resize_e} | arquivo: {local_path}')
+                            pil_img = Image.open(local_path)
+                            pil_img = pil_img.convert('RGB')
+                        except Exception as pil_err:
+                            logging.error(f"[THUMB][RAW][ERRO] Falha em todos os metodos (rawpy e Pillow) para {local_path}: {pil_err}")
                             return None
-                        if img is None or img.size == 0 or len(img.shape) != 3:
-                            logging.error(
-                                f'[THUMB][RAW][ERRO] Imagem extraída do RAW é inválida. | arquivo: {local_path}')
-                            return None
-                        img = np.ascontiguousarray(img)
-                        h, w, ch = img.shape
-                        bytes_per_line = ch * w
-                        try:
-                            qimg = QImage(img.data, w, h, bytes_per_line,
-                                          QImage.Format.Format_RGB888).copy()
-                        except Exception as qimg_e:
-                            logging.error(
-                                f'[THUMB][RAW][ERRO] Falha ao criar QImage: {qimg_e} | arquivo: {local_path}')
-                            return None
+
+                    if pil_img is None:
+                        return None
+
+                    try:
+                        pil_img.thumbnail((base_size, base_size), Image.LANCZOS)
+                        img = np.array(pil_img)
+                    except Exception as resize_e:
+                        logging.error(
+                            f'[THUMB][RAW][ERRO] Falha ao redimensionar thumb: {resize_e} | arquivo: {local_path}')
+                        return None
+
+                    if img is None or img.size == 0 or len(img.shape) != 3:
+                        logging.error(
+                            f'[THUMB][RAW][ERRO] Imagem extraída do RAW/Pillow é inválida. | arquivo: {local_path}')
+                        return None
+
+                    img = np.ascontiguousarray(img)
+                    h, w, ch = img.shape
+                    bytes_per_line = ch * w
+                    try:
+                        qimg = QImage(img.data, w, h, bytes_per_line,
+                                      QImage.Format.Format_RGB888).copy()
+                    except Exception as qimg_e:
+                        logging.error(
+                            f'[THUMB][RAW][ERRO] Falha ao criar QImage: {qimg_e} | arquivo: {local_path}')
+                        return None
 
                     cache_path = ThumbnailCache.get_thumbnail_cache_path(
                         file_item, 'png')

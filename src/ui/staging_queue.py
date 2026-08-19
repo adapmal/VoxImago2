@@ -9,9 +9,10 @@ import time
 import logging
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem,
-    QPushButton, QLabel, QMessageBox, QWidget, QFrame, QSplitter
+    QPushButton, QLabel, QMessageBox, QWidget, QFrame, QSplitter,
+    QAbstractItemView, QProgressDialog
 )
-from PyQt6.QtCore import Qt, QObject, pyqtSignal
+from PyQt6.QtCore import Qt, QObject, pyqtSignal, QCoreApplication
 from src.utils.config_manager import ConfigManager
 
 
@@ -115,6 +116,22 @@ class StagingQueue:
                     pass
 
     def add_item(self, item):
+        # 1. Se for 'delete', remove qualquer 'move', 'rename' ou 'tags' pendentes anteriores desse mesmo arquivo
+        if item.action_type == 'delete':
+            self.items = [it for it in self.items if it.file_id != item.file_id]
+
+        # 2. Se for 'move':
+        elif item.action_type == 'move':
+            # Se o arquivo já está marcado para exclusão definitiva (delete), ignora o mover
+            if any(it.file_id == item.file_id and it.action_type == 'delete' for it in self.items):
+                return
+            # Substitui 'move' anterior
+            self.items = [it for it in self.items if not (it.file_id == item.file_id and it.action_type == 'move')]
+
+        # 3. Se for 'rename', substitui 'rename' anterior
+        elif item.action_type == 'rename':
+            self.items = [it for it in self.items if not (it.file_id == item.file_id and it.action_type == 'rename')]
+
         self.items.append(item)
         self.itemAdded.emit(item)
         self.queueChanged.emit(len(self.items))
@@ -149,6 +166,17 @@ class StagingQueue:
             self.queueChanged.emit(len(self.items))
             self._save_to_disk()
 
+    def remove_items_batch(self, items_to_remove):
+        changed = False
+        for item in items_to_remove:
+            if item in self.items:
+                self.items.remove(item)
+                self.itemRemoved.emit(item)
+                changed = True
+        if changed:
+            self.queueChanged.emit(len(self.items))
+            self._save_to_disk()
+
     def clear(self):
         self.items.clear()
         self.cleared.emit()
@@ -179,11 +207,45 @@ class StagingQueueDialog(QDialog):
         self.queue.queueChanged.connect(lambda c: self._populate_list())
 
     def _init_ui(self):
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #1E1E1E;
+                color: #FFFFFF;
+            }
+            QLabel {
+                color: #FFFFFF;
+            }
+            QListWidget {
+                background-color: #252525;
+                color: #FFFFFF;
+                border: 1px solid #3A3A3A;
+                border-radius: 6px;
+            }
+            QListWidget::item {
+                padding: 6px;
+                border-bottom: 1px solid #2F2F2F;
+            }
+            QListWidget::item:selected {
+                background-color: #0D47A1;
+                color: #FFFFFF;
+            }
+            QPushButton {
+                background-color: #333333;
+                color: #FFFFFF;
+                border: 1px solid #555555;
+                border-radius: 4px;
+                padding: 6px 12px;
+            }
+            QPushButton:hover {
+                background-color: #444444;
+            }
+        """)
+
         layout = QVBoxLayout(self)
 
         header_layout = QHBoxLayout()
         self.header_label = QLabel("📋 Alterações Pendentes para Revisão")
-        self.header_label.setStyleSheet("font-size: 16px; font-weight: bold;")
+        self.header_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #FFFFFF;")
         header_layout.addWidget(self.header_label)
 
         header_layout.addStretch()
@@ -195,16 +257,18 @@ class StagingQueueDialog(QDialog):
         layout.addLayout(header_layout)
 
         self.list_widget = QListWidget()
+        self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.list_widget.setStyleSheet("font-size: 13px;")
         layout.addWidget(self.list_widget)
 
         self.details_label = QLabel("Selecione um item para ver o detalhamento da alteração.")
         self.details_label.setFrameShape(QFrame.Shape.StyledPanel)
         self.details_label.setWordWrap(True)
-        self.details_label.setStyleSheet("padding: 8px; background: #F8F9FA;")
+        self.details_label.setStyleSheet("padding: 10px; background-color: #252525; color: #E0E0E0; border: 1px solid #3A3A3A; border-radius: 6px; font-size: 12px; min-height: 48px;")
         layout.addWidget(self.details_label)
 
         self.list_widget.currentItemChanged.connect(self._on_item_selected)
+        self.list_widget.itemSelectionChanged.connect(self._on_selection_changed)
 
         btn_layout = QHBoxLayout()
 
@@ -253,7 +317,7 @@ class StagingQueueDialog(QDialog):
         else:
             if self.config_mgr.is_sandbox():
                 self.mode_info_label.setText("🧪 Alvo: Sandbox (L:\\Drives Compartilhados\\_TestesBanco)")
-                self.mode_info_label.setStyleSheet("color: #856404;")
+                self.mode_info_label.setStyleSheet("color: #FFC107;")
             else:
                 self.mode_info_label.setText("☁️ Alvo: Produção Oficial (Google Drive)")
                 self.mode_info_label.setStyleSheet("color: #28A745;")
@@ -262,9 +326,44 @@ class StagingQueueDialog(QDialog):
 
     def _populate_list(self):
         self.list_widget.clear()
+        
+        # Mapear arquivos que possuem 'move' na fila
+        move_map = {}
+        for it in self.queue.items:
+            if it.action_type == 'move':
+                dest_name = os.path.basename(os.path.dirname(it.new_value))
+                move_map[it.file_id] = (dest_name, it.new_value)
+                if it.path:
+                    move_map[os.path.normpath(it.path).lower()] = (dest_name, it.new_value)
+
         for idx, item in enumerate(self.queue.items):
             list_item = QListWidgetItem()
-            text = f"{idx+1}. {item.file_name} -> {item.get_description_summary()}"
+            
+            # Verificar se este arquivo possui movimento posterior
+            has_subsequent_move = False
+            moved_dest_name = ""
+            if item.action_type != 'move':
+                lookup_key = os.path.normpath(item.path).lower() if item.path else item.file_id
+                if item.file_id in move_map:
+                    has_subsequent_move = True
+                    moved_dest_name = move_map[item.file_id][0]
+                elif lookup_key in move_map:
+                    has_subsequent_move = True
+                    moved_dest_name = move_map[lookup_key][0]
+
+            if item.action_type == 'move':
+                orig_folder = os.path.basename(os.path.dirname(item.old_value or item.path))
+                dest_folder = os.path.basename(os.path.dirname(item.new_value))
+                text = f"{idx+1}. 📦 {item.file_name} ➜ Mover: [{orig_folder}] ➔ [{dest_folder}]"
+            elif item.action_type == 'rename':
+                move_suffix = f"  [📦 Movido para: {moved_dest_name}]" if has_subsequent_move else ""
+                text = f"{idx+1}. ✏️ {item.old_value or item.file_name} ➜ Renomear para [{item.new_value}]{move_suffix}"
+            elif item.action_type == 'delete':
+                text = f"{idx+1}. 🗑️ {item.file_name} ➜ Excluir do acervo"
+            else:
+                move_suffix = f"  [📦 Movido para: {moved_dest_name}]" if has_subsequent_move else ""
+                text = f"{idx+1}. 🏷️ {item.file_name} ➜ {item.get_description_summary()}{move_suffix}"
+
             list_item.setText(text)
             list_item.setData(Qt.ItemDataRole.UserRole, item)
             self.list_widget.addItem(list_item)
@@ -276,6 +375,17 @@ class StagingQueueDialog(QDialog):
         if current:
             item = current.data(Qt.ItemDataRole.UserRole)
             if item:
+                # Checar se possui transferência posterior
+                subsequent_note = ""
+                if item.action_type != 'move':
+                    lookup_key = os.path.normpath(item.path).lower() if item.path else item.file_id
+                    for it in self.queue.items:
+                        if it.action_type == 'move':
+                            if it.file_id == item.file_id or (it.path and os.path.normpath(it.path).lower() == lookup_key):
+                                dst_folder = os.path.normpath(os.path.dirname(it.new_value))
+                                subsequent_note = f"<br><br><span style='color: #17A2B8; font-weight: bold;'>📦 Transferência posterior:</span> Este arquivo foi movido na fila para a pasta: <b>{dst_folder}</b>"
+                                break
+
                 if item.action_type == 'move':
                     details = (
                         f"<b>Arquivo:</b> {item.file_name}<br>"
@@ -295,6 +405,7 @@ class StagingQueueDialog(QDialog):
                         f"<b>Novo Nome:</b> {item.new_value}<br>"
                         f"<b>Caminho:</b> {item.path}<br>"
                         f"<b>Ação:</b> ✏️ Renomear arquivo"
+                        f"{subsequent_note}"
                     )
                 else:
                     details = (
@@ -302,6 +413,7 @@ class StagingQueueDialog(QDialog):
                         f"<b>Caminho:</b> {item.path}<br>"
                         f"<b>Ação:</b> {item.get_description_summary()}<br>"
                         f"<b>Descrição Anterior:</b> <i>{item.old_value or '(vazia)'}</i>"
+                        f"{subsequent_note}"
                     )
                 self.details_label.setText(details)
 
@@ -310,11 +422,32 @@ class StagingQueueDialog(QDialog):
                 return
         self.details_label.setText("Selecione um item para ver o detalhamento da alteração.")
 
+    def _on_selection_changed(self):
+        selected_items = self.list_widget.selectedItems()
+        count = len(selected_items)
+        if count == 0:
+            self.btn_execute_next.setText("▶️ Executar Próxima")
+            self.btn_remove_selected.setText("🗑️ Remover Selecionado")
+        elif count == 1:
+            self.btn_execute_next.setText("▶️ Executar Selec.")
+            self.btn_remove_selected.setText("🗑️ Remover Selecionado")
+        else:
+            self.btn_execute_next.setText(f"▶️ Executar Selec. ({count})")
+            self.btn_remove_selected.setText(f"🗑️ Remover Selecionados ({count})")
+
     def _remove_selected_item(self):
-        current = self.list_widget.currentItem()
-        if current:
-            item = current.data(Qt.ItemDataRole.UserRole)
-            self.queue.remove_item(item)
+        selected = self.list_widget.selectedItems()
+        if selected:
+            items_to_remove = []
+            for it_widget in selected:
+                try:
+                    item = it_widget.data(Qt.ItemDataRole.UserRole)
+                    if item:
+                        items_to_remove.append(item)
+                except RuntimeError:
+                    pass
+            if items_to_remove:
+                self.queue.remove_items_batch(items_to_remove)
 
     def _clear_queue(self):
         if self.queue.count() > 0:
@@ -334,23 +467,46 @@ class StagingQueueDialog(QDialog):
         total = self.queue.count()
         if total == 0:
             return
-            
-        errors = []
-        # Remove confirmation dialog as requested
-        # dest_name = "Sandbox (L:\\Drives Compartilhados\\_TestesBanco)" if self.config_mgr.is_sandbox() else "Google Drive Oficial"
-        # reply = QMessageBox.question(...)
+
+        reply = QMessageBox.question(
+            self, "Confirmar Execução",
+            f"Você tem certeza de que deseja executar todas as {total} alterações pendentes da fila?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
 
         executed_count = 0
         errors = []
+        executed_items = []
 
-        for item in list(self.queue.items):
+        progress = QProgressDialog("Preparando execução...", "Cancelar", 0, total, self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+
+        for idx, item in enumerate(list(self.queue.items)):
+            if progress.wasCanceled():
+                logging.info("Execução da fila cancelada pelo usuário.")
+                break
+            progress.setLabelText(f"Executando ({idx+1}/{total}):\n{item.file_name}")
+            progress.setValue(idx)
+            QCoreApplication.processEvents()
+
             try:
                 self._execute_single_item(item)
                 executed_count += 1
-                self.queue.remove_item(item)
+                executed_items.append(item)
             except Exception as e:
                 logging.error(f"Erro ao executar item {item.file_name}: {e}")
                 errors.append(f"{item.file_name}: {e}")
+
+        progress.setValue(total)
+        progress.close()
+
+        if executed_items:
+            self.queue.remove_items_batch(executed_items)
 
         if errors:
             QMessageBox.warning(
@@ -371,14 +527,53 @@ class StagingQueueDialog(QDialog):
         if self.config_mgr.is_read_only() or self.queue.count() == 0:
             return
 
-        item = self.queue.items[0]
-        try:
-            self._execute_single_item(item)
-            self.queue.remove_item(item)
-            self.executionCompleted.emit(1)
-        except Exception as e:
-            logging.error(f"Erro ao executar proxima: {e}")
-            QMessageBox.warning(self, "Erro", f"Falha ao executar o item: {e}")
+        selected_widgets = self.list_widget.selectedItems()
+        if selected_widgets:
+            target_items_set = {w.data(Qt.ItemDataRole.UserRole) for w in selected_widgets if w.data(Qt.ItemDataRole.UserRole)}
+            items_to_execute = [it for it in self.queue.items if it in target_items_set]
+        else:
+            items_to_execute = [self.queue.items[0]]
+
+        executed_count = 0
+        errors = []
+        executed_items = []
+        
+        total = len(items_to_execute)
+        progress = None
+        if total > 1:
+            progress = QProgressDialog("Preparando execução...", "Cancelar", 0, total, self)
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.setValue(0)
+            progress.show()
+
+        for idx, item in enumerate(items_to_execute):
+            if progress:
+                if progress.wasCanceled():
+                    logging.info("Execução cancelada pelo usuário.")
+                    break
+                progress.setLabelText(f"Executando ({idx+1}/{total}):\n{item.file_name}")
+                progress.setValue(idx)
+                QCoreApplication.processEvents()
+
+            try:
+                self._execute_single_item(item)
+                executed_items.append(item)
+                executed_count += 1
+            except Exception as e:
+                logging.error(f"Erro ao executar item {item.file_name}: {e}")
+                errors.append(f"{item.file_name}: {e}")
+
+        if progress:
+            progress.setValue(total)
+            progress.close()
+
+        if executed_items:
+            self.queue.remove_items_batch(executed_items)
+
+        if errors:
+            QMessageBox.warning(self, "Aviso", f"{executed_count} item(ns) executado(s).\n\nErros:\n" + "\n".join(errors[:5]))
+        self.executionCompleted.emit(executed_count)
 
     def _get_drive_file_id(self, item):
         fid = item.file_id
@@ -496,6 +691,8 @@ class StagingQueueDialog(QDialog):
         return fid
 
     def _execute_single_item(self, item):
+        if self.db_indexer:
+            self.db_indexer.ensure_conn()
         drive_file_id = self._get_drive_file_id(item) if self.drive_service else None
 
         # 1. Processar alteração de tags / descrição
@@ -550,6 +747,7 @@ class StagingQueueDialog(QDialog):
         elif item.action_type == 'move':
             src_path = item.old_value or item.path
             dst_path = item.new_value
+            new_file_name_clash = None
 
             # 1. Mover arquivo localmente no disco
             if src_path and os.path.exists(src_path):
@@ -557,15 +755,31 @@ class StagingQueueDialog(QDialog):
                 dst_dir = os.path.dirname(dst_path)
                 os.makedirs(dst_dir, exist_ok=True)
                 if os.path.normpath(src_path) != os.path.normpath(dst_path):
+                    # Se o arquivo destino já existe no local, resolve o conflito de nome
+                    if os.path.exists(dst_path):
+                        base, ext = os.path.splitext(dst_path)
+                        counter = 1
+                        while True:
+                            candidate_path = f"{base}_{counter}{ext}"
+                            if not os.path.exists(candidate_path):
+                                dst_path = candidate_path
+                                break
+                            counter += 1
+                        
+                        item.new_value = dst_path
+                        new_file_name_clash = os.path.basename(dst_path)
+                        logging.warning(f"⚠️ Conflito detectado! Renomeando arquivo para evitar sobreposição: {new_file_name_clash}")
+
                     shutil.move(src_path, dst_path)
                     logging.info(f"✅ Arquivo local movido com sucesso: {src_path} -> {dst_path}")
 
             # 2. Atualizar no banco SQLite
             if self.db_indexer and item.file_id:
                 new_parent_path = os.path.dirname(dst_path)
+                new_name = os.path.basename(dst_path)
                 self.db_indexer.cursor.execute(
-                    "UPDATE files SET path = ?, parentId = ? WHERE file_id = ? OR path = ?",
-                    (dst_path, new_parent_path, item.file_id, src_path)
+                    "UPDATE files SET path = ?, parentId = ?, name = ?, name_normalized = ? WHERE file_id = ? OR path = ?",
+                    (dst_path, new_parent_path, new_name, new_name.lower(), item.file_id, src_path)
                 )
                 self.db_indexer.conn.commit()
 
@@ -582,13 +796,17 @@ class StagingQueueDialog(QDialog):
                     target_parent_id = self._find_drive_folder_id(dst_folder_name, dst_parent_folder_name)
 
                     if target_parent_id:
-                        self.drive_service.files().update(
-                            fileId=drive_file_id,
-                            addParents=target_parent_id,
-                            removeParents=current_parents,
-                            supportsAllDrives=True
-                        ).execute()
-                        logging.info(f"✅ Google Drive: arquivo {item.file_name} movido para a pasta '{dst_folder_name}'")
+                        update_kwargs = {
+                            'fileId': drive_file_id,
+                            'addParents': target_parent_id,
+                            'removeParents': current_parents,
+                            'supportsAllDrives': True
+                        }
+                        if new_file_name_clash:
+                            update_kwargs['body'] = {'name': new_file_name_clash}
+
+                        self.drive_service.files().update(**update_kwargs).execute()
+                        logging.info(f"✅ Google Drive: arquivo {item.file_name} movido para a pasta '{dst_folder_name}'" + (f" e renomeado para {new_file_name_clash}" if new_file_name_clash else ""))
                 except Exception as e:
                     logging.error(f"Erro ao mover arquivo no Google Drive: {e}")
 

@@ -19,8 +19,16 @@ def setup_logging():
     logging.basicConfig(level=logging.INFO, format=log_format, handlers=handlers)
 
 
+def handle_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+    logging.critical("Unhandled exception", exc_info=(exc_type, exc_value, exc_traceback))
+
+
 def main():
     setup_logging()
+    sys.excepthook = handle_exception
     logging.info("=== Iniciando VoxImago.MB ===")
     app = QApplication(sys.argv)
     print('DEBUG: QApplication criado')
