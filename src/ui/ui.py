@@ -1813,7 +1813,7 @@ class DriveFileGalleryApp(QMainWindow):
             self.status_bar.showMessage(f"📦 Arquivo movido na fila para '{dst_folder_name}' (exibindo na pasta de destino atual).", 5000)
 
         # 4. Localizar e iluminar/selecionar o arquivo na grade do meio
-        def _find_and_select():
+        def _find_and_select(retries=10):
             if not hasattr(self, 'file_list_model') or not self.file_list_model:
                 return
 
@@ -1839,12 +1839,13 @@ class DriveFileGalleryApp(QMainWindow):
                 if hasattr(self, 'status_bar') and self.status_bar and not has_moved_staged:
                     self.status_bar.showMessage(f"🔍 Item em foco: {fname}", 4000)
             else:
-                # Se não estiver no primeiro lote, tenta carregar mais um lote
-                if not self.all_files_loaded and len(self.file_list_model._files) < 300:
+                if getattr(self, 'is_loading', False) and retries > 0:
+                    QTimer.singleShot(60, lambda: _find_and_select(retries - 1))
+                elif not getattr(self, 'all_files_loaded', False) and len(self.file_list_model._files) < 400 and retries > 0:
                     list_update.load_next_batch(self)
-                    QTimer.singleShot(40, _find_and_select)
+                    QTimer.singleShot(60, lambda: _find_and_select(retries - 1))
 
-        QTimer.singleShot(80, _find_and_select)
+        QTimer.singleShot(100, lambda: _find_and_select(10))
 
     def on_vocab_tag_selected(self, tag_text):
         focus_widget = QApplication.focusWidget()
@@ -1910,14 +1911,23 @@ class DriveFileGalleryApp(QMainWindow):
         if not file_item:
             return
 
-        if file_item.get('mimeType') in ['application/vnd.google-apps.folder', 'folder']:
+        is_folder = (file_item.get('mimeType') in ['application/vnd.google-apps.folder', 'folder', 'directory'])
+        fpath = file_item.get('path') or file_item.get('id')
+        if not is_folder and fpath and os.path.isdir(fpath):
+            is_folder = True
+
+        if is_folder:
             self.search_term = ""
             self.main_bar.search_entry.clear()
-            self.current_page = 0
-            self.all_files_loaded = False
-            list_update.clear_display(self)
-            self.current_folder_id = file_item.get('id') or file_item.get('file_id')
-            list_update.load_next_batch(self)
+            if fpath and hasattr(self, 'folder_tree') and self.folder_tree:
+                self.folder_tree.select_and_expand_folder(fpath)
+            else:
+                self.current_folder_path_filter = fpath
+                self.current_folder_id = file_item.get('id') or file_item.get('file_id')
+                self.current_page = 0
+                self.all_files_loaded = False
+                list_update.clear_display(self)
+                list_update.load_next_batch(self)
             return
 
         # Para arquivos (fotos, vídeos, documentos):

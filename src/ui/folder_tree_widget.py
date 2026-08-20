@@ -17,14 +17,48 @@ from src.utils.config_manager import ConfigManager
 
 
 class FolderFileSystemModel(QFileSystemModel):
-    """QFileSystemModel otimizado e nativo para navegação ultra-rápida de diretórios."""
+    """QFileSystemModel otimizado com cache instantâneo de subpastas do banco de dados (0ms)."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._subdirs_cache = {}
+        self._known_parent_folders = set()
+        self._load_parents_from_db()
+
+    def _load_parents_from_db(self):
+        try:
+            import sqlite3
+            base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            db_path = os.path.join(base_dir, 'data', 'file_index.db')
+            if not os.path.exists(db_path):
+                db_path = os.path.abspath('data/file_index.db')
+            if os.path.exists(db_path):
+                con = sqlite3.connect(db_path)
+                q = "SELECT DISTINCT parentId FROM files WHERE mimeType IN ('folder', 'application/vnd.google-apps.folder', 'directory')"
+                self._known_parent_folders = {
+                    os.path.normcase(os.path.normpath(r[0]))
+                    for r in con.execute(q) if r[0]
+                }
+                con.close()
+        except Exception:
+            pass
+
+    def hasChildren(self, parent=QModelIndex()):
+        if not parent.isValid():
+            return super().hasChildren(parent)
+        path = self.filePath(parent)
+        if not path:
+            return False
+        norm_p = os.path.normcase(os.path.normpath(path))
+        if norm_p in self._known_parent_folders:
+            return True
+        return self.rowCount(parent) > 0
+
+    def add_known_parent(self, path):
+        if path:
+            self._known_parent_folders.add(os.path.normcase(os.path.normpath(path)))
 
     def clear_subdirs_cache(self):
-        self._subdirs_cache.clear()
+        self._load_parents_from_db()
 
 
 class FolderTreeDelegate(QStyledItemDelegate):
@@ -252,18 +286,30 @@ class FolderTreeWidget(QWidget):
         # Atualizar visualização quando o modo Sandbox alternar
         self.config_mgr.modeChanged.connect(self._on_mode_changed)
 
+    def _copy_path_to_clipboard(self, target_path):
+        from PyQt6.QtWidgets import QApplication
+        clipboard = QApplication.clipboard()
+        if clipboard and target_path:
+            clipboard.setText(target_path)
+            win = self.window()
+            if hasattr(win, 'status_bar') and win.status_bar:
+                win.status_bar.showMessage(f"📋 Caminho copiado: {target_path}", 3500)
+
     def _show_tree_context_menu(self, position):
         index = self.tree_view.indexAt(position)
         target_path = self.model.filePath(index) if index.isValid() else self.root_dir
 
         menu = QMenu(self)
-        action_new = menu.addAction("📁 Criar Nova Pasta Aqui...")
+        action_copy_path = menu.addAction("📋 Copiar Caminho")
         action_open_explorer = menu.addAction("📂 Abrir no Explorer")
+        menu.addSeparator()
+        action_new = menu.addAction("📁 Criar Nova Pasta Aqui...")
         menu.addSeparator()
         action_refresh = menu.addAction("🔄 Recarregar Árvore")
 
-        action_new.triggered.connect(lambda: self.create_new_folder(target_path))
+        action_copy_path.triggered.connect(lambda: self._copy_path_to_clipboard(target_path))
         action_open_explorer.triggered.connect(lambda: os.startfile(target_path) if os.path.exists(target_path) else None)
+        action_new.triggered.connect(lambda: self.create_new_folder(target_path))
         action_refresh.triggered.connect(self._refresh_tree)
 
         menu.exec(self.tree_view.viewport().mapToGlobal(position))
@@ -308,53 +354,40 @@ class FolderTreeWidget(QWidget):
             QMessageBox.warning(self, "Pasta Já Existe", f"A pasta '{folder_name}' já existe neste local.")
             return
 
-        if self.config_mgr.is_read_only():
-            from src.ui.staging_queue import StagingQueue, StagingItem
-            queue = StagingQueue()
-            st_item = StagingItem(new_path, folder_name, new_path, 'create_folder', old_value="", new_value=new_path)
-            queue.add_item(st_item)
-            win = self.window()
-            if hasattr(win, 'status_bar') and win.status_bar:
-                win.status_bar.showMessage(f"🟢 Nova pasta '{folder_name}' agendada na Fila (Modo Somente Leitura)!", 4000)
-            self.tree_view.viewport().update()
-            return
+        from src.ui.staging_queue import StagingQueue, StagingItem
+        queue = StagingQueue()
+        for it in queue.items:
+            if it.action_type == 'create_folder' and os.path.normcase(os.path.normpath(it.new_value)) == os.path.normcase(new_path):
+                QMessageBox.information(self, "Pasta em Fila", f"A pasta '{folder_name}' já está agendada na Fila de Revisão.")
+                return
 
-
+        # 1. Cria a pasta localmente para que o QFileSystemModel a exiba na árvore e receba drag-and-drop
         try:
             os.makedirs(new_path, exist_ok=True)
+        except Exception as e_mk:
+            QMessageBox.critical(self, "Erro ao Criar Pasta", f"Não foi possível preparar a pasta local:\n{e_mk}")
+            return
 
-            # Registrar a pasta no banco de dados SQLite local
-            win = self.window()
-            if hasattr(win, 'indexer') and win.indexer:
-                try:
-                    import time
-                    now = int(time.time())
-                    win.indexer.ensure_conn()
-                    win.indexer.cursor.execute(
-                        "INSERT OR REPLACE INTO files (file_id, name, path, mimeType, source, description, parentId, createdTime, modifiedTime) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        (new_path, folder_name, new_path, 'folder', 'local', '', target_parent_path, now, now)
-                    )
-                    win.indexer.conn.commit()
-                except Exception as e_db:
-                    pass
+        # 2. Agenda a criação oficial / sincronização na nuvem na Fila de Revisão
+        st_item = StagingItem(new_path, folder_name, new_path, 'create_folder', old_value="", new_value=new_path)
+        queue.add_item(st_item)
+        
+        # 3. Registrar como pasta conhecida e atualizar visualização
+        self.model.add_known_parent(target_parent_path)
+        self.model.clear_subdirs_cache()
+        parent_idx = self.model.index(target_parent_path)
+        if parent_idx.isValid():
+            self.tree_view.expand(parent_idx)
 
-            # Limpar cache e expandir pasta pai
-            self.model.clear_subdirs_cache()
-            parent_idx = self.model.index(target_parent_path)
-            if parent_idx.isValid():
-                self.tree_view.expand(parent_idx)
-
-            # Selecionar a nova pasta criada
-            new_idx = self.model.index(new_path)
-            if new_idx.isValid():
-                self.tree_view.setCurrentIndex(new_idx)
-                self.folderSelected.emit(new_path)
-
-            if hasattr(win, 'status_bar') and win.status_bar:
-                win.status_bar.showMessage(f"✅ Pasta '{folder_name}' criada com sucesso!", 4000)
-
-        except Exception as err:
-            QMessageBox.critical(self, "Erro ao Criar Pasta", f"Não foi possível criar a pasta:\n{err}")
+        new_idx = self.model.index(new_path)
+        if new_idx.isValid():
+            self.tree_view.setCurrentIndex(new_idx)
+            self.folderSelected.emit(new_path)
+        
+        win = self.window()
+        if hasattr(win, 'status_bar') and win.status_bar:
+            win.status_bar.showMessage(f"🟢 Nova pasta '{folder_name}' agendada na Fila (com badge verde)!", 4000)
+        self.tree_view.viewport().update()
 
     def _on_selection_changed(self, selected, deselected):
         indexes = self.tree_view.selectedIndexes()

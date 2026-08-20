@@ -163,8 +163,20 @@ class StagingQueue:
         self._save_to_disk()
         return count
 
+    def _cleanup_staged_folder(self, item):
+        if item.action_type == 'create_folder':
+            fpath = item.new_value or item.path
+            if fpath and os.path.isdir(fpath):
+                try:
+                    # Se a pasta estiver vazia, remove o placeholder local
+                    if not os.listdir(fpath):
+                        os.rmdir(fpath)
+                except Exception:
+                    pass
+
     def remove_item(self, item):
         if item in self.items:
+            self._cleanup_staged_folder(item)
             self.items.remove(item)
             self.itemRemoved.emit(item)
             self.queueChanged.emit(len(self.items))
@@ -174,6 +186,7 @@ class StagingQueue:
         changed = False
         for item in items_to_remove:
             if item in self.items:
+                self._cleanup_staged_folder(item)
                 self.items.remove(item)
                 self.itemRemoved.emit(item)
                 changed = True
@@ -209,6 +222,10 @@ class StagingQueueDialog(QDialog):
         self._init_ui()
         self._populate_list()
         self.queue.queueChanged.connect(lambda c: self._populate_list())
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._populate_list()
 
     def _init_ui(self):
         self.setStyleSheet("""
@@ -364,6 +381,9 @@ class StagingQueueDialog(QDialog):
                 text = f"{idx+1}. ✏️ {item.old_value or item.file_name} ➜ Renomear para [{item.new_value}]{move_suffix}"
             elif item.action_type == 'delete':
                 text = f"{idx+1}. 🗑️ {item.file_name} ➜ Excluir do acervo"
+            elif item.action_type == 'create_folder':
+                parent_name = os.path.basename(os.path.dirname(item.new_value or item.path))
+                text = f"{idx+1}. 📁🟢 Criar Nova Pasta: [{parent_name}] ➔ [{item.file_name}]"
             else:
                 move_suffix = f"  [📦 Movido para: {moved_dest_name}]" if has_subsequent_move else ""
                 text = f"{idx+1}. 🏷️ {item.file_name} ➜ {item.get_description_summary()}{move_suffix}"
@@ -402,6 +422,14 @@ class StagingQueueDialog(QDialog):
                         f"<b>Arquivo:</b> {item.file_name}<br>"
                         f"<b>Caminho:</b> {item.path}<br>"
                         f"<b>Ação:</b> 🗑️ Excluir arquivo do acervo"
+                    )
+                elif item.action_type == 'create_folder':
+                    parent_dir = os.path.dirname(item.new_value or item.path)
+                    details = (
+                        f"<b>Nome da Nova Pasta:</b> {item.file_name}<br>"
+                        f"<b>Pasta Pai (Local):</b> {parent_dir}<br>"
+                        f"<b>Caminho Completo:</b> {item.new_value or item.path}<br>"
+                        f"<b>Ação:</b> 📁🟢 Criar Nova Pasta no Google Drive e no Disco"
                     )
                 elif item.action_type == 'rename':
                     details = (
@@ -749,15 +777,44 @@ class StagingQueueDialog(QDialog):
 
         elif item.action_type == 'rename':
             new_name = item.new_value
-            if self.db_indexer and item.file_id:
-                self.db_indexer.cursor.execute("UPDATE files SET name = ?, name_normalized = ? WHERE file_id = ?", (new_name, new_name.lower(), item.file_id))
+            old_path = item.path or item.old_value
+            new_path = old_path
+
+            # 1. Renomear fisicamente no disco local pelo caminho absoluto
+            if old_path and os.path.exists(old_path):
+                parent_dir = os.path.dirname(old_path)
+                new_path = os.path.normpath(os.path.join(parent_dir, new_name))
+                if os.path.normpath(old_path) != new_path:
+                    try:
+                        os.rename(old_path, new_path)
+                        logging.info(f"✅ Arquivo local renomeado: {old_path} -> {new_path}")
+                    except Exception as e_ren:
+                        logging.error(f"Erro ao renomear arquivo local: {e_ren}")
+
+            # 2. Atualizar no banco SQLite pelo ID / caminho exato
+            if self.db_indexer:
+                lookup_id = item.file_id or old_path
+                self.db_indexer.cursor.execute(
+                    "UPDATE files SET name = ?, name_normalized = ?, path = ? WHERE file_id = ? OR path = ?", 
+                    (new_name, new_name.lower(), new_path, lookup_id, old_path)
+                )
+                self.db_indexer.cursor.execute(
+                    "UPDATE search_index SET name = ?, normalized_name = ? WHERE file_id = ?",
+                    (new_name, new_name.lower(), lookup_id)
+                )
                 self.db_indexer.conn.commit()
+
+            # 3. Renomear no Google Drive pelo ID único do arquivo
             if self.drive_service and drive_file_id:
-                self.drive_service.files().update(
-                    fileId=drive_file_id, 
-                    body={'name': new_name}, 
-                    supportsAllDrives=True
-                ).execute()
+                try:
+                    self.drive_service.files().update(
+                        fileId=drive_file_id, 
+                        body={'name': new_name}, 
+                        supportsAllDrives=True
+                    ).execute()
+                    logging.info(f"✅ Google Drive: arquivo renomeado para '{new_name}' (ID: {drive_file_id})")
+                except Exception as e_drv:
+                    logging.error(f"Erro ao renomear no Google Drive: {e_drv}")
 
         elif item.action_type == 'move':
             src_path = item.old_value or item.path
@@ -806,9 +863,9 @@ class StagingQueueDialog(QDialog):
                     ).execute()
                     current_parents = ",".join(f_info.get('parents', []))
 
-                    dst_folder_name = os.path.basename(os.path.dirname(dst_path))
-                    dst_parent_folder_name = os.path.basename(os.path.dirname(os.path.dirname(dst_path)))
-                    target_parent_id = self._find_drive_folder_id(dst_folder_name, dst_parent_folder_name)
+                    dst_dir = os.path.dirname(dst_path)
+                    dst_folder_name = os.path.basename(dst_dir)
+                    target_parent_id = self._resolve_drive_folder_id_by_path(dst_dir)
 
                     if target_parent_id:
                         update_kwargs = {
@@ -821,20 +878,84 @@ class StagingQueueDialog(QDialog):
                             update_kwargs['body'] = {'name': new_file_name_clash}
 
                         self.drive_service.files().update(**update_kwargs).execute()
-                        logging.info(f"✅ Google Drive: arquivo {item.file_name} movido para a pasta '{dst_folder_name}'" + (f" e renomeado para {new_file_name_clash}" if new_file_name_clash else ""))
+                        logging.info(f"✅ Google Drive: arquivo {item.file_name} movido com sucesso para a pasta '{dst_folder_name}' (ID: {target_parent_id})" + (f" e renomeado para {new_file_name_clash}" if new_file_name_clash else ""))
+                    else:
+                        logging.error(f"❌ Não foi possível resolver o ID da pasta destino no Google Drive para o caminho: {dst_dir}")
                 except Exception as e:
                     logging.error(f"Erro ao mover arquivo no Google Drive: {e}")
 
         elif item.action_type == 'delete':
-            if self.db_indexer and item.file_id:
-                self.db_indexer.cursor.execute("DELETE FROM files WHERE file_id = ?", (item.file_id,))
-                self.db_indexer.conn.commit()
+            # 1. Apagar no disco local (se existir fisicamente)
+            if item.path and os.path.exists(item.path):
+                try:
+                    import send2trash
+                    send2trash.send2trash(item.path)
+                except Exception:
+                    try:
+                        if os.path.isdir(item.path):
+                            import shutil
+                            shutil.rmtree(item.path)
+                        else:
+                            os.remove(item.path)
+                    except Exception as e_del:
+                        logging.warning(f"Não foi possível remover arquivo local '{item.path}': {e_del}")
+
+            # 2. Apagar no banco de dados SQLite local
+            if self.db_indexer:
+                del_id = item.file_id or item.path
+                if del_id:
+                    self.db_indexer.cursor.execute("DELETE FROM files WHERE file_id = ? OR path = ?", (del_id, item.path or del_id))
+                    self.db_indexer.cursor.execute("DELETE FROM search_index WHERE file_id = ?", (del_id,))
+                    self.db_indexer.conn.commit()
+
+            # 3. Enviar para a lixeira do Google Drive pelo ID único
             if self.drive_service and drive_file_id:
-                self.drive_service.files().update(
-                    fileId=drive_file_id, 
-                    body={'trashed': True}, 
-                    supportsAllDrives=True
-                ).execute()
+                try:
+                    self.drive_service.files().update(
+                        fileId=drive_file_id, 
+                        body={'trashed': True}, 
+                        supportsAllDrives=True
+                    ).execute()
+                    logging.info(f"🗑️ Google Drive: arquivo '{item.file_name}' (ID: {drive_file_id}) movido para a lixeira.")
+                except Exception as e_drv:
+                    logging.error(f"Erro ao enviar para a lixeira no Drive: {e_drv}")
+
+        elif item.action_type == 'create_folder':
+            target_folder_path = item.new_value or item.path
+            if target_folder_path:
+                norm_p = os.path.normpath(target_folder_path)
+                os.makedirs(norm_p, exist_ok=True)
+                if self.db_indexer:
+                    now = int(time.time())
+                    self.db_indexer.cursor.execute(
+                        "INSERT OR REPLACE INTO files (file_id, name, path, mimeType, source, description, parentId, createdTime, modifiedTime) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (norm_p, os.path.basename(norm_p), norm_p, 'folder', 'local', '', os.path.dirname(norm_p), now, now)
+                    )
+                    self.db_indexer.conn.commit()
+                if self.drive_service:
+                    parent_dir = os.path.dirname(norm_p)
+                    parent_drive_id = self._resolve_drive_folder_id_by_path(parent_dir)
+                    if parent_drive_id:
+                        folder_metadata = {
+                            'name': os.path.basename(norm_p),
+                            'mimeType': 'application/vnd.google-apps.folder',
+                            'parents': [parent_drive_id]
+                        }
+                        res = self.drive_service.files().create(
+                            body=folder_metadata,
+                            fields='id',
+                            supportsAllDrives=True
+                        ).execute()
+                        new_folder_id = res.get('id')
+                        if not hasattr(self, '_drive_folder_id_cache'):
+                            self._drive_folder_id_cache = {}
+                        self._drive_folder_id_cache[norm_p.lower()] = new_folder_id
+                        if self.db_indexer and new_folder_id:
+                            self.db_indexer.cursor.execute(
+                                "UPDATE files SET file_id = ? WHERE path = ?",
+                                (new_folder_id, norm_p)
+                            )
+                            self.db_indexer.conn.commit()
 
         elif item.action_type == 'rotate_90':
             if item.path and os.path.exists(item.path):
@@ -843,47 +964,88 @@ class StagingQueueDialog(QDialog):
                     img = img.rotate(-90, expand=True)
                     img.save(item.path)
 
-    def _find_drive_folder_id(self, folder_name, parent_folder_name=None):
-        """Localiza o fileId de uma pasta no Google Drive pelo nome e opcionalmente pelo pai."""
-        if not self.drive_service or not folder_name:
+    def _resolve_drive_folder_id_by_path(self, full_folder_path):
+        """
+        Resolve o fileId exato da pasta no Google Drive navegando nível por nível
+        a partir da raiz do Drive Compartilhado, evitando ambiguidades entre anos e pastas com nomes iguais.
+        """
+        if not self.drive_service or not full_folder_path:
             return None
+
+        norm = os.path.normpath(full_folder_path)
+        
+        # Cache em memória durante a execução em lote
+        if not hasattr(self, '_drive_folder_id_cache'):
+            self._drive_folder_id_cache = {}
+            
+        if norm.lower() in self._drive_folder_id_cache:
+            return self._drive_folder_id_cache[norm.lower()]
+
+        drive_id = self.config_mgr.get_current_drive_id() or '0AOB-ISqqs76_Uk9PVA'
+        
+        # Separar partes relativas a partir de 'Banco de Imagens'
+        parts = norm.split(os.sep)
         try:
-            clean_name = folder_name.replace("'", "\\'")
-            query = f"name='{clean_name}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+            idx = [p.lower() for p in parts].index('banco de imagens')
+            rel_parts = parts[idx+1:]
+        except ValueError:
+            rel_parts = [p for p in parts if p and ':' not in p and p.lower() not in ('drives compartilhados', 'shared drives')]
+
+        if not rel_parts:
+            return drive_id
+
+        current_parent_id = drive_id
+        accumulated_path = []
+
+        for seg in rel_parts:
+            accumulated_path.append(seg)
+            curr_norm = os.sep.join(accumulated_path).lower()
+            
+            if curr_norm in self._drive_folder_id_cache:
+                current_parent_id = self._drive_folder_id_cache[curr_norm]
+                continue
+
+            clean_seg = seg.replace("'", "\\'")
+            q = f"'{current_parent_id}' in parents and name = '{clean_seg}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+            
             kwargs = {
-                'q': query,
+                'q': q,
                 'supportsAllDrives': True,
                 'includeItemsFromAllDrives': True,
                 'fields': "files(id, name, parents)"
             }
-            current_drive = self.config_mgr.get_current_drive_id()
-            if current_drive:
+            if drive_id:
                 kwargs['corpora'] = 'drive'
-                kwargs['driveId'] = current_drive
+                kwargs['driveId'] = drive_id
             else:
                 kwargs['corpora'] = 'allDrives'
-                
-            res = self.drive_service.files().list(**kwargs).execute()
-            folders = res.get('files', [])
-            if not folders:
-                return None
-            if len(folders) == 1 or not parent_folder_name:
-                return folders[0]['id']
 
-            for f in folders:
-                for pid in f.get('parents', []):
-                    try:
-                        p_info = self.drive_service.files().get(
-                            fileId=pid, fields="name", supportsAllDrives=True
-                        ).execute()
-                        if p_info.get('name') == parent_folder_name:
-                            return f['id']
-                    except Exception:
-                        pass
-            return folders[0]['id']
-        except Exception as e:
-            logging.error(f"Erro ao buscar ID da pasta de destino no Drive: {e}")
-            return None
+            try:
+                res = self.drive_service.files().list(**kwargs).execute()
+                files = res.get('files', [])
+                if not files:
+                    # Fallback com busca normalizada (sem acentos/maiúsculas) entre os filhos diretos
+                    fallback_kwargs = kwargs.copy()
+                    fallback_kwargs['q'] = f"'{current_parent_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+                    res_fallback = self.drive_service.files().list(**fallback_kwargs).execute()
+                    from src.database.search import SearchEngine
+                    norm_seg = SearchEngine(None).normalize_text(seg)
+                    for candidate in res_fallback.get('files', []):
+                        if SearchEngine(None).normalize_text(candidate.get('name', '')) == norm_seg:
+                            files = [candidate]
+                            break
+
+                if not files:
+                    logging.warning(f"Pasta intermediária '{seg}' não encontrada no Drive sob pai '{current_parent_id}'")
+                    return None
+                current_parent_id = files[0]['id']
+                self._drive_folder_id_cache[curr_norm] = current_parent_id
+            except Exception as err:
+                logging.error(f"Erro ao resolver pasta '{seg}' no Drive: {err}")
+                return None
+
+        self._drive_folder_id_cache[norm.lower()] = current_parent_id
+        return current_parent_id
 
     def _export_queue(self):
         from PyQt6.QtWidgets import QFileDialog
