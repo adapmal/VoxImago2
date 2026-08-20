@@ -228,6 +228,7 @@ class list_update:
 
     @staticmethod
     def clear_display(app):
+        app.is_loading = False
         app.all_loaded_label.hide()
         app.file_list_model.setFiles([])
 
@@ -235,7 +236,7 @@ class list_update:
             try:
                 if app.details_panel.thumbnail_thread.isRunning():
                     app.details_panel.thumbnail_thread.quit()
-                    if not app.details_panel.thumbnail_thread.wait(2000):
+                    if not app.details_panel.thumbnail_thread.wait(50):
                         app.details_panel.thumbnail_thread.terminate()
             except Exception:
                 pass
@@ -274,12 +275,7 @@ class list_update:
             source = app.current_view if not search_all_sources else None
 
             files_raw = list_update._load_files_for_filters(app, source)
-            
-            # Manter arquivos que existem fisicamente OU que são virtuais (staged move) OU do Drive
-            files_to_add = [
-                f for f in files_raw 
-                if f.get('is_staged_move') or f.get('source') == 'drive' or (f.get('path') and os.path.exists(f['path']))
-            ]
+            files_to_add = files_raw
 
             if not files_to_add:
                 app.all_files_loaded = True
@@ -326,22 +322,33 @@ class list_update:
     def _sync_single_folder_on_the_fly(app, folder_path):
         import logging
         try:
-            entries = os.listdir(folder_path)
+            with os.scandir(folder_path) as it:
+                valid_entries = [
+                    (e.name, e.is_dir(follow_symlinks=False), int(e.stat(follow_symlinks=False).st_mtime), e.stat(follow_symlinks=False).st_size)
+                    for e in it if e.name.lower() != 'desktop.ini'
+                ]
         except Exception:
             return
 
-        valid_entries = [e for e in entries if e.lower() != 'desktop.ini']
         app.indexer.ensure_conn()
         norm_folder = os.path.normpath(folder_path)
         norm_folder_slashes = norm_folder.replace('\\', '/')
+        possible_parents = (
+            norm_folder,
+            norm_folder.lower(),
+            norm_folder_slashes,
+            norm_folder_slashes.lower()
+        )
 
-        # Query slashes case/slash-insensitively
+        # Query ultra-fast using index (0.001s) loading all existing metadata at once
         app.indexer.cursor.execute(
-            "SELECT file_id, name, path, mimeType, modifiedTime, size FROM files WHERE (parentId = ? OR parentId = ? OR REPLACE(parentId, '\\', '/') = ?) AND source = 'local'",
-            (norm_folder, norm_folder_slashes, norm_folder_slashes)
+            """SELECT file_id, name, path, mimeType, modifiedTime, size, description, thumbnailLink, thumbnailPath, webContentLink 
+               FROM files 
+               WHERE parentId IN (?, ?, ?, ?) AND source = 'local'""",
+            possible_parents
         )
         db_entries = app.indexer.cursor.fetchall()
-        db_by_name = {row[1]: row for row in db_entries}
+        db_by_name = {row[1].lower(): row for row in db_entries}
 
         items_to_save = []
         ids_to_delete = []
@@ -350,31 +357,44 @@ class list_update:
         from src.utils.utils import extrair_ano_banco_imagens
         from datetime import datetime, timezone
 
-        for name in valid_entries:
-            entry_path = os.path.normcase(os.path.normpath(os.path.join(norm_folder, name)))
-            actual_names.add(name)
+        for name, is_dir, modified, size in valid_entries:
+            entry_path = os.path.normpath(os.path.join(norm_folder, name))
+            actual_names.add(name.lower())
 
-            try:
-                is_dir = os.path.isdir(entry_path)
-                modified = int(os.path.getmtime(entry_path))
-                size = 0 if is_dir else os.path.getsize(entry_path)
-            except Exception:
-                continue
+            db_row = db_by_name.get(name.lower())
+            db_id_differs = bool(db_row and os.path.normcase(os.path.normpath(db_row[0])) != os.path.normcase(entry_path))
 
-            db_row = db_by_name.get(name)
-            db_id_differs = db_row and db_row[0] != entry_path
-
+            # Check if file is new or modified or moved
             if not db_row or db_row[4] != modified or db_row[5] != size or db_id_differs:
                 try:
-                    created = int(os.path.getctime(entry_path))
-                    data_mais_antiga = min(created, modified)
                     ano_caminho = extrair_ano_banco_imagens(entry_path)
-                    if ano_caminho and ano_caminho < datetime.fromtimestamp(data_mais_antiga).year:
+                    if ano_caminho and ano_caminho < datetime.fromtimestamp(modified).year:
                         data_final = int(datetime(ano_caminho, 1, 1, tzinfo=timezone.utc).timestamp())
                     else:
-                        data_final = data_mais_antiga
+                        data_final = modified
                 except Exception:
                     data_final = modified
+
+                desc = db_row[6] if (db_row and db_row[6]) else ''
+                thumb_link = db_row[7] if (db_row and db_row[7]) else ''
+                thumb_path = db_row[8] if (db_row and db_row[8]) else ''
+                web_link = db_row[9] if (db_row and db_row[9]) else None
+
+                # AUTO-HEALING: If no description exists locally, search if Drive or another record has tags for this filename!
+                if not desc:
+                    app.indexer.cursor.execute(
+                        "SELECT description, thumbnailLink, thumbnailPath, webContentLink FROM files WHERE (name = ? OR name_normalized = ?) AND description != '' LIMIT 1",
+                        (name, name.lower())
+                    )
+                    cloud_match = app.indexer.cursor.fetchone()
+                    if cloud_match and cloud_match[0]:
+                        desc = cloud_match[0]
+                        if not thumb_link:
+                            thumb_link = cloud_match[1] or ''
+                        if not thumb_path:
+                            thumb_path = cloud_match[2] or ''
+                        if not web_link:
+                            web_link = cloud_match[3]
 
                 item = {
                     'id': entry_path,
@@ -382,29 +402,18 @@ class list_update:
                     'path': entry_path,
                     'mimeType': 'folder' if is_dir else 'image/jpeg',
                     'source': 'local',
-                    'description': '',
-                    'thumbnailLink': '',
-                    'thumbnailPath': '',
+                    'description': desc,
+                    'thumbnailLink': thumb_link,
+                    'thumbnailPath': thumb_path,
                     'size': size,
                     'modifiedTime': modified,
                     'createdTime': data_final,
                     'parentId': norm_folder,
-                    'webContentLink': None
+                    'webContentLink': web_link
                 }
-                if db_row:
-                    app.indexer.cursor.execute(
-                        "SELECT description, thumbnailLink, thumbnailPath, webContentLink FROM files WHERE file_id = ?",
-                        (db_row[0],)
-                    )
-                    old_data = app.indexer.cursor.fetchone()
-                    if old_data:
-                        item['description'] = old_data[0] or ''
-                        item['thumbnailLink'] = old_data[1] or ''
-                        item['thumbnailPath'] = old_data[2] or ''
-                        item['webContentLink'] = old_data[3]
-                    
-                    if db_id_differs:
-                        ids_to_delete.append(db_row[0])
+
+                if db_row and db_id_differs:
+                    ids_to_delete.append(db_row[0])
 
                 items_to_save.append(item)
 

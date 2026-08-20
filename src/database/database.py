@@ -9,6 +9,7 @@ Responsável por:
 
 import unicodedata
 import sqlite3
+import logging
 from src.database.search import SearchEngine
 import os
 import time
@@ -58,16 +59,11 @@ class FileIndexer:
         for s_path in shared_candidates:
             try:
                 if os.path.exists(s_path) and os.path.getsize(s_path) > 1024 * 1024:
-                    should_copy = False
                     if not local_exists:
-                        print(f"📦 Banco local ausente ou vazio. Restaurando da nuvem ({s_path})...")
+                        logging.info(f"[RESTORE] Banco local ausente ou vazio. Restaurando da nuvem ({s_path})...")
                         should_copy = True
                     else:
-                        local_mtime = os.path.getmtime(self.db_name)
-                        remote_mtime = os.path.getmtime(s_path)
-                        if remote_mtime > local_mtime:
-                            print(f"🔄 Banco compartilhado na nuvem é mais recente ({s_path}). Atualizando banco local...")
-                            should_copy = True
+                        should_copy = False
 
                     if should_copy:
                         # Limpar arquivos WAL / SHM antigos antes de copiar
@@ -79,10 +75,10 @@ class FileIndexer:
                                 except Exception:
                                     pass
                         shutil.copy2(s_path, self.db_name)
-                        print("✅ Banco de dados local sincronizado com sucesso com a versão da nuvem!")
+                        logging.info("[OK] Banco de dados local sincronizado com sucesso com a versão da nuvem!")
                         break
             except Exception as e_copy:
-                print(f"⚠️ Não foi possível sincronizar com o banco compartilhado: {e_copy}")
+                logging.warning(f"[AVISO] Não foi possível sincronizar com o banco compartilhado: {e_copy}")
 
         self.conn = sqlite3.connect(self.db_name, check_same_thread=False, timeout=30.0)
         self.conn.create_function("py_lower", 1, lambda s: s.lower() if s else s)
@@ -212,9 +208,9 @@ class FileIndexer:
         self.cursor.execute(
             'CREATE INDEX IF NOT EXISTS idx_files_modifiedTime ON files(modifiedTime)')
         self.cursor.execute(
-            'CREATE INDEX IF NOT EXISTS idx_files_createdTime ON files(createdTime)')
+            'CREATE INDEX IF NOT EXISTS idx_files_parent_source_created ON files(parentId, source, createdTime DESC)')
         self.cursor.execute(
-            'CREATE INDEX IF NOT EXISTS idx_files_size ON files(size)')
+            'CREATE INDEX IF NOT EXISTS idx_files_parent_source_name ON files(parentId, source, name COLLATE NOCASE)')
 
         self._create_performance_indices()
 

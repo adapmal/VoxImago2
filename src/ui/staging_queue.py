@@ -718,10 +718,21 @@ class StagingQueueDialog(QDialog):
                 new_desc = item.new_value
 
             # Atualizar SEMPRE localmente no banco SQLite
-            if self.db_indexer and item.file_id:
-                self.db_indexer.update_description(item.file_id, new_desc, commit=True)
+            if self.db_indexer:
+                if item.file_id:
+                    self.db_indexer.update_description(item.file_id, new_desc, commit=True)
                 if item.path and item.path != item.file_id:
                     self.db_indexer.update_description(item.path, new_desc, commit=True)
+                if item.file_name:
+                    self.db_indexer.cursor.execute(
+                        "UPDATE files SET description = ? WHERE (name = ? OR name_normalized = ?)",
+                        (new_desc, item.file_name, item.file_name.lower())
+                    )
+                    self.db_indexer.cursor.execute(
+                        "UPDATE search_index SET description = ?, normalized_description = ? WHERE file_id IN (SELECT file_id FROM files WHERE name = ? OR name_normalized = ?)",
+                        (new_desc, new_desc.lower(), item.file_name, item.file_name.lower())
+                    )
+                    self.db_indexer.conn.commit()
 
             # Atualizar na API do Google Drive se o serviço de drive estiver ativo
             if self.drive_service and drive_file_id:

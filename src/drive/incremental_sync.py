@@ -7,22 +7,26 @@ class IncrementalSyncWorker(QObject):
     sync_finished = pyqtSignal(int)  # number of updated files
     sync_failed = pyqtSignal(str)
 
-    def __init__(self, service, config_mgr, indexer=None):
+    def __init__(self, service, config_mgr, indexer=None, force_window_days=None):
         super().__init__()
         self.service = service
         self.config_mgr = config_mgr
         self.indexer = indexer
+        self.force_window_days = force_window_days
 
     def run(self):
         try:
             from src.database.database import FileIndexer
             local_indexer = FileIndexer()
             
-            last_sync = self.config_mgr.get('last_sync_timestamp')
-            if not last_sync:
-                # Se não houver timestamp anterior, olhar os últimos 30 dias para pegar qualquer alteração recente
-                last_sync = int(time.time() - 30 * 86400)
-                self.config_mgr.set('last_sync_timestamp', last_sync)
+            if self.force_window_days:
+                last_sync = int(time.time() - self.force_window_days * 86400)
+            else:
+                last_sync = self.config_mgr.get('last_sync_timestamp')
+                if not last_sync:
+                    # Se não houver timestamp anterior, olhar os últimos 30 dias para pegar qualquer alteração recente
+                    last_sync = int(time.time() - 30 * 86400)
+                    self.config_mgr.set('last_sync_timestamp', last_sync)
 
             last_sync_dt = datetime.fromtimestamp(last_sync, timezone.utc)
             formatted_time = last_sync_dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
@@ -83,9 +87,30 @@ class IncrementalSyncWorker(QObject):
                     "UPDATE files SET description = ?, modifiedTime = ?, webContentLink = ? WHERE file_id = ?",
                     (desc, mod_time, wlink, fid)
                 )
+                drive_updated = (local_indexer.cursor.rowcount > 0)
                 
-                # Se o arquivo não existia na base de dados, ele é novo! Inserir.
-                if local_indexer.cursor.rowcount == 0:
+                # 2. Atualizar registro local correspondente de forma ultra-rápida (indexada)
+                local_indexer.cursor.execute("SELECT file_id FROM files WHERE (name = ? OR name_normalized = ?) AND source = 'local'", (fname, fname.lower()))
+                matching_local_fids = [r[0] for r in local_indexer.cursor.fetchall()]
+                
+                local_updated = False
+                for local_fid in matching_local_fids:
+                    if is_sb and '_TestesBanco' not in local_fid:
+                        continue
+                    if not is_sb and '_TestesBanco' in local_fid:
+                        continue
+                    local_indexer.cursor.execute(
+                        "UPDATE files SET description = ?, modifiedTime = ?, webContentLink = ? WHERE file_id = ?",
+                        (desc, mod_time, wlink, local_fid)
+                    )
+                    local_indexer.cursor.execute(
+                        "UPDATE search_index SET description = ?, normalized_description = ? WHERE file_id = ?",
+                        (desc, desc.lower(), local_fid)
+                    )
+                    local_updated = True
+
+                # Se o arquivo não existia nem no Drive nem localmente, inserir novo registro do Drive
+                if not drive_updated and not local_updated:
                     try:
                         created_time_raw = file.get('createdTime')
                         created_time = int(datetime.strptime(created_time_raw, "%Y-%m-%dT%H:%M:%S.%fZ").timestamp()) if created_time_raw else mod_time
@@ -108,26 +133,6 @@ class IncrementalSyncWorker(QObject):
                         'webContentLink': wlink,
                     }
                     local_indexer.save_files_in_batch([new_item], source='drive')
-                else:
-                    # 2. Atualizar registro local correspondente respeitando o escopo do Sandbox
-                    if is_sb:
-                        local_indexer.cursor.execute(
-                            "UPDATE files SET description = ?, modifiedTime = ?, webContentLink = ? WHERE name = ? AND source = 'local' AND (path LIKE '%_TestesBanco%' OR file_id LIKE '%_TestesBanco%')",
-                            (desc, mod_time, wlink, fname)
-                        )
-                        local_indexer.cursor.execute(
-                            "UPDATE search_index SET description = ?, normalized_description = ? WHERE file_id = ? OR file_id IN (SELECT file_id FROM files WHERE name = ? AND (path LIKE '%_TestesBanco%' OR file_id LIKE '%_TestesBanco%'))",
-                            (desc, desc.lower(), fid, fname)
-                        )
-                    else:
-                        local_indexer.cursor.execute(
-                            "UPDATE files SET description = ?, modifiedTime = ?, webContentLink = ? WHERE name = ? AND source = 'local' AND NOT (path LIKE '%_TestesBanco%' OR file_id LIKE '%_TestesBanco%')",
-                            (desc, mod_time, wlink, fname)
-                        )
-                        local_indexer.cursor.execute(
-                            "UPDATE search_index SET description = ?, normalized_description = ? WHERE file_id = ? OR file_id IN (SELECT file_id FROM files WHERE name = ? AND NOT (path LIKE '%_TestesBanco%' OR file_id LIKE '%_TestesBanco%'))",
-                            (desc, desc.lower(), fid, fname)
-                        )
 
             local_indexer.conn.commit()
             

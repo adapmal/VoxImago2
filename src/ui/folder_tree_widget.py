@@ -11,41 +11,17 @@ from PyQt6.QtWidgets import (
     QHeaderView, QAbstractItemView, QPushButton, QInputDialog,
     QMessageBox, QMenu, QStyledItemDelegate
 )
-from PyQt6.QtGui import QFileSystemModel, QDragEnterEvent, QDragMoveEvent, QDropEvent, QCursor, QColor, QPen
+from PyQt6.QtGui import QFileSystemModel, QDragEnterEvent, QDragMoveEvent, QDropEvent, QCursor, QColor, QPen, QFont
 from PyQt6.QtCore import pyqtSignal, Qt, QDir, QUrl, QModelIndex
 from src.utils.config_manager import ConfigManager
 
 
 class FolderFileSystemModel(QFileSystemModel):
-    """QFileSystemModel customizado que apenas exibe triângulos expansores se a pasta tiver subpastas reais."""
+    """QFileSystemModel otimizado e nativo para navegação ultra-rápida de diretórios."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._subdirs_cache = {}
-
-    def hasChildren(self, parent=QModelIndex()):
-        if not parent.isValid():
-            return super().hasChildren(parent)
-
-        path = self.filePath(parent)
-        if not path or not os.path.isdir(path):
-            return False
-
-        if path in self._subdirs_cache:
-            return self._subdirs_cache[path]
-
-        has_subdirs = False
-        try:
-            with os.scandir(path) as it:
-                for entry in it:
-                    if entry.is_dir(follow_symlinks=False) and not entry.name.startswith('.'):
-                        has_subdirs = True
-                        break
-        except Exception:
-            has_subdirs = False
-
-        self._subdirs_cache[path] = has_subdirs
-        return has_subdirs
 
     def clear_subdirs_cache(self):
         self._subdirs_cache.clear()
@@ -382,9 +358,10 @@ class FolderTreeWidget(QWidget):
 
     def _on_selection_changed(self, selected, deselected):
         indexes = self.tree_view.selectedIndexes()
-        if indexes:
+        if indexes and self.model.isDir(indexes[0]):
             folder_path = self.model.filePath(indexes[0])
-            self.folderSelected.emit(folder_path)
+            if folder_path:
+                self.folderSelected.emit(folder_path)
 
     def _on_mode_changed(self, key, value):
         if key in ('sandbox_mode', 'sandbox_path'):

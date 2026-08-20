@@ -249,17 +249,16 @@ class SearchEngine:
                     filter_params.append(int(time.mktime(advanced_filters['created_after'].timetuple())))
 
                 if advanced_filters.get('path_filter'):
-                    pf = advanced_filters['path_filter'].replace(chr(92), '/').lower()
-                    # Apenas filhos diretos (não a própria pasta e nem netos)
-                    where_parts.append("(py_lower(REPLACE(path, '\\', '/')) LIKE ? AND py_lower(REPLACE(path, '\\', '/')) NOT LIKE ?)")
-                    filter_params.append(f"{pf}/%")
-                    filter_params.append(f"{pf}/%/%")
+                    pf = advanced_filters['path_filter'].replace('\\', '/')
+                    pf_win = pf.replace('/', '\\')
+                    where_parts.append("(parentId IN (?, ?, ?, ?) OR ((path LIKE ? OR path LIKE ?) AND (path NOT LIKE ? AND path NOT LIKE ?)))")
+                    filter_params.extend([pf, pf.lower(), pf_win, pf_win.lower(), f"{pf}/%", f"{pf_win}\\%", f"{pf}/%/%", f"{pf_win}\\%\\%"])
 
                 if advanced_filters.get('sandbox_filter'):
-                    sf = advanced_filters['sandbox_filter'].replace(chr(92), '/').lower()
-                    where_parts.append("(py_lower(REPLACE(path, '\\', '/')) = ? OR py_lower(REPLACE(path, '\\', '/')) LIKE ?)")
-                    filter_params.append(sf)
-                    filter_params.append(f"{sf}/%")
+                    sf = advanced_filters['sandbox_filter'].replace('\\', '/')
+                    sf_win = sf.replace('/', '\\')
+                    where_parts.append("(path = ? OR path = ? OR path LIKE ? OR path LIKE ?)")
+                    filter_params.extend([sf, sf_win, f"{sf}/%", f"{sf_win}\\%"])
 
             details_query = f"SELECT file_id, name, path, mimeType, source, description, thumbnailLink, thumbnailPath, size, modifiedTime, createdTime, parentId, starred, webContentLink FROM files"
             
@@ -375,15 +374,16 @@ class SearchEngine:
                                     f"({' OR '.join(ext_conditions)})")
 
                 if advanced_filters.get('path_filter'):
-                    pf = advanced_filters['path_filter'].replace(chr(92), '/').lower()
-                    files_where_clauses.append("(py_lower(REPLACE(path, '\\', '/')) LIKE ? AND py_lower(REPLACE(path, '\\', '/')) NOT LIKE ?)")
-                    files_params.append(f"{pf}/%")
-                    files_params.append(f"{pf}/%/%")
+                    pf = advanced_filters['path_filter'].replace('\\', '/')
+                    pf_win = pf.replace('/', '\\')
+                    files_where_clauses.append("(parentId IN (?, ?, ?, ?) OR ((path LIKE ? OR path LIKE ?) AND (path NOT LIKE ? AND path NOT LIKE ?)))")
+                    files_params.extend([pf, pf.lower(), pf_win, pf_win.lower(), f"{pf}/%", f"{pf_win}\\%", f"{pf}/%/%", f"{pf_win}\\%\\%"])
 
                 if advanced_filters.get('sandbox_filter'):
-                    sf = advanced_filters['sandbox_filter'].replace(chr(92), '/').lower()
-                    files_where_clauses.append("py_lower(REPLACE(path, '\\', '/')) LIKE ?")
-                    files_params.append(f"{sf}%")
+                    sf = advanced_filters['sandbox_filter'].replace('\\', '/')
+                    sf_win = sf.replace('/', '\\')
+                    files_where_clauses.append("(path = ? OR path = ? OR path LIKE ? OR path LIKE ?)")
+                    files_params.extend([sf, sf_win, f"{sf}/%", f"{sf_win}\\%"])
             query = f"SELECT file_id, name, path, mimeType, source, description, thumbnailLink, thumbnailPath, size, modifiedTime, createdTime, parentId, starred, webContentLink FROM files WHERE {' AND '.join(files_where_clauses)} ORDER BY {order_by_clause} LIMIT ? OFFSET ?"
             if explorer_special:
                 query = query.replace("WHERE", "WHERE source = 'local' AND")

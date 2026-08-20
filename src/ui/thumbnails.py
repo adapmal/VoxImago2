@@ -10,7 +10,7 @@
 '''
 from PyQt6.QtCore import QRect, QRunnable
 from PyQt6.QtCore import Qt, QSize, pyqtSignal
-from PyQt6.QtGui import QPixmap, QFont, QPainter, QBrush, QColor, QImage
+from PyQt6.QtGui import QPixmap, QFont, QPainter, QBrush, QColor, QImage, QPen
 from PyQt6.QtWidgets import QStyledItemDelegate, QStyle
 from PyQt6.QtCore import QObject
 import os
@@ -119,37 +119,36 @@ class FileListDelegate(QStyledItemDelegate):
             painter.setOpacity(0.3)
 
         parent_view = self.parent()
-        is_grid = hasattr(parent_view, 'viewMode') and parent_view.viewMode(
-        ) == parent_view.ViewMode.IconMode
+        is_grid = hasattr(parent_view, 'viewMode') and parent_view.viewMode() == parent_view.ViewMode.IconMode
 
         pixmap = None
-        if file_item.get('source') == 'local' or file_item.get('source') == 'drive':
+        is_dir = file_item.get('mimeType') in ('folder', 'application/vnd.google-apps.folder')
+        if not is_dir:
             local_path = file_item.get('physical_path') or file_item.get('orig_path') or file_item.get('path') or ''
-            if local_path and not os.path.exists(local_path) and file_item.get('orig_path') and os.path.exists(file_item['orig_path']):
-                local_path = file_item['orig_path']
-            if local_path and not os.path.isdir(local_path):
-                extension = os.path.splitext(
-                    local_path)[1].lower() if local_path else ''
-                supported_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v',
-                                        '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp',
-                                        '.raw', '.cr2', '.nef', '.arw', '.dng', '.orf', '.rw2', '.pef', '.srw', '.raf',
-                                        '.pdf', '.heic', '.heif'}
+            extension = os.path.splitext(local_path)[1].lower() if local_path else ''
+            supported_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v',
+                                    '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp',
+                                    '.raw', '.cr2', '.nef', '.arw', '.dng', '.orf', '.rw2', '.pef', '.srw', '.raf',
+                                    '.pdf', '.heic', '.heif'}
 
-                if extension in supported_extensions:
-                    if ThumbnailCache.is_thumbnail_cached(file_item):
-                        cached = ThumbnailCache.get_existing_thumbnail_cache_path(
-                            file_item)
-                        p = QPixmap(cached)
-                        if not p.isNull():
-                            pixmap = p
-                    else:
-                        try:
-                            self.requestThumbnail.emit(file_item)
-                        except Exception:
-                            pass
+            if extension in supported_extensions:
+                if ThumbnailCache.is_thumbnail_cached(file_item):
+                    cached = ThumbnailCache.get_existing_thumbnail_cache_path(file_item)
+                    p = QPixmap(cached)
+                    if not p.isNull():
+                        pixmap = p
+                else:
+                    try:
+                        self.requestThumbnail.emit(file_item)
+                    except Exception:
+                        pass
+
         if pixmap is None:
             pixmap = ThumbnailManager.get_generic_thumbnail(
                 file_item.get('mimeType'))
+
+        source = file_item.get('source', 'local')
+        source_name = "Cloud" if source == 'drive' else "Local"
 
         if is_grid:
             icon_size = parent_view.iconSize().width()
@@ -178,15 +177,6 @@ class FileListDelegate(QStyledItemDelegate):
             painter.drawText(
                 name_bg_rect, Qt.AlignmentFlag.AlignCenter, elided_name)
 
-            source = file_item.get('source', 'local')
-            if source == 'drive':
-                local_path = file_item.get('path')
-                if local_path and os.path.exists(local_path):
-                    source_name = "Cloud (Local)"
-                else:
-                    source_name = "Cloud"
-            else:
-                source_name = "Local"
             painter.setFont(QFont("Arial", 8))
             painter.setPen(Qt.GlobalColor.gray)
             painter.drawText(rect.left()+8, rect.bottom()-6, source_name)
@@ -204,15 +194,6 @@ class FileListDelegate(QStyledItemDelegate):
             painter.setPen(option.palette.text().color())
             painter.drawText(rect.left()+64, rect.top()+22, name)
 
-            source = file_item.get('source', 'local')
-            if source == 'drive':
-                local_path = file_item.get('path')
-                if local_path and os.path.exists(local_path):
-                    source_name = "Cloud (Local)"
-                else:
-                    source_name = "Cloud"
-            else:
-                source_name = "Local"
             painter.setFont(QFont("Arial", 8))
             painter.setPen(Qt.GlobalColor.gray)
             painter.drawText(rect.left()+64, rect.top()+38, f"({source_name})")
@@ -628,8 +609,6 @@ class ThumbnailCache:
     def get_thumbnail_cache_key(file_item):
         if file_item.get('source') == 'local':
             path = file_item.get('physical_path') or file_item.get('orig_path') or file_item.get('path') or ''
-            if path and not os.path.exists(path) and file_item.get('orig_path') and os.path.exists(file_item['orig_path']):
-                path = file_item['orig_path']
             mtime = str(file_item.get('modifiedTime', ''))
             size = str(file_item.get('size', ''))
             key = hashlib.sha1(f"{path}|{mtime}|{size}".encode()).hexdigest()

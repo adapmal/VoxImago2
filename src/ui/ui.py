@@ -152,7 +152,7 @@ class DriveFileGalleryApp(QMainWindow):
         self.suggestion_timer.timeout.connect(self.update_search_suggestions)
         
         self.incremental_sync_timer = QTimer()
-        self.incremental_sync_timer.timeout.connect(self._run_incremental_sync)
+        self.incremental_sync_timer.timeout.connect(lambda: self._run_incremental_sync(force_manual=False))
         self.incremental_sync_timer.start(15 * 60 * 1000)  # 15 minutos
 
 
@@ -336,6 +336,8 @@ class DriveFileGalleryApp(QMainWindow):
 
         self.action_grid_view = self.main_bar.action_grid_view
         self.action_list_view = self.main_bar.action_list_view
+
+        self.main_bar.sync_now_requested.connect(self._run_incremental_sync)
 
         self.main_bar.action_scan_options.triggered.connect(
             self._show_scan_options)
@@ -801,41 +803,52 @@ class DriveFileGalleryApp(QMainWindow):
         list_update.clear_display(self)
         list_update.load_next_batch(self)
 
-    def _run_incremental_sync(self):
+    def _run_incremental_sync(self, force_manual=True):
         if not self.is_authenticated or not self.service:
             return
             
         import logging
-        if hasattr(self, 'inc_sync_thread') and self.inc_sync_thread and self.inc_sync_thread.isRunning():
-            logging.info("⏳ Sincronização incremental já está em andamento, ignorando ciclo.")
-            return
+        try:
+            if hasattr(self, 'inc_sync_thread') and self.inc_sync_thread is not None and self.inc_sync_thread.isRunning():
+                logging.info("⏳ Sincronização incremental já está em andamento, ignorando ciclo.")
+                self.status_bar.showMessage("⏳ Sincronização já em andamento...", 2000)
+                return
+        except RuntimeError:
+            self.inc_sync_thread = None
 
         logging.info("⏳ Disparando Sincronização Incremental (Background)...")
-        self.status_bar.showMessage("🔄 Verificando atualizações no Google Drive...", 2500)
+        self.status_bar.showMessage("🔄 Verificando atualizações no Google Drive...", 3000)
         
         from src.drive.incremental_sync import IncrementalSyncWorker
         from src.utils.config_manager import ConfigManager
         
+        # Se for acionado manualmente pelo usuário, olhar os últimos 7 dias para garantir tudo
+        window_days = 7 if force_manual else None
+        
         self.inc_sync_thread = QThread()
-        self.inc_sync_worker = IncrementalSyncWorker(self.service, ConfigManager(), self.search_engine.indexer)
+        self.inc_sync_worker = IncrementalSyncWorker(self.service, ConfigManager(), self.search_engine.indexer, force_window_days=window_days)
         self.inc_sync_worker.moveToThread(self.inc_sync_thread)
         
         self.inc_sync_thread.started.connect(self.inc_sync_worker.run)
         
         def on_inc_finished(count):
-            self.inc_sync_thread.quit()
-            self.inc_sync_thread.wait(2000)
-            self.inc_sync_thread.deleteLater()
+            if self.inc_sync_thread:
+                self.inc_sync_thread.quit()
+                self.inc_sync_thread.wait(2000)
+                self.inc_sync_thread.deleteLater()
+                self.inc_sync_thread = None
+            self._force_refresh_after_sync()
             if count > 0:
                 self.status_bar.showMessage(f"✅ Sincronização: {count} arquivo(s) atualizado(s) da nuvem.", 5000)
-                self._force_refresh_after_sync()
             else:
                 self.status_bar.showMessage("🔄 Sincronização: Tudo atualizado com o Drive.", 3000)
         
         def on_inc_failed(err):
-            self.inc_sync_thread.quit()
-            self.inc_sync_thread.wait(2000)
-            self.inc_sync_thread.deleteLater()
+            if self.inc_sync_thread:
+                self.inc_sync_thread.quit()
+                self.inc_sync_thread.wait(2000)
+                self.inc_sync_thread.deleteLater()
+                self.inc_sync_thread = None
             import logging
             logging.error(f"Sincronização incremental falhou: {err}")
             self.status_bar.showMessage(f"⚠️ Erro no sync em segundo plano: {err}", 4000)
@@ -1645,13 +1658,14 @@ class DriveFileGalleryApp(QMainWindow):
             self.file_list_model.addFiles(files_to_add)
 
     def on_folder_tree_selected(self, folder_path):
-        if not folder_path or not os.path.exists(folder_path):
+        if not folder_path:
             return
-        if folder_path == self.folder_tree.root_dir:
-            self.current_folder_path_filter = None
-        else:
-            self.current_folder_path_filter = folder_path
+        target_filter = None if folder_path == self.folder_tree.root_dir else folder_path
+        if getattr(self, 'current_folder_path_filter', None) == target_filter and self.file_list_model.rowCount() > 0 and not self.is_loading:
+            return
 
+        self.current_folder_path_filter = target_filter
+        self.is_loading = False
         self.current_page = 0
         self.all_files_loaded = False
         list_update.clear_display(self)

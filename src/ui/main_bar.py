@@ -9,6 +9,7 @@ from src.google_profile import make_circular_pixmap, PhotoDownloadWorker, Google
 
 class MainBar(QFrame):
     profile_requested = pyqtSignal(object)
+    sync_now_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         print('DEBUG: MainBar.__init__ INICIO')
@@ -117,6 +118,16 @@ class MainBar(QFrame):
         self.staging_btn.setToolTip("Abre a Fila de Revisão de Alterações Pendentes.")
         self.staging_btn.clicked.connect(self._open_staging_dialog)
         self.unified_layout.addWidget(self.staging_btn)
+        self.unified_layout.addSpacing(5)
+
+        self.sync_now_btn = QPushButton("🔄 Sincronizar")
+        self.sync_now_btn.setFixedHeight(34)
+        self.sync_now_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.sync_now_btn.setStyleSheet(
+            "background-color: #E3F2FD; color: #1565C0; border: 1px solid #BBDEFB; border-radius: 4px; padding: 4px 10px; font-weight: bold; font-size: 12px;")
+        self.sync_now_btn.setToolTip("Forçar sincronização incremental com o Google Drive agora.")
+        self.sync_now_btn.clicked.connect(self.sync_now_requested.emit)
+        self.unified_layout.addWidget(self.sync_now_btn)
         self.unified_layout.addSpacing(5)
 
         self.staging_queue.queueChanged.connect(self._update_staging_button)
