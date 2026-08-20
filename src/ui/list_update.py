@@ -38,23 +38,23 @@ class list_update:
         desc_overlay = {}  # {file_id / path_lower: updated_description}
 
         for it in staging_queue.items:
-            fid_key = it.file_id
-            path_key = os.path.normpath(it.path).lower() if it.path else None
+            fid_key = os.path.normcase(os.path.normpath(it.file_id)) if it.file_id else ''
+            path_key = os.path.normcase(os.path.normpath(it.path)) if it.path else ''
 
             if it.action_type == 'move':
-                moved_away_ids.add(it.file_id)
-                if it.path:
-                    moved_away_ids.add(os.path.normpath(it.path).lower())
+                moved_away_ids.add(fid_key)
+                if path_key:
+                    moved_away_ids.add(path_key)
                 if it.old_value:
-                    moved_away_ids.add(os.path.normpath(it.old_value).lower())
+                    moved_away_ids.add(os.path.normcase(os.path.normpath(it.old_value)))
 
                 if norm_filter:
-                    dst_folder = os.path.normpath(os.path.dirname(it.new_value)).lower()
+                    dst_folder = os.path.normcase(os.path.normpath(os.path.dirname(it.new_value)))
                     if dst_folder == norm_filter:
                         moved_in_staged_items.append(it)
 
             elif it.action_type == 'delete':
-                deleted_ids.add(it.file_id)
+                deleted_ids.add(fid_key)
                 if path_key:
                     deleted_ids.add(path_key)
 
@@ -73,20 +73,21 @@ class list_update:
         # 1. Filtrar e atualizar arquivos existentes
         filtered_files = []
         for f in files:
-            fid = f.get('file_id') or f.get('id')
-            fpath = os.path.normpath(f.get('path', '')).lower() if f.get('path') else None
+            raw_fid = f.get('file_id') or f.get('id') or ''
+            fid = os.path.normcase(os.path.normpath(raw_fid)) if raw_fid else ''
+            fpath = os.path.normcase(os.path.normpath(f.get('path', ''))) if f.get('path') else ''
 
             # Se foi movido para fora desta pasta, não exibe aqui
-            if fid in moved_away_ids or (fpath and fpath in moved_away_ids):
+            if (fid and fid in moved_away_ids) or (fpath and fpath in moved_away_ids):
                 continue
 
             # Sobrepor tags/descrição pendentes da fila
-            if fid in desc_overlay:
+            if fid and fid in desc_overlay:
                 f['description'] = desc_overlay[fid]
             elif fpath and fpath in desc_overlay:
                 f['description'] = desc_overlay[fpath]
 
-            if fid in deleted_ids or (fpath and fpath in deleted_ids):
+            if (fid and fid in deleted_ids) or (fpath and fpath in deleted_ids):
                 f['is_staged_delete'] = True
 
             filtered_files.append(f)
@@ -332,10 +333,12 @@ class list_update:
         valid_entries = [e for e in entries if e.lower() != 'desktop.ini']
         app.indexer.ensure_conn()
         norm_folder = os.path.normpath(folder_path)
+        norm_folder_slashes = norm_folder.replace('\\', '/')
 
+        # Query slashes case/slash-insensitively
         app.indexer.cursor.execute(
-            "SELECT file_id, name, path, mimeType, modifiedTime, size FROM files WHERE parentId = ? AND source = 'local'",
-            (norm_folder,)
+            "SELECT file_id, name, path, mimeType, modifiedTime, size FROM files WHERE (parentId = ? OR parentId = ? OR REPLACE(parentId, '\\', '/') = ?) AND source = 'local'",
+            (norm_folder, norm_folder_slashes, norm_folder_slashes)
         )
         db_entries = app.indexer.cursor.fetchall()
         db_by_name = {row[1]: row for row in db_entries}
@@ -348,7 +351,7 @@ class list_update:
         from datetime import datetime, timezone
 
         for name in valid_entries:
-            entry_path = os.path.join(norm_folder, name)
+            entry_path = os.path.normcase(os.path.normpath(os.path.join(norm_folder, name)))
             actual_names.add(name)
 
             try:
@@ -359,8 +362,9 @@ class list_update:
                 continue
 
             db_row = db_by_name.get(name)
+            db_id_differs = db_row and db_row[0] != entry_path
 
-            if not db_row or db_row[4] != modified or db_row[5] != size:
+            if not db_row or db_row[4] != modified or db_row[5] != size or db_id_differs:
                 try:
                     created = int(os.path.getctime(entry_path))
                     data_mais_antiga = min(created, modified)
@@ -398,6 +402,9 @@ class list_update:
                         item['thumbnailLink'] = old_data[1] or ''
                         item['thumbnailPath'] = old_data[2] or ''
                         item['webContentLink'] = old_data[3]
+                    
+                    if db_id_differs:
+                        ids_to_delete.append(db_row[0])
 
                 items_to_save.append(item)
 
@@ -407,10 +414,14 @@ class list_update:
 
         if items_to_save:
             app.indexer.save_files_in_batch(items_to_save, source='local')
+            app.search_engine.clear_cache()
+            
         if ids_to_delete:
+            app.search_engine.clear_cache()
             placeholders = ','.join('?' for _ in ids_to_delete)
             app.indexer.cursor.execute(f"DELETE FROM files WHERE file_id IN ({placeholders})", ids_to_delete)
             app.indexer.cursor.execute(f"DELETE FROM search_index WHERE file_id IN ({placeholders})", ids_to_delete)
+            app.indexer.conn.commit()
 
         if items_to_save or ids_to_delete:
             app.indexer.conn.commit()

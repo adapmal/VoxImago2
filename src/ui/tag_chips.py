@@ -311,7 +311,15 @@ class TagChipsWidget(QFrame):
         """)
         self.text_editor.setMaximumHeight(80)
         self.text_editor.setPlaceholderText("Digite as tags separadas por vírgula...")
+        self.text_editor.focusOutEvent = self._on_text_editor_focus_out
         self.stack.addWidget(self.text_editor)
+
+    def _on_text_editor_focus_out(self, event):
+        # Executar comportamento padrão
+        QPlainTextEdit.focusOutEvent(self.text_editor, event)
+        # Ao perder o foco no modo texto, commita automaticamente para o modo chips
+        if getattr(self, '_is_text_mode', False):
+            self.set_mode('chips')
 
     def mousePressEvent(self, event):
         if not self._is_text_mode:
@@ -340,6 +348,14 @@ class TagChipsWidget(QFrame):
             self._sync_chips_from_text_edit(new_tags)
             self.stack.setCurrentIndex(0)
             self.input_field.setFocus()
+
+        if hasattr(self.parent(), 'btn_toggle_edit'):
+            if mode == 'text':
+                self.parent().btn_toggle_edit.setText("🏷️ Bolinhas")
+                self.parent().btn_toggle_edit.setToolTip("Voltar para o modo de bolinhas/chips")
+            else:
+                self.parent().btn_toggle_edit.setText("✏️ Editar")
+                self.parent().btn_toggle_edit.setToolTip("Alternar para modo texto puro")
 
     def _sync_chips_from_text_edit(self, new_tags):
         """Reconstrói os chips após uma edição livre no modo texto mantendo os estados corretos."""

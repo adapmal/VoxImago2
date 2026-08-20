@@ -166,39 +166,20 @@ class SearchEngine:
                     for et in long_exclude_terms:
                         clean_et = et.replace('"', '')
                         fts_query += f' NOT "{clean_et}"'
-                
-                if fts_query.strip():
-                    if explorer_special:
-                        query = f"SELECT DISTINCT file_id FROM search_index WHERE (search_index MATCH ? OR normalized_name MATCH ? OR normalized_description MATCH ?) AND source = 'local' ORDER BY rank"
-                        params = (fts_query, fts_query, fts_query)
-                    elif source:
-                        query = f"SELECT DISTINCT file_id FROM search_index WHERE (search_index MATCH ? OR normalized_name MATCH ? OR normalized_description MATCH ?) AND source = ? ORDER BY rank"
-                        params = (fts_query, fts_query, fts_query, source)
-                    else:
-                        query = f"SELECT DISTINCT file_id FROM search_index WHERE search_index MATCH ? OR normalized_name MATCH ? OR normalized_description MATCH ? ORDER BY rank"
-                        params = (fts_query, fts_query, fts_query)
-                    try:
-                        self.indexer.cursor.execute(query, params)
-                        file_ids_to_fetch = [row[0] for row in self.indexer.cursor.fetchall()]
-                        print(f"Resultados FTS: {len(file_ids_to_fetch)} IDs encontrados")
-                    except sqlite3.OperationalError as e:
-                        print(f"Erro na consulta FTS: {e}")
-                        print(f"Consulta problemática: {fts_query}")
-                        self._paged_cache[cache_key] = []
-                        return []
-
-                    if not file_ids_to_fetch:
-                        self._paged_cache[cache_key] = []
-                        return []
 
             where_parts = []
             filter_params = []
 
-            if fts_terms:
-                file_ids_to_fetch = file_ids_to_fetch[:999]
-                placeholders = ','.join('?' for _ in file_ids_to_fetch)
-                where_parts.append(f"file_id IN ({placeholders})")
-                filter_params.extend(file_ids_to_fetch)
+            if fts_terms and fts_query.strip():
+                if explorer_special:
+                    where_parts.append("file_id IN (SELECT file_id FROM search_index WHERE (search_index MATCH ? OR normalized_name MATCH ? OR normalized_description MATCH ?) AND source = 'local')")
+                    filter_params.extend([fts_query, fts_query, fts_query])
+                elif source:
+                    where_parts.append("file_id IN (SELECT file_id FROM search_index WHERE (search_index MATCH ? OR normalized_name MATCH ? OR normalized_description MATCH ?) AND source = ?)")
+                    filter_params.extend([fts_query, fts_query, fts_query, source])
+                else:
+                    where_parts.append("file_id IN (SELECT file_id FROM search_index WHERE search_index MATCH ? OR normalized_name MATCH ? OR normalized_description MATCH ?)")
+                    filter_params.extend([fts_query, fts_query, fts_query])
 
             if source:
                 where_parts.append("source = ?")

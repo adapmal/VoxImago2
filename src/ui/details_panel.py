@@ -209,6 +209,8 @@ class FileDetailsPanel(QFrame):
         self.btn_toggle_edit.setEnabled(True)
 
     def update_details(self, file_item):
+        if hasattr(self, 'tag_chips_widget') and self.tag_chips_widget and getattr(self.tag_chips_widget, '_is_text_mode', False):
+            self.tag_chips_widget.set_mode('chips')
         self._is_updating = True
         self.current_file_item = file_item
         self.current_files_list = [file_item]
@@ -277,7 +279,9 @@ class FileDetailsPanel(QFrame):
         # Checar se já está na fila de deleção
         is_deleted = False
         for it in list(self.staging_queue.items):
-            if it.file_id == fid and it.action_type == 'delete':
+            it_fid = os.path.normcase(os.path.normpath(it.file_id)) if it.file_id else ''
+            it_path = os.path.normcase(os.path.normpath(it.path)) if it.path else ''
+            if ((it_fid and (it_fid == norm_fid or it_fid == norm_path)) or (it_path and (it_path == norm_path or it_path == norm_fid))) and it.action_type == 'delete':
                 is_deleted = True
                 break
         
@@ -299,6 +303,8 @@ class FileDetailsPanel(QFrame):
         return file_item.get('description', '')
 
     def update_details_batch(self, files_list):
+        if hasattr(self, 'tag_chips_widget') and self.tag_chips_widget and getattr(self.tag_chips_widget, '_is_text_mode', False):
+            self.tag_chips_widget.set_mode('chips')
         self._is_updating = True
         self.current_file_item = None
         self.current_files_list = files_list
@@ -517,7 +523,19 @@ class FileDetailsPanel(QFrame):
                 fid = item.get('file_id') or item.get('id')
                 fpath = item.get('path', '')
                 fname = item.get('name', 'N/A')
-                db_orig_desc = item.get('description', '')
+                
+                # Buscar a descrição original salva no banco de dados SQLite para comparação
+                db_orig_desc = ""
+                if hasattr(self.parent_app, 'indexer') and self.parent_app.indexer:
+                    self.parent_app.indexer.ensure_conn()
+                    self.parent_app.indexer.cursor.execute(
+                        "SELECT description FROM files WHERE file_id = ? OR path = ? LIMIT 1",
+                        (fid, fpath)
+                    )
+                    r = self.parent_app.indexer.cursor.fetchone()
+                    if r:
+                        db_orig_desc = r[0] or ""
+
                 eff_desc = self._get_effective_description(item)
                 
                 # Partir da descrição EFETIVA do arquivo (preservando edições individuais prévias)
@@ -547,7 +565,18 @@ class FileDetailsPanel(QFrame):
         norm_fid = os.path.normcase(os.path.normpath(raw_fid)) if raw_fid else ''
         norm_path = os.path.normcase(os.path.normpath(raw_path)) if raw_path else ''
         fname = self.current_file_item.get('name', '')
-        old_desc = self.current_file_item.get('description', '')
+        
+        # Buscar a descrição original salva no banco de dados SQLite para comparação
+        old_desc = ""
+        if hasattr(self.parent_app, 'indexer') and self.parent_app.indexer:
+            self.parent_app.indexer.ensure_conn()
+            self.parent_app.indexer.cursor.execute(
+                "SELECT description FROM files WHERE file_id = ? OR path = ? LIMIT 1",
+                (raw_fid, raw_path)
+            )
+            r = self.parent_app.indexer.cursor.fetchone()
+            if r:
+                old_desc = r[0] or ""
 
         for it in list(self.staging_queue.items):
             it_fid = os.path.normcase(os.path.normpath(it.file_id)) if it.file_id else ''
@@ -567,8 +596,19 @@ class FileDetailsPanel(QFrame):
         if self._is_updating or not self.current_file_item:
             return
         fid = self.current_file_item.get('file_id') or self.current_file_item.get('id')
-        old_name = self.current_file_item.get('name', '')
         fpath = self.current_file_item.get('path', '')
+        
+        # Buscar o nome original salvo no banco de dados SQLite para comparação
+        old_name = ""
+        if hasattr(self.parent_app, 'indexer') and self.parent_app.indexer:
+            self.parent_app.indexer.ensure_conn()
+            self.parent_app.indexer.cursor.execute(
+                "SELECT name FROM files WHERE file_id = ? OR path = ? LIMIT 1",
+                (fid, fpath)
+            )
+            r = self.parent_app.indexer.cursor.fetchone()
+            if r:
+                old_name = r[0] or ""
 
         for it in list(self.staging_queue.items):
             if it.file_id == fid and it.action_type == 'rename':
