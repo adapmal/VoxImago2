@@ -75,11 +75,18 @@ class IncrementalSyncWorker(QObject):
             local_indexer.ensure_conn()
             is_sb = self.config_mgr.is_sandbox()
 
+            from src.database.search import SearchEngine
+            norm_engine = SearchEngine(None)
+            parent_name_cache = {}
+
             for file in updated_files:
                 fid = file.get('id')
                 fname = file.get('name')
-                desc = file.get('description', '')
+                desc = (file.get('description') or '').strip()
+                norm_desc = norm_engine.normalize_text(desc)
                 wlink = file.get('webViewLink', '')
+                parents = file.get('parents', [])
+                parent_id = parents[0] if parents else None
                 mod_time = int(datetime.strptime(file.get('modifiedTime'), "%Y-%m-%dT%H:%M:%S.%fZ").timestamp()) if file.get('modifiedTime') else int(time.time())
                 
                 # 1. Atualizar registro no banco onde file_id = fid (drive)
@@ -89,23 +96,57 @@ class IncrementalSyncWorker(QObject):
                 )
                 drive_updated = (local_indexer.cursor.rowcount > 0)
                 
-                # 2. Atualizar registro local correspondente de forma ultra-rápida (indexada)
-                local_indexer.cursor.execute("SELECT file_id FROM files WHERE (name = ? OR name_normalized = ?) AND source = 'local'", (fname, fname.lower()))
-                matching_local_fids = [r[0] for r in local_indexer.cursor.fetchall()]
+                # 2. Localizar o arquivo local correspondente com isolamento estrito de pasta e ID
+                # 2a. Primeiro tenta por vínculo direto gravado
+                local_indexer.cursor.execute(
+                    "SELECT file_id, path FROM files WHERE (webContentLink LIKE ? OR file_id = ?) AND source = 'local'",
+                    (f"%{fid}%", fid)
+                )
+                direct_matches = local_indexer.cursor.fetchall()
                 
+                target_local_fid = None
+                if direct_matches:
+                    target_local_fid = direct_matches[0][0]
+                elif parent_id:
+                    # 2b. Se não está vinculado, resolve o nome da pasta pai no Drive
+                    if parent_id not in parent_name_cache:
+                        try:
+                            p_info = self.service.files().get(fileId=parent_id, supportsAllDrives=True, fields='name').execute()
+                            parent_name_cache[parent_id] = p_info.get('name', '')
+                        except Exception:
+                            parent_name_cache[parent_id] = ''
+                    drive_parent_name = parent_name_cache.get(parent_id, '')
+
+                    # Buscar candidatos locais com o mesmo nome de arquivo
+                    local_indexer.cursor.execute(
+                        "SELECT file_id, path FROM files WHERE (name = ? OR name_normalized = ?) AND source = 'local'",
+                        (fname, fname.lower())
+                    )
+                    candidates = local_indexer.cursor.fetchall()
+
+                    matched_candidates = []
+                    for c_fid, c_path in candidates:
+                        if is_sb and '_TestesBanco' not in c_fid:
+                            continue
+                        if not is_sb and '_TestesBanco' in c_fid:
+                            continue
+                        if c_path and drive_parent_name:
+                            p_folder = os.path.basename(os.path.dirname(c_path))
+                            if norm_engine.normalize_text(p_folder) == norm_engine.normalize_text(drive_parent_name):
+                                matched_candidates.append(c_fid)
+
+                    if len(matched_candidates) == 1:
+                        target_local_fid = matched_candidates[0]
+
                 local_updated = False
-                for local_fid in matching_local_fids:
-                    if is_sb and '_TestesBanco' not in local_fid:
-                        continue
-                    if not is_sb and '_TestesBanco' in local_fid:
-                        continue
+                if target_local_fid:
                     local_indexer.cursor.execute(
                         "UPDATE files SET description = ?, modifiedTime = ?, webContentLink = ? WHERE file_id = ?",
-                        (desc, mod_time, wlink, local_fid)
+                        (desc, mod_time, wlink, target_local_fid)
                     )
                     local_indexer.cursor.execute(
                         "UPDATE search_index SET description = ?, normalized_description = ? WHERE file_id = ?",
-                        (desc, desc.lower(), local_fid)
+                        (desc, norm_desc, target_local_fid)
                     )
                     local_updated = True
 

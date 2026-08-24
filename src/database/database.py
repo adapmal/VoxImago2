@@ -527,7 +527,7 @@ class FileIndexer:
         self.ensure_conn()
 
         try:
-            print("🔄 Iniciando reconstrução do índice com normalização...")
+            logging.info("Iniciando reconstrucao do indice FTS5 com normalizacao...")
             self.cursor.execute('DROP TABLE IF EXISTS search_index')
             self.cursor.execute('''
                     CREATE VIRTUAL TABLE search_index USING fts5(
@@ -545,9 +545,8 @@ class FileIndexer:
                 'SELECT file_id, name, description, source FROM files')
             all_files = self.cursor.fetchall()
 
-            print(f"📁 Processando {len(all_files)} arquivos existentes...")
-
             batch_data = []
+            norm_engine = SearchEngine(None)
             for i, (file_id, name, description, source) in enumerate(all_files):
                 name = name or ""
                 description = description or ""
@@ -555,8 +554,8 @@ class FileIndexer:
                 batch_data.append((
                     name,
                     description,
-                    SearchEngine(None).normalize_text(name),
-                    SearchEngine(None).normalize_text(description),
+                    norm_engine.normalize_text(name),
+                    norm_engine.normalize_text(description),
                     file_id,
                     source
                 ))
@@ -567,8 +566,6 @@ class FileIndexer:
                         batch_data
                     )
                     batch_data = []
-                    print(
-                        f"  📊 Processados {i + 1}/{len(all_files)} arquivos...")
 
             if batch_data:
                 self.cursor.executemany(
@@ -577,10 +574,10 @@ class FileIndexer:
                 )
 
             self.conn.commit()
-            print("✅ Índice reconstruído com sucesso!")
+            logging.info("Indice FTS5 reconstruido com sucesso!")
 
         except Exception as e:
-            print(f"❌ Erro ao reconstruir o índice: {e}")
+            logging.error(f"Erro ao reconstruir o indice: {e}")
             self.conn.rollback()
             raise
 

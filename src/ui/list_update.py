@@ -380,22 +380,6 @@ class list_update:
                 thumb_path = db_row[8] if (db_row and db_row[8]) else ''
                 web_link = db_row[9] if (db_row and db_row[9]) else None
 
-                # AUTO-HEALING: If no description exists locally, search if Drive or another record has tags for this filename!
-                if not desc:
-                    app.indexer.cursor.execute(
-                        "SELECT description, thumbnailLink, thumbnailPath, webContentLink FROM files WHERE (name = ? OR name_normalized = ?) AND description != '' LIMIT 1",
-                        (name, name.lower())
-                    )
-                    cloud_match = app.indexer.cursor.fetchone()
-                    if cloud_match and cloud_match[0]:
-                        desc = cloud_match[0]
-                        if not thumb_link:
-                            thumb_link = cloud_match[1] or ''
-                        if not thumb_path:
-                            thumb_path = cloud_match[2] or ''
-                        if not web_link:
-                            web_link = cloud_match[3]
-
                 item = {
                     'id': entry_path,
                     'name': name,

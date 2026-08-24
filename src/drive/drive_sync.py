@@ -497,7 +497,7 @@ class DriveSync(QObject):
 
         for drive_item in valid_items:
             try:
-                matches = find_local_matches(drive_item, indexer.cursor)
+                matches = find_local_matches(drive_item, indexer.cursor, self.service)
                 if matches:
                     for local_id in matches:
                         indexer.update_description(

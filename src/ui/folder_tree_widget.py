@@ -237,17 +237,27 @@ class FolderTreeWidget(QWidget):
         layout.setContentsMargins(6, 6, 6, 6)
 
         header_layout = QHBoxLayout()
-        self.title_label = QLabel("📂 Árvore de Pastas")
-        self.title_label.setStyleSheet("font-weight: bold; font-size: 13px;")
-        header_layout.addWidget(self.title_label)
+        header_layout.setSpacing(4)
 
-        header_layout.addStretch()
+        # Botão de alternância intuitivo: Modo Pasta x Todo o Acervo
+        self.btn_filter_toggle = QPushButton("🌐 Todo o Acervo")
+        self.btn_filter_toggle.setCheckable(True)
+        self.btn_filter_toggle.setChecked(False)
+        self.btn_filter_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_filter_toggle.setToolTip("Modo de busca global em Todo o Acervo ativo.\nClique em uma pasta da árvore para filtrar, ou clique aqui para desvincular.")
+        self.btn_filter_toggle.setStyleSheet(
+            "QPushButton { background-color: #F8F9FA; color: #495057; border: 1px solid #CED4DA; border-radius: 4px; padding: 4px 8px; font-size: 11px; font-weight: bold; text-align: left; }"
+            "QPushButton:hover { background-color: #E9ECEF; color: #212529; }"
+            "QPushButton:checked { background-color: #007BFF; color: white; border-color: #0056B3; }"
+        )
+        self.btn_filter_toggle.clicked.connect(self._on_filter_toggle_clicked)
+        header_layout.addWidget(self.btn_filter_toggle, 1)
 
         self.btn_new_folder = QPushButton("➕ Nova")
         self.btn_new_folder.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_new_folder.setToolTip("Criar nova subpasta dentro da pasta selecionada")
         self.btn_new_folder.setStyleSheet(
-            "QPushButton { background-color: #E9ECEF; color: #212529; border: 1px solid #CED4DA; border-radius: 4px; padding: 2px 7px; font-size: 11px; font-weight: bold; }"
+            "QPushButton { background-color: #E9ECEF; color: #212529; border: 1px solid #CED4DA; border-radius: 4px; padding: 4px 7px; font-size: 11px; font-weight: bold; }"
             "QPushButton:hover { background-color: #007BFF; color: white; border-color: #0056B3; }"
         )
         self.btn_new_folder.clicked.connect(lambda: self.create_new_folder())
@@ -312,7 +322,96 @@ class FolderTreeWidget(QWidget):
         action_new.triggered.connect(lambda: self.create_new_folder(target_path))
         action_refresh.triggered.connect(self._refresh_tree)
 
+        menu.addSeparator()
+        action_sync_drive = menu.addAction("☁️ Sincronizar Tags desta Pasta com o Google Drive")
+        action_sync_drive.triggered.connect(lambda: self.sync_folder_tags_with_drive(target_path))
+
         menu.exec(self.tree_view.viewport().mapToGlobal(position))
+
+    def sync_folder_tags_with_drive(self, folder_path):
+        if not folder_path or not os.path.exists(folder_path):
+            return
+
+        win = self.window()
+        service = getattr(win, 'service', None)
+        if not service:
+            QMessageBox.warning(self, "Google Drive Desconectado", "Conecte-se ao Google Drive para sincronizar as tags desta pasta.")
+            return
+
+        if hasattr(win, 'status_bar') and win.status_bar:
+            win.status_bar.showMessage(f"⏳ Sincronizando tags de '{os.path.basename(folder_path)}' com o Google Drive...", 0)
+
+        from src.utils.utils import resolve_drive_folder_id_by_path
+        target_folder_id = resolve_drive_folder_id_by_path(service, folder_path)
+
+        if not target_folder_id:
+            QMessageBox.warning(self, "Pasta Não Encontrada no Drive", f"Não foi possível localizar a pasta '{os.path.basename(folder_path)}' correspondente no Google Drive.")
+            if hasattr(win, 'status_bar') and win.status_bar:
+                win.status_bar.clearMessage()
+            return
+
+        try:
+            drive_id = self.config_mgr.get_current_drive_id()
+            kwargs = {'supportsAllDrives': True, 'includeItemsFromAllDrives': True}
+            if drive_id:
+                kwargs['corpora'] = 'drive'
+                kwargs['driveId'] = drive_id
+
+            page_token = None
+            drive_files = []
+            while True:
+                res = service.files().list(
+                    q=f"'{target_folder_id}' in parents and trashed = false and mimeType != 'application/vnd.google-apps.folder'",
+                    fields='nextPageToken, files(id, name, description, webViewLink)',
+                    pageSize=1000, pageToken=page_token, **kwargs
+                ).execute()
+                drive_files.extend(res.get('files', []))
+                page_token = res.get('nextPageToken')
+                if not page_token:
+                    break
+
+            indexer = getattr(win, 'indexer', None)
+            if indexer:
+                indexer.ensure_conn()
+                from src.database.search import SearchEngine
+                norm_engine = SearchEngine(None)
+
+                for df in drive_files:
+                    fname = df['name']
+                    desc = (df.get('description') or '').strip()
+                    norm_desc = norm_engine.normalize_text(desc)
+                    link = df.get('webViewLink') or f"https://drive.google.com/file/d/{df['id']}/view?usp=drivesdk"
+                    local_p = os.path.normpath(os.path.join(folder_path, fname)).lower()
+
+                    indexer.cursor.execute(
+                        "UPDATE files SET description = ?, webContentLink = ? WHERE LOWER(path) = ? OR LOWER(file_id) = ?",
+                        (desc, link, local_p, local_p)
+                    )
+                    indexer.cursor.execute(
+                        "UPDATE search_index SET description = ?, normalized_description = ? WHERE LOWER(file_id) = ?",
+                        (desc, norm_desc, local_p)
+                    )
+                indexer.conn.commit()
+                indexer.export_to_shared_cache()
+
+            if hasattr(win, '_force_refresh_after_sync'):
+                win._force_refresh_after_sync()
+            else:
+                if hasattr(win, 'search_engine') and win.search_engine:
+                    win.search_engine.clear_cache()
+                self.folderSelected.emit(folder_path)
+                if hasattr(win, 'current_page'):
+                    win.current_page = 0
+                    win.all_files_loaded = False
+                    from src.ui.list_update import list_update
+                    list_update.clear_display(win)
+                    list_update.load_next_batch(win)
+
+            if hasattr(win, 'status_bar') and win.status_bar:
+                win.status_bar.showMessage(f"✅ {len(drive_files)} arquivos da pasta '{os.path.basename(folder_path)}' sincronizados com o Drive!", 4000)
+
+        except Exception as e:
+            QMessageBox.critical(self, "Erro na Sincronização", f"Ocorreu um erro ao sincronizar com o Drive:\n{e}")
 
     def _refresh_tree(self):
         self.model.clear_subdirs_cache()
@@ -389,12 +488,51 @@ class FolderTreeWidget(QWidget):
             win.status_bar.showMessage(f"🟢 Nova pasta '{folder_name}' agendada na Fila (com badge verde)!", 4000)
         self.tree_view.viewport().update()
 
+    def _on_filter_toggle_clicked(self):
+        if not self.btn_filter_toggle.isChecked():
+            # Desvincular pasta -> Modo 1: Todo o Acervo
+            self.clear_folder_selection()
+        else:
+            # Se foi marcado, verifica se há uma pasta selecionada
+            indexes = self.tree_view.selectedIndexes()
+            if indexes and self.model.isDir(indexes[0]):
+                folder_p = self.model.filePath(indexes[0])
+                self._update_header_for_folder(folder_p)
+                self.folderSelected.emit(folder_p)
+            else:
+                self.btn_filter_toggle.setChecked(False)
+                self.btn_filter_toggle.setText("🌐 Todo o Acervo")
+
+    def _update_header_for_folder(self, folder_path):
+        if folder_path and os.path.exists(folder_path):
+            folder_name = os.path.basename(folder_path) or folder_path
+            self.btn_filter_toggle.blockSignals(True)
+            self.btn_filter_toggle.setChecked(True)
+            self.btn_filter_toggle.setText(f"📁 {folder_name}  ✕")
+            self.btn_filter_toggle.setToolTip(f"Filtrando por: {folder_path}\nClique para desvincular e buscar em Todo o Acervo.")
+            self.btn_filter_toggle.blockSignals(False)
+        else:
+            self.btn_filter_toggle.blockSignals(True)
+            self.btn_filter_toggle.setChecked(False)
+            self.btn_filter_toggle.setText("🌐 Todo o Acervo")
+            self.btn_filter_toggle.setToolTip("Modo de busca global em Todo o Acervo ativo.\nClique em uma pasta da árvore para filtrar, ou clique aqui para desvincular.")
+            self.btn_filter_toggle.blockSignals(False)
+
+    def clear_folder_selection(self):
+        self.tree_view.selectionModel().clearSelection()
+        self._update_header_for_folder(None)
+        self.folderSelected.emit("")
+
     def _on_selection_changed(self, selected, deselected):
         indexes = self.tree_view.selectedIndexes()
         if indexes and self.model.isDir(indexes[0]):
             folder_path = self.model.filePath(indexes[0])
             if folder_path:
+                self._update_header_for_folder(folder_path)
                 self.folderSelected.emit(folder_path)
+        else:
+            self._update_header_for_folder(None)
+            self.folderSelected.emit("")
 
     def _on_mode_changed(self, key, value):
         if key in ('sandbox_mode', 'sandbox_path'):
@@ -407,6 +545,7 @@ class FolderTreeWidget(QWidget):
             self.model.clear_subdirs_cache()
             self.model.setRootPath(self.root_dir)
             self.tree_view.setRootIndex(self.model.index(self.root_dir))
+            self.clear_folder_selection()
 
     def select_and_expand_folder(self, folder_path):
         """Expande os níveis intermediários e seleciona a pasta alvo na árvore."""
@@ -433,4 +572,5 @@ class FolderTreeWidget(QWidget):
         if target_idx.isValid():
             self.tree_view.setCurrentIndex(target_idx)
             self.tree_view.scrollTo(target_idx, QAbstractItemView.ScrollHint.PositionAtCenter)
+            self._update_header_for_folder(norm_p)
             self.folderSelected.emit(norm_p)

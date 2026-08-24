@@ -42,118 +42,76 @@ def normalize_name_only(name):
     return name_clean.translate(table).lower()
 
 
-def find_local_matches(drive_file, local_files_cursor):
+def find_local_matches(drive_file, local_files_cursor, drive_service=None):
     import logging
     import time
-    from difflib import SequenceMatcher
 
     matches = []
     drive_name = drive_file.get('name', '')
-    drive_size = drive_file.get('size', 0)
+    drive_size = int(drive_file.get('size') or 0)
     drive_id = drive_file.get('id', '')
+    drive_parent_name = drive_file.get('parent_name', '')
 
     if not drive_name:
-        logging.warning(f"⚠️  Nome vazio para arquivo Drive ID: {drive_id}")
         return matches
 
-    start_time = time.perf_counter()
+    # Se não temos o nome da pasta pai do Drive mas temos o parentId e o drive_service, tenta obter
+    if not drive_parent_name and drive_service and drive_file.get('parentId'):
+        try:
+            p_info = drive_service.files().get(fileId=drive_file['parentId'], supportsAllDrives=True, fields='name').execute()
+            drive_parent_name = p_info.get('name', '')
+        except Exception:
+            pass
 
-    logging.info(
-        f"🔍 [OTIMIZADO] Matching para: '{drive_name}' (ID: {drive_id[:8]}..., {drive_size} bytes)")
-
-    search_engine = SearchEngine(None)
-    drive_name_normalized = search_engine.normalize_text(drive_name)
-    drive_name_aggressive = normalize_aggressive(drive_name)
-
-    phase_start = time.perf_counter()
+    # 1. Buscar todos os candidatos locais com o mesmo nome (exato ou normalizado)
     local_files_cursor.execute(
-        "SELECT file_id, name, size FROM files WHERE source='local' AND LOWER(name)=LOWER(?) LIMIT 1",
+        "SELECT file_id, name, path, size FROM files WHERE source='local' AND LOWER(name)=LOWER(?)",
         (drive_name,)
     )
-    exact_match = local_files_cursor.fetchone()
-    phase_time = (time.perf_counter() - phase_start) * 1000
+    candidates = local_files_cursor.fetchall()
 
-    if exact_match:
-        total_time = (time.perf_counter() - start_time) * 1000
-        matches.append(exact_match[0])
-        logging.info(
-            f"✅ [FASE 1] Match EXATO: '{exact_match[1]}' (ID: {exact_match[0][:8]}...) | {phase_time:.2f}ms | Total: {total_time:.2f}ms")
-        return matches
-    else:
-        logging.debug(
-            f"🔍 [FASE 1] Sem match exato para '{drive_name}' | {phase_time:.2f}ms")
-
-    if drive_name_normalized:
-        phase_start = time.perf_counter()
-        local_files_cursor.execute(
-            "SELECT file_id, name, size FROM files WHERE source='local' AND name_normalized=? LIMIT 1",
-            (drive_name_normalized,)
-        )
-        normalized_match = local_files_cursor.fetchone()
-        phase_time = (time.perf_counter() - phase_start) * 1000
-
-        if normalized_match:
-            total_time = (time.perf_counter() - start_time) * 1000
-            matches.append(normalized_match[0])
-            logging.info(
-                f"✅ [FASE 2] Match NORMALIZADO: '{normalized_match[1]}' (ID: {normalized_match[0][:8]}...) | '{drive_name}' → '{drive_name_normalized}' | {phase_time:.2f}ms | Total: {total_time:.2f}ms")
-            return matches
-        else:
-            logging.debug(
-                f"🔍 [FASE 2] Sem match normalizado: '{drive_name}' → '{drive_name_normalized}' | {phase_time:.2f}ms")
-
-    if drive_name_aggressive:
-        phase_start = time.perf_counter()
-        local_files_cursor.execute(
-            "SELECT file_id, name, size FROM files WHERE source='local' AND name_aggressive=? LIMIT 1",
-            (drive_name_aggressive,)
-        )
-        aggressive_match = local_files_cursor.fetchone()
-        phase_time = (time.perf_counter() - phase_start) * 1000
-
-        if aggressive_match:
-            total_time = (time.perf_counter() - start_time) * 1000
-            matches.append(aggressive_match[0])
-            logging.info(
-                f"✅ [FASE 3] Match AGRESSIVO: '{aggressive_match[1]}' (ID: {aggressive_match[0][:8]}...) | '{drive_name}' → '{drive_name_aggressive}' | {phase_time:.2f}ms | Total: {total_time:.2f}ms")
-            return matches
-        else:
-            logging.debug(
-                f"🔍 [FASE 3] Sem match agressivo: '{drive_name}' → '{drive_name_aggressive}' | {phase_time:.2f}ms")
-
-    if not matches:
-        drive_name_only = normalize_name_only(drive_name)
-        if drive_name_only:
-            phase_start = time.perf_counter()
+    if not candidates:
+        search_engine = SearchEngine(None)
+        drive_name_norm = search_engine.normalize_text(drive_name)
+        if drive_name_norm:
             local_files_cursor.execute(
-                "SELECT file_id, name, size FROM files WHERE source='local' AND name_aggressive LIKE ? LIMIT 1",
-                (drive_name_only + '%',)
+                "SELECT file_id, name, path, size FROM files WHERE source='local' AND name_normalized=?",
+                (drive_name_norm,)
             )
-            name_only_match = local_files_cursor.fetchone()
-            phase_time = (time.perf_counter() - phase_start) * 1000
+            candidates = local_files_cursor.fetchall()
 
-            if name_only_match:
-                total_time = (time.perf_counter() - start_time) * 1000
-                matches.append(name_only_match[0])
-                logging.info(
-                    f"✅ [FASE 4] Match NOME-ONLY: '{name_only_match[1]}' (ID: {name_only_match[0][:8]}...) | '{drive_name}' → '{drive_name_only}' | {phase_time:.2f}ms | Total: {total_time:.2f}ms")
-                return matches
-            else:
-                logging.debug(
-                    f"🔍 [FASE 4] Sem match nome-only: '{drive_name}' → '{drive_name_only}' | {phase_time:.2f}ms")
+    if not candidates:
+        return []
 
-    if not matches:
-        total_time = (time.perf_counter() - start_time) * 1000
-        logging.warning(
-            f"❌ [SEM MATCH] '{drive_name}' (ID: {drive_id[:8]}..., {drive_size} bytes) | Tempo total: {total_time:.2f}ms")
+    # 2. Se há apenas 1 candidato local, valida tamanho e pasta para evitar falso positivo em nomes comuns
+    if len(candidates) == 1:
+        cand_id, cand_name, cand_path, cand_size = candidates[0]
+        # Se for um nome muito genérico de câmera (ex: IMG_0091.jpg, DSC07402.arw) e tivermos info de pasta/tamanho
+        is_generic_name = any(cand_name.upper().startswith(p) for p in ('IMG_', 'DSC', 'DSC0', 'DSC_', 'C00', '_MG_', 'SAM_', '2024', '2023', '2022', '2021', '2020', '2026'))
+        
+        if is_generic_name and drive_parent_name and cand_path:
+            parent_folder = os.path.basename(os.path.dirname(cand_path)).lower()
+            if drive_parent_name.lower() not in parent_folder and parent_folder not in drive_parent_name.lower():
+                # Pastas totalmente diferentes em nome genérico -> não associar aleatoriamente
+                return []
+                
+        return [cand_id]
 
-        if logging.getLogger().isEnabledFor(logging.DEBUG):
-            local_files_cursor.execute(
-                "SELECT name, size FROM files WHERE source='local' LIMIT 3"
-            )
-            close_candidates = local_files_cursor.fetchall()
-            if close_candidates:
-                exemplos = [f"'{n}' ({s} bytes)" for n, s in close_candidates]
-                logging.debug(f"Exemplos locais: {', '.join(exemplos)}")
+    # 3. Desambiguação de múltiplos arquivos homônimos:
+    # A. Prioridade 1: Match exato por nome da pasta pai
+    if drive_parent_name:
+        for cand_id, cand_name, cand_path, cand_size in candidates:
+            if cand_path:
+                local_pname = os.path.basename(os.path.dirname(cand_path)).lower()
+                if drive_parent_name.lower() in local_pname or local_pname in drive_parent_name.lower():
+                    return [cand_id]
 
-    return matches
+    # B. Prioridade 2: Match por tamanho exato (tolerância de até 512 bytes)
+    if drive_size > 0:
+        for cand_id, cand_name, cand_path, cand_size in candidates:
+            c_size = int(cand_size or 0)
+            if c_size > 0 and abs(c_size - drive_size) <= 512:
+                return [cand_id]
+
+    # Se não foi possível desambiguar com segurança, NÃO retorna match aleatório para não contaminar
+    return []

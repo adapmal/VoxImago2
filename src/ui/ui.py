@@ -362,6 +362,8 @@ class DriveFileGalleryApp(QMainWindow):
         self.main_bar.sort_combo.activated.connect(self.change_sort_order)
         self.main_bar.category_combo.activated.connect(
             self.change_filter_type_combo)
+        self.main_bar.tag_filter_combo.activated.connect(
+            self.change_tag_filter_combo)
 
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
 
@@ -788,6 +790,7 @@ class DriveFileGalleryApp(QMainWindow):
 
     def update_filter_buttons(self):
         self.main_bar.category_combo.setEnabled(True)
+        self.main_bar.tag_filter_combo.setEnabled(True)
         self.main_bar.sort_combo.setEnabled(True)
 
     def change_filter_type_combo(self, index):
@@ -798,6 +801,18 @@ class DriveFileGalleryApp(QMainWindow):
             self.advanced_filters['category'] = selected_category
         else:
             self.advanced_filters.pop('category', None)
+        self.current_page = 0
+        self.all_files_loaded = False
+        list_update.clear_display(self)
+        list_update.load_next_batch(self)
+
+    def change_tag_filter_combo(self, index):
+        selected_tag_filter = self.main_bar.tag_filter_combo.itemData(index)
+        print(f"DEBUG: Filtro de tags alterado para: {selected_tag_filter}")
+        if selected_tag_filter and selected_tag_filter != 'all':
+            self.advanced_filters['tag_filter'] = selected_tag_filter
+        else:
+            self.advanced_filters.pop('tag_filter', None)
         self.current_page = 0
         self.all_files_loaded = False
         list_update.clear_display(self)
@@ -1658,9 +1673,7 @@ class DriveFileGalleryApp(QMainWindow):
             self.file_list_model.addFiles(files_to_add)
 
     def on_folder_tree_selected(self, folder_path):
-        if not folder_path:
-            return
-        target_filter = None if folder_path == self.folder_tree.root_dir else folder_path
+        target_filter = folder_path if (folder_path and folder_path != self.folder_tree.root_dir) else None
         if getattr(self, 'current_folder_path_filter', None) == target_filter and self.file_list_model.rowCount() > 0 and not self.is_loading:
             return
 
@@ -1671,14 +1684,26 @@ class DriveFileGalleryApp(QMainWindow):
         list_update.clear_display(self)
         list_update.load_next_batch(self)
 
+        if hasattr(self, 'status_bar') and self.status_bar:
+            if target_filter:
+                self.status_bar.showMessage(f"📁 Modo Pasta: {os.path.basename(target_filter)} (Busca recursiva em subpastas ativada)", 3500)
+            else:
+                self.status_bar.showMessage("🌐 Modo Global: Busca em Todo o Acervo ativada.", 3500)
+
     def on_files_dropped_on_folder(self, dropped_items, target_folder_path):
         if not dropped_items or not target_folder_path:
             return
 
         from src.ui.staging_queue import StagingQueue, StagingItem
+        from src.ui.move_conflict_dialog import MoveConflictDialog
         queue = StagingQueue()
         staged_count = 0
         reverted_count = 0
+
+        # Separar itens entre não-conflitantes e conflitantes (mesmo nome já existe no destino)
+        valid_items_to_process = []
+        conflicts = []
+        source_folder_names = []
 
         for item in dropped_items:
             src_path = item.get('path') or item.get('file_id') or ''
@@ -1690,6 +1715,15 @@ class DriveFileGalleryApp(QMainWindow):
 
             if os.path.normpath(os.path.dirname(src_path)).lower() == os.path.normpath(target_folder_path).lower():
                 continue  # Arquivo já está nesta mesma pasta
+
+            # Proteção contra mover pasta para dentro de si mesma
+            if os.path.isdir(src_path):
+                norm_src = src_path.lower()
+                norm_tgt = os.path.normpath(target_folder_path).lower()
+                if norm_tgt == norm_src or norm_tgt.startswith(norm_src + os.sep):
+                    if hasattr(self, 'status_bar') and self.status_bar:
+                        self.status_bar.showMessage("❌ Não é permitido mover uma pasta para dentro de si mesma.", 4000)
+                    continue
 
             fid = item.get('file_id') or item.get('id') or src_path
 
@@ -1715,22 +1749,115 @@ class DriveFileGalleryApp(QMainWindow):
             if is_deleted:
                 continue
 
-            # Se havia 'move' anterior para este mesmo arquivo, remove para atualizar para a nova pasta
-            for it in list(queue.items):
-                if (it.file_id == fid or (it.path and os.path.normpath(it.path).lower() == src_path.lower())) and it.action_type == 'move':
-                    queue.remove_item(it)
+            # Se o destino é a pasta original do banco, é uma reversão (não gera conflito)
+            is_revert = (os.path.normpath(dst_path).lower() == os.path.normpath(db_orig_path).lower())
 
-            # Se o destino é a pasta original do banco, a movimentação foi desfeita/revertida!
-            if os.path.normpath(dst_path).lower() == os.path.normpath(db_orig_path).lower():
+            # Checar se já existe um arquivo com esse nome no destino
+            has_clash = False
+            if not is_revert:
+                if os.path.exists(dst_path):
+                    has_clash = True
+                elif hasattr(self, 'indexer') and self.indexer:
+                    try:
+                        self.indexer.cursor.execute("SELECT 1 FROM files WHERE LOWER(path) = ? LIMIT 1", (dst_path.lower(),))
+                        if self.indexer.cursor.fetchone():
+                            has_clash = True
+                    except Exception:
+                        pass
+
+            item_data = {
+                'fid': fid,
+                'fname': fname,
+                'src_path': src_path,
+                'db_orig_path': db_orig_path,
+                'dst_path': dst_path,
+                'is_revert': is_revert
+            }
+
+            if has_clash:
+                conflicts.append(item_data)
+                src_parent_name = os.path.basename(os.path.dirname(src_path))
+                if src_parent_name and src_parent_name not in source_folder_names:
+                    source_folder_names.append(src_parent_name)
+            else:
+                valid_items_to_process.append(item_data)
+
+        # Se houver conflitos, abrir diálogo para o usuário decidir
+        conflict_action = "create_subfolder"
+        conflict_subfolder = "mesmonome"
+        if conflicts:
+            sug_name = source_folder_names[0] if source_folder_names else "mesmonome"
+            dialog = MoveConflictDialog(conflicts, target_folder_path, source_folder_name=sug_name, parent=self)
+            if dialog.exec() == MoveConflictDialog.DialogCode.Accepted:
+                conflict_action, conflict_subfolder = dialog.get_result()
+            else:
+                # Usuário cancelou a operação
+                if hasattr(self, 'status_bar') and self.status_bar:
+                    self.status_bar.showMessage("Movimentação cancelada pelo usuário.", 3000)
+                return
+
+        # Processar itens não-conflitantes
+        for it in valid_items_to_process:
+            fid = it['fid']
+            src_path = it['src_path']
+            fname = it['fname']
+            db_orig_path = it['db_orig_path']
+            dst_path = it['dst_path']
+
+            for q_it in list(queue.items):
+                if (q_it.file_id == fid or (q_it.path and os.path.normpath(q_it.path).lower() == src_path.lower())) and q_it.action_type == 'move':
+                    queue.remove_item(q_it)
+
+            if it['is_revert']:
                 reverted_count += 1
             else:
-                # Caso contrário, enfileira o move a partir do caminho físico original
-                st_item = StagingItem(
-                    fid, fname, db_orig_path, 'move',
-                    old_value=db_orig_path, new_value=dst_path
-                )
+                st_item = StagingItem(fid, fname, db_orig_path, 'move', old_value=db_orig_path, new_value=dst_path)
                 queue.add_item(st_item)
                 staged_count += 1
+
+        # Processar itens conflitantes de acordo com a escolha do usuário
+        if conflicts:
+            if conflict_action == "create_subfolder":
+                sub_dir = os.path.normpath(os.path.join(target_folder_path, conflict_subfolder))
+                for it in conflicts:
+                    fid = it['fid']
+                    src_path = it['src_path']
+                    fname = it['fname']
+                    db_orig_path = it['db_orig_path']
+                    sub_dst_path = os.path.normpath(os.path.join(sub_dir, fname))
+
+                    for q_it in list(queue.items):
+                        if (q_it.file_id == fid or (q_it.path and os.path.normpath(q_it.path).lower() == src_path.lower())) and q_it.action_type == 'move':
+                            queue.remove_item(q_it)
+
+                    st_item = StagingItem(fid, fname, db_orig_path, 'move', old_value=db_orig_path, new_value=sub_dst_path)
+                    queue.add_item(st_item)
+                    staged_count += 1
+
+            elif conflict_action == "rename":
+                for it in conflicts:
+                    fid = it['fid']
+                    src_path = it['src_path']
+                    fname = it['fname']
+                    db_orig_path = it['db_orig_path']
+                    dst_path = it['dst_path']
+
+                    base, ext = os.path.splitext(dst_path)
+                    counter = 1
+                    while True:
+                        candidate = f"{base}_{counter}{ext}"
+                        if not os.path.exists(candidate) and not any(q_it.new_value and os.path.normpath(q_it.new_value).lower() == os.path.normpath(candidate).lower() for q_it in queue.items):
+                            dst_path = candidate
+                            break
+                        counter += 1
+
+                    for q_it in list(queue.items):
+                        if (q_it.file_id == fid or (q_it.path and os.path.normpath(q_it.path).lower() == src_path.lower())) and q_it.action_type == 'move':
+                            queue.remove_item(q_it)
+
+                    st_item = StagingItem(fid, os.path.basename(dst_path), db_orig_path, 'move', old_value=db_orig_path, new_value=dst_path)
+                    queue.add_item(st_item)
+                    staged_count += 1
 
         folder_name = os.path.basename(target_folder_path)
         if hasattr(self, 'status_bar') and self.status_bar:

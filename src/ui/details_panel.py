@@ -737,24 +737,31 @@ class FileDetailsPanel(QFrame):
     def open_drive_link(self):
         if not self.current_file_item:
             return
-        link = self.current_file_item.get('webContentLink') or self.current_file_item.get('webViewLink')
-        if link:
-            webbrowser.open(link)
-            return
-
-        fid = self.current_file_item.get('file_id') or self.current_file_item.get('id')
+        src = (self.current_file_item.get('source') or '').lower()
+        fpath = self.current_file_item.get('path', '')
         fname = self.current_file_item.get('name', '')
         
-        if fid and not ('/' in fid or '\\' in fid or fid[1:3] == ':\\'):
-            webbrowser.open(f"https://drive.google.com/file/d/{fid}/view")
-            return
+        # Para arquivos de origem exclusivamente 'drive' (sem caminho local), abre o link direto
+        if src == 'drive':
+            link = self.current_file_item.get('webContentLink') or self.current_file_item.get('webViewLink')
+            if link:
+                webbrowser.open(link)
+                return
+            fid = self.current_file_item.get('file_id') or self.current_file_item.get('id')
+            if fid and not ('/' in fid or '\\' in fid or fid[1:3] == ':\\'):
+                webbrowser.open(f"https://drive.google.com/file/d/{fid}/view")
+                return
 
-        try:
-            drive_service = getattr(self.window(), 'service', None)
-            if drive_service and fname:
+        # 1. Tentar resolver o link exato Top-Down se o serviço do Drive estiver ativo
+        win = self.window()
+        drive_service = getattr(win, 'service', None) or getattr(win, 'drive_service', None)
+        if not drive_service and hasattr(win, 'main_window'):
+            drive_service = getattr(win.main_window, 'service', None) or getattr(win.main_window, 'drive_service', None)
+
+        if drive_service and fname:
+            try:
                 import urllib.parse
                 clean_name = fname.replace("'", "\\'")
-                fpath = self.current_file_item.get('path', '')
                 file_size = self.current_file_item.get('size')
                 
                 kwargs = {
@@ -856,20 +863,30 @@ class FileDetailsPanel(QFrame):
                 if matched_file and matched_file.get('webViewLink'):
                     wlink = matched_file['webViewLink']
                     self.current_file_item['webContentLink'] = wlink
-                    if hasattr(self.window(), 'indexer'):
-                        self.window().indexer.ensure_conn()
-                        self.window().indexer.cursor.execute("UPDATE files SET webContentLink = ? WHERE file_id = ? OR path = ?", (wlink, fid, fpath))
-                        self.window().indexer.conn.commit()
+                    if hasattr(win, 'indexer') and win.indexer:
+                        win.indexer.ensure_conn()
+                        win.indexer.cursor.execute("UPDATE files SET webContentLink = ? WHERE file_id = ? OR path = ?", (wlink, self.current_file_item.get('file_id'), fpath))
+                        win.indexer.conn.commit()
                     webbrowser.open(wlink)
                     return
-        except Exception as e:
-            logging.error(f"Erro ao buscar link do Drive: {e}")
+            except Exception as e:
+                logging.error(f"Erro ao buscar link do Drive: {e}")
 
+        # 2. Se já existe link gravado no banco de dados, abre ele diretamente
+        cached_link = self.current_file_item.get('webContentLink') or self.current_file_item.get('webViewLink')
+        if cached_link and 'drive.google.com' in cached_link:
+            webbrowser.open(cached_link)
+            return
+
+        fid = self.current_file_item.get('file_id') or self.current_file_item.get('id')
+        if fid and not ('/' in fid or '\\' in fid or (len(fid) > 1 and fid[1] == ':')):
+            webbrowser.open(f"https://drive.google.com/file/d/{fid}/view")
+            return
+
+        # 3. Fallback final: Busca no Google Drive Web pelo nome do arquivo
         import urllib.parse
-        fpath = self.current_file_item.get('path', '')
-        parent_folder_name = os.path.basename(os.path.dirname(fpath)) if fpath else None
-        query_text = f"{parent_folder_name} {fname}" if parent_folder_name else fname
-        search_url = f"https://drive.google.com/drive/search?q={urllib.parse.quote(query_text)}"
+        search_term = fname.strip()
+        search_url = f"https://drive.google.com/drive/search?q={urllib.parse.quote(search_term)}"
         webbrowser.open(search_url)
 
     def open_folder(self):

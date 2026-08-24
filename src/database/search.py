@@ -251,14 +251,27 @@ class SearchEngine:
                 if advanced_filters.get('path_filter'):
                     pf = advanced_filters['path_filter'].replace('\\', '/')
                     pf_win = pf.replace('/', '\\')
-                    where_parts.append("(parentId IN (?, ?, ?, ?) OR ((path LIKE ? OR path LIKE ?) AND (path NOT LIKE ? AND path NOT LIKE ?)))")
-                    filter_params.extend([pf, pf.lower(), pf_win, pf_win.lower(), f"{pf}/%", f"{pf_win}\\%", f"{pf}/%/%", f"{pf_win}\\%\\%"])
+                    if search_term and search_term.strip():
+                        # Modo 2: Busca recursiva dentro da pasta selecionada e de todas as suas subpastas
+                        where_parts.append("(parentId IN (?, ?, ?, ?) OR path LIKE ? OR path LIKE ? OR parentId LIKE ? OR parentId LIKE ?)")
+                        filter_params.extend([pf, pf.lower(), pf_win, pf_win.lower(), f"{pf}/%", f"{pf_win}\\%", f"{pf}/%", f"{pf_win}\\%"])
+                    else:
+                        # Modo 3: Navegação de pasta direta sem busca (apenas o nível direto)
+                        where_parts.append("(parentId IN (?, ?, ?, ?) OR ((path LIKE ? OR path LIKE ?) AND (path NOT LIKE ? AND path NOT LIKE ?)))")
+                        filter_params.extend([pf, pf.lower(), pf_win, pf_win.lower(), f"{pf}/%", f"{pf_win}\\%", f"{pf}/%/%", f"{pf_win}\\%\\%"])
 
                 if advanced_filters.get('sandbox_filter'):
                     sf = advanced_filters['sandbox_filter'].replace('\\', '/')
                     sf_win = sf.replace('/', '\\')
                     where_parts.append("(path = ? OR path = ? OR path LIKE ? OR path LIKE ?)")
                     filter_params.extend([sf, sf_win, f"{sf}/%", f"{sf_win}\\%"])
+
+                if advanced_filters.get('tag_filter'):
+                    tf = advanced_filters['tag_filter']
+                    if tf == 'tagged':
+                        where_parts.append("(description IS NOT NULL AND TRIM(description) != '')")
+                    elif tf == 'untagged':
+                        where_parts.append("(description IS NULL OR TRIM(description) = '')")
 
             details_query = f"SELECT file_id, name, path, mimeType, source, description, thumbnailLink, thumbnailPath, size, modifiedTime, createdTime, parentId, starred, webContentLink FROM files"
             
@@ -384,6 +397,13 @@ class SearchEngine:
                     sf_win = sf.replace('/', '\\')
                     files_where_clauses.append("(path = ? OR path = ? OR path LIKE ? OR path LIKE ?)")
                     files_params.extend([sf, sf_win, f"{sf}/%", f"{sf_win}\\%"])
+
+                if advanced_filters.get('tag_filter'):
+                    tf = advanced_filters['tag_filter']
+                    if tf == 'tagged':
+                        files_where_clauses.append("(description IS NOT NULL AND TRIM(description) != '')")
+                    elif tf == 'untagged':
+                        files_where_clauses.append("(description IS NULL OR TRIM(description) = '')")
             query = f"SELECT file_id, name, path, mimeType, source, description, thumbnailLink, thumbnailPath, size, modifiedTime, createdTime, parentId, starred, webContentLink FROM files WHERE {' AND '.join(files_where_clauses)} ORDER BY {order_by_clause} LIMIT ? OFFSET ?"
             if explorer_special:
                 query = query.replace("WHERE", "WHERE source = 'local' AND")
