@@ -80,8 +80,6 @@ class SearchEngine:
 
     def get_search_suggestions(self, search_term, search_all_sources, limit=10):
         self.indexer.ensure_conn()
-        self.indexer.cursor.execute("PRAGMA synchronous=OFF")
-
         quoted_term = search_term.strip().replace('"', '""')
         query_term = f'"{quoted_term}*"'
 
@@ -95,8 +93,6 @@ class SearchEngine:
                 query, (query_term, query_term, query_term, limit))
 
         suggestions = [row[0] for row in self.indexer.cursor.fetchall()]
-
-        self.indexer.cursor.execute("PRAGMA synchronous=FULL")
         return list(dict.fromkeys(suggestions))
 
     def load_files_paged(self, source, page, page_size, search_term=None, sort_by='name_asc', filter_type='all', folder_id=None, advanced_filters=None, explorer_special=False):

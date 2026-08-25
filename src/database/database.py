@@ -48,37 +48,21 @@ class FileIndexer:
             os.makedirs(db_dir, exist_ok=True)
             print(f"📁 Pasta '{db_dir}' criada automaticamente")
 
-        # Sincronização / Restauração inteligente a partir da nuvem (Drive Compartilhado)
-        shared_candidates = [
-            r"L:\Drives Compartilhados\zRecursos_VoxImago\file_index_shared.db",
-            r"L:\.voximago_system\shared_index.db"
-        ]
-
-        local_exists = os.path.exists(self.db_name) and os.path.getsize(self.db_name) >= 1024 * 1024
-
-        for s_path in shared_candidates:
-            try:
-                if os.path.exists(s_path) and os.path.getsize(s_path) > 1024 * 1024:
-                    if not local_exists:
-                        logging.info(f"[RESTORE] Banco local ausente ou vazio. Restaurando da nuvem ({s_path})...")
-                        should_copy = True
-                    else:
-                        should_copy = False
-
-                    if should_copy:
-                        # Limpar arquivos WAL / SHM antigos antes de copiar
-                        for ext in ["-wal", "-shm"]:
-                            wal_file = self.db_name + ext
-                            if os.path.exists(wal_file):
-                                try:
-                                    os.remove(wal_file)
-                                except Exception:
-                                    pass
+        # Inicialização inteligente / Bootstrap inicial apenas se o banco local não existir
+        if not os.path.exists(self.db_name):
+            shared_candidates = [
+                r"L:\Drives Compartilhados\zRecursos_VoxImago\file_index_shared.db",
+                r"L:\.voximago_system\shared_index.db"
+            ]
+            for s_path in shared_candidates:
+                try:
+                    if os.path.exists(s_path) and os.path.getsize(s_path) > 1024 * 1024:
+                        logging.info(f"[BOOTSTRAP] Banco local não encontrado. Inicializando a partir do snapshot ({s_path})...")
                         shutil.copy2(s_path, self.db_name)
-                        logging.info("[OK] Banco de dados local sincronizado com sucesso com a versão da nuvem!")
+                        logging.info("[OK] Banco de dados local inicializado a partir do snapshot!")
                         break
-            except Exception as e_copy:
-                logging.warning(f"[AVISO] Não foi possível sincronizar com o banco compartilhado: {e_copy}")
+                except Exception as e_copy:
+                    logging.warning(f"[AVISO] Não foi possível copiar snapshot compartilhado: {e_copy}")
 
         self.conn = sqlite3.connect(self.db_name, check_same_thread=False, timeout=30.0)
         self.conn.create_function("py_lower", 1, lambda s: s.lower() if s else s)
@@ -342,6 +326,10 @@ class FileIndexer:
                 data_search_index = []
                 for item in files_list:
                     fid = item.get('id')
+                    raw_path = item.get('path')
+                    if item.get('source') == 'local' and raw_path:
+                        fid = os.path.normcase(os.path.normpath(raw_path))
+
                     name_val = item.get('name', '')
                     incoming_desc = item.get('description', '')
                     if (item.get('source') == 'local') and (not incoming_desc):
@@ -666,64 +654,91 @@ class FileIndexer:
         )
         self.conn.commit()
 
-    def update_description(self, file_id: str, description: str | None, thumbnailLink: str | None = None, webContentLink: str | None = None, commit: bool = False):
+    def update_description(self, file_id: str, description: str | None, thumbnailLink: str | None = None, webContentLink: str | None = None, commit: bool = False, allow_empty_override: bool = True):
         self.ensure_conn()
-        desc = description or ''
-        self.cursor.execute(
-            "UPDATE files SET description = ?, thumbnailLink = COALESCE(?, thumbnailLink), webContentLink = COALESCE(?, webContentLink) WHERE file_id = ?",
-            (desc, thumbnailLink, webContentLink, file_id),
-        )
-        self.cursor.execute(
-            "UPDATE search_index SET description = ?, normalized_description = ? WHERE file_id = ?",
-            (desc, SearchEngine(None).normalize_text(desc), file_id),
-        )
+        desc = (description or '').strip()
+        canon_id = os.path.normcase(os.path.normpath(file_id))
+
+        if not allow_empty_override and not desc:
+            # Não sobrescrever descrição existente com vazio
+            self.cursor.execute(
+                "UPDATE files SET thumbnailLink = COALESCE(?, thumbnailLink), webContentLink = COALESCE(?, webContentLink) WHERE file_id = ? OR path = ?",
+                (thumbnailLink, webContentLink, canon_id, canon_id),
+            )
+        else:
+            self.cursor.execute(
+                "UPDATE files SET description = ?, thumbnailLink = COALESCE(?, thumbnailLink), webContentLink = COALESCE(?, webContentLink) WHERE file_id = ? OR path = ?",
+                (desc, thumbnailLink, webContentLink, canon_id, canon_id),
+            )
+            self.cursor.execute(
+                "UPDATE search_index SET description = ?, normalized_description = ? WHERE file_id = ?",
+                (desc, SearchEngine(None).normalize_text(desc), canon_id),
+            )
         if commit:
             self.conn.commit()
 
     def export_to_shared_cache(self, target_path=r"L:\Drives Compartilhados\zRecursos_VoxImago\file_index_shared.db"):
-        '''Exporta o banco local e CSV para o local de cache compartilhado na rede Google Drive'''
+        '''Exporta o banco local e CSV para o local de cache compartilhado na rede Google Drive de forma atômica com checkpoint WAL'''
         try:
-            os.makedirs(os.path.dirname(target_path), exist_ok=True)
+            target_dir = os.path.dirname(target_path)
+            if target_dir and not os.path.exists(target_dir):
+                os.makedirs(target_dir, exist_ok=True)
+
+            self.ensure_conn()
             self.conn.commit()
-            shutil.copy2(self.db_name, target_path)
+            # 1. Executar checkpoint WAL para consolidar transações pendentes no arquivo .db principal
+            try:
+                self.cursor.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception as e_wal:
+                logging.warning(f"Aviso no wal_checkpoint: {e_wal}")
+
+            # 2. Cópia atômica via backup API
+            tmp_db_dest = target_path + ".tmp"
+            dest_conn = sqlite3.connect(tmp_db_dest)
+            self.conn.backup(dest_conn)
+            dest_conn.close()
+
+            # Renomear atomicamente
+            if os.path.exists(target_path):
+                try:
+                    os.remove(target_path)
+                except Exception:
+                    pass
+            os.replace(tmp_db_dest, target_path)
             
-            # Exportar CSV localmente primeiro para alta velocidade, depois copiar
+            # 3. Exportar CSV atômico
             temp_csv = os.path.join(os.path.dirname(self.db_name), "temp_export.csv")
             csv_path = os.path.splitext(target_path)[0] + ".csv"
+            tmp_csv_dest = csv_path + ".tmp"
             
             with open(temp_csv, "w", newline="", encoding="utf-8-sig") as f:
                 import csv
                 writer = csv.writer(f)
                 writer.writerow(["file_id", "name", "path", "mimeType", "source", "description", "size", "modifiedTime", "createdTime", "parentId", "webContentLink", "starred"])
-                self.ensure_conn()
                 cur = self.conn.cursor()
                 cur.execute("SELECT file_id, name, path, mimeType, source, description, size, modifiedTime, createdTime, parentId, webContentLink, starred FROM files")
                 for row in cur:
                     writer.writerow(row)
             
-            shutil.copy2(temp_csv, csv_path)
+            shutil.copy2(temp_csv, tmp_csv_dest)
+            if os.path.exists(csv_path):
+                try:
+                    os.remove(csv_path)
+                except Exception:
+                    pass
+            os.replace(tmp_csv_dest, csv_path)
+
             if os.path.exists(temp_csv):
                 try:
                     os.remove(temp_csv)
                 except Exception:
                     pass
             
-            print(f"[OK] Cache compartilhado (.db e .csv) atualizado em: {target_path}")
+            print(f"[OK] Cache compartilhado (.db e .csv) atualizado com sucesso em: {target_path}")
             return True
         except Exception as e:
             print(f"[AVISO] Nao foi possivel exportar cache compartilhado: {e}")
             return False
-
-    def import_from_shared_cache(self, source_path=r"L:\Drives Compartilhados\zRecursos_VoxImago\file_index_shared.db"):
-        '''Importa o banco compartilhado se existir e for mais recente'''
-        try:
-            if os.path.exists(source_path):
-                shutil.copy2(source_path, self.db_name)
-                print(f"[OK] Banco de dados importado do cache compartilhado: {source_path}")
-                return True
-        except Exception as e:
-            print(f"[AVISO] Nao foi possivel importar cache compartilhado: {e}")
-        return False
 
 
 def open_db_for_thread(db_name):

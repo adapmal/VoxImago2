@@ -107,18 +107,15 @@ def start_drive_folder_processing(parent, service, indexer, force_dialog=False):
                 except:
                     pass
 
+            if 'worker' in locals() and worker:
+                worker.is_running = False
+
             if 'thread' in locals() and thread and thread.isRunning():
-                print("⏳ Aguardando thread finalizar...")
+                print("⏳ Aguardando thread finalizar de forma cooperativa...")
                 thread.quit()
-
-                if not thread.wait(3000):
-                    print("⚠️ Thread não finalizou em 3s, tentando terminar...")
-                    thread.terminate()
-
-                    if not thread.wait(2000):
-                        print("🚨 Thread não respondeu ao terminate")
-                    else:
-                        print("✅ Thread terminada após terminate")
+                if not thread.wait(5000):
+                    print("⚠️ Thread ainda em processamento, aguardando conclusão...")
+                    thread.wait(2000)
                 else:
                     print("✅ Thread finalizada normalmente")
 
@@ -190,15 +187,11 @@ def start_drive_folder_processing(parent, service, indexer, force_dialog=False):
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         print(f"🚨 [{timestamp}] EMERGENCY CLEANUP - App fechando!")
         try:
-            if worker:
-                worker.terminate()
+            if 'worker' in locals() and worker:
                 worker.is_running = False
-            if thread and thread.isRunning():
+            if 'thread' in locals() and thread and thread.isRunning():
                 thread.quit()
                 thread.wait(2000)
-                if thread.isRunning():
-                    thread.terminate()
-                    thread.wait(1000)
         except:
             pass
 

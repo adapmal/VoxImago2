@@ -168,25 +168,27 @@ class StagingQueue:
             fpath = item.new_value or item.path
             if fpath and os.path.isdir(fpath):
                 try:
-                    # Se a pasta estiver vazia, remove o placeholder local
+                    # Se a pasta estiver vazia e foi descartada, remove o placeholder local
                     if not os.listdir(fpath):
                         os.rmdir(fpath)
                 except Exception:
                     pass
 
-    def remove_item(self, item):
+    def remove_item(self, item, discard_placeholder=False):
         if item in self.items:
-            self._cleanup_staged_folder(item)
+            if discard_placeholder:
+                self._cleanup_staged_folder(item)
             self.items.remove(item)
             self.itemRemoved.emit(item)
             self.queueChanged.emit(len(self.items))
             self._save_to_disk()
 
-    def remove_items_batch(self, items_to_remove):
+    def remove_items_batch(self, items_to_remove, discard_placeholder=False):
         changed = False
         for item in items_to_remove:
             if item in self.items:
-                self._cleanup_staged_folder(item)
+                if discard_placeholder:
+                    self._cleanup_staged_folder(item)
                 self.items.remove(item)
                 self.itemRemoved.emit(item)
                 changed = True
@@ -681,37 +683,47 @@ class StagingQueueDialog(QDialog):
 
         # 1. Processar alteração de tags / descrição
         if item.action_type in ('add_tags', 'remove_tags', 'set_description'):
-            new_desc = item.old_value
+            lookup_id = item.file_id or item.path
+            canon_id = os.path.normcase(os.path.normpath(lookup_id)) if lookup_id else None
+            
+            # Buscar a descrição VIVA mais recente do banco SQLite no momento da execução (F11)
+            current_live_desc = item.old_value or ''
+            if self.db_indexer and canon_id:
+                self.db_indexer.ensure_conn()
+                self.db_indexer.cursor.execute(
+                    "SELECT description FROM files WHERE file_id = ? OR path = ? LIMIT 1",
+                    (canon_id, canon_id)
+                )
+                r_live = self.db_indexer.cursor.fetchone()
+                if r_live and r_live[0] is not None:
+                    current_live_desc = r_live[0]
+
             if item.action_type == 'add_tags':
                 tags = [t.strip() for t in item.new_value.split(',') if t.strip()]
-                existing_tags = [t.strip() for t in item.old_value.split(',') if t.strip()]
+                existing_tags = [t.strip() for t in current_live_desc.split(',') if t.strip()]
                 for t in tags:
                     if t not in existing_tags:
                         existing_tags.append(t)
                 new_desc = ", ".join(existing_tags)
             elif item.action_type == 'remove_tags':
                 tags_to_rem = [t.strip().lower() for t in item.new_value.split(',') if t.strip()]
-                existing_tags = [t.strip() for t in item.old_value.split(',') if t.strip()]
+                existing_tags = [t.strip() for t in current_live_desc.split(',') if t.strip()]
                 existing_tags = [t for t in existing_tags if t.lower() not in tags_to_rem]
                 new_desc = ", ".join(existing_tags)
             elif item.action_type == 'set_description':
                 new_desc = item.new_value
 
-            # Atualizar SEMPRE localmente no banco SQLite estritamente pelo ID e caminho único
-            if self.db_indexer:
-                lookup_id = item.file_id or item.path
-                if lookup_id:
-                    from src.database.search import SearchEngine
-                    norm_engine = SearchEngine(None)
-                    norm_desc = norm_engine.normalize_text(new_desc)
-                    self.db_indexer.update_description(lookup_id, new_desc, commit=False)
-                    if item.path and item.path != lookup_id:
-                        self.db_indexer.update_description(item.path, new_desc, commit=False)
-                    self.db_indexer.cursor.execute(
-                        "UPDATE search_index SET description = ?, normalized_description = ? WHERE file_id = ? OR file_id = ?",
-                        (new_desc, norm_desc, lookup_id, item.path or lookup_id)
-                    )
-                    self.db_indexer.conn.commit()
+            # Atualizar SEMPRE localmente no banco SQLite estritamente pela chave canônica única
+            if self.db_indexer and canon_id:
+                from src.database.search import SearchEngine
+                norm_engine = SearchEngine(None)
+                norm_desc = norm_engine.normalize_text(new_desc)
+                self.db_indexer.update_description(canon_id, new_desc, commit=False)
+                self.db_indexer.cursor.execute(
+                    "UPDATE search_index SET description = ?, normalized_description = ? WHERE file_id = ?",
+                    (new_desc, norm_desc, canon_id)
+                )
+                self.db_indexer.conn.commit()
 
             # Atualizar na API do Google Drive se o serviço de drive estiver ativo
             if self.drive_service and drive_file_id:
@@ -729,50 +741,51 @@ class StagingQueueDialog(QDialog):
         elif item.action_type == 'rename':
             new_name = item.new_value
             old_path = item.path or item.old_value
-            new_path = old_path
+            if not old_path or not os.path.exists(old_path):
+                logging.warning(f"Arquivo de origem para renomear não encontrado: {old_path}")
+                return
 
-            # 1. Renomear fisicamente no disco local pelo caminho absoluto
-            if old_path and os.path.exists(old_path):
-                parent_dir = os.path.dirname(old_path)
-                new_path = os.path.normpath(os.path.join(parent_dir, new_name))
-                if os.path.normpath(old_path) != new_path:
-                    try:
-                        from src.utils.utils import safe_move_file
-                        success, err_msg = safe_move_file(old_path, new_path, retries=3, delay=0.5)
-                        if not success:
-                            raise RuntimeError(f"Erro ao renomear localmente: {err_msg}")
-                        logging.info(f"✅ Arquivo/pasta local renomeado: {old_path} -> {new_path}")
-                    except Exception as e_ren:
-                        logging.error(f"Erro ao renomear arquivo local: {e_ren}")
-                        raise e_ren
+            parent_dir = os.path.dirname(old_path)
+            new_path = os.path.normpath(os.path.join(parent_dir, new_name))
+            old_norm = os.path.normcase(os.path.normpath(old_path))
+            new_norm = os.path.normcase(new_path)
 
-            # 2. Atualizar no banco SQLite pelo ID / caminho exato (inclusive filhos se for pasta)
+            if old_norm != new_norm:
+                # Checagem estrita de colisão (F3): nunca sobrescrever arquivo existente
+                if os.path.exists(new_path):
+                    raise RuntimeError(f"Já existe um arquivo ou pasta com o nome '{new_name}' em '{parent_dir}'. Renomeação abortada para evitar perda de dados.")
+
+                from src.utils.utils import safe_move_file
+                success, err_msg = safe_move_file(old_path, new_path, retries=3, delay=0.5)
+                if not success:
+                    raise RuntimeError(f"Erro ao renomear localmente: {err_msg}")
+                logging.info(f"✅ Arquivo/pasta local renomeado: {old_path} -> {new_path}")
+
+            # Atualizar no banco SQLite com chave canônica normcase(normpath)
             if self.db_indexer:
-                lookup_id = item.file_id or old_path
                 self.db_indexer.cursor.execute(
                     "UPDATE files SET name = ?, name_normalized = ?, path = ?, file_id = ? WHERE file_id = ? OR path = ?", 
-                    (new_name, new_name.lower(), new_path, new_path, lookup_id, old_path)
+                    (new_name, new_name.lower(), new_norm, new_norm, old_norm, old_norm)
                 )
                 self.db_indexer.cursor.execute(
-                    "UPDATE search_index SET name = ?, normalized_name = ?, file_id = ? WHERE file_id = ? OR file_id = ?",
-                    (new_name, new_name.lower(), new_path, lookup_id, old_path)
+                    "UPDATE search_index SET name = ?, normalized_name = ?, file_id = ? WHERE file_id = ?",
+                    (new_name, new_name.lower(), new_norm, old_norm)
                 )
 
-                # Se for diretório, atualizar recursivamente todos os caminhos dos arquivos filhos
-                if os.path.isdir(new_path) or (old_path and os.path.isdir(old_path)):
-                    norm_old = os.path.normpath(old_path)
-                    norm_new = os.path.normpath(new_path)
+                # Se for diretório, atualizar recursivamente os caminhos dos arquivos filhos com ESCAPE (F12)
+                if os.path.isdir(new_path) or os.path.isdir(old_path):
+                    escaped_old = old_norm.replace('\\', '\\\\').replace('_', '\\_').replace('%', '\\%')
                     self.db_indexer.cursor.execute(
-                        "SELECT file_id, path, parentId FROM files WHERE path LIKE ? OR path LIKE ?",
-                        (f"{norm_old}\\%", f"{norm_old}/%")
+                        "SELECT file_id, path, parentId FROM files WHERE path LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\'",
+                        (f"{escaped_old}\\\\%", f"{escaped_old}/%")
                     )
                     child_rows = self.db_indexer.cursor.fetchall()
                     for c_fid, c_path, c_parent in child_rows:
                         if not c_path:
                             continue
-                        rel = os.path.relpath(c_path, norm_old)
-                        new_c_path = os.path.normpath(os.path.join(norm_new, rel))
-                        new_c_parent = os.path.normpath(os.path.dirname(new_c_path))
+                        rel = os.path.relpath(c_path, old_norm)
+                        new_c_path = os.path.normcase(os.path.normpath(os.path.join(new_norm, rel)))
+                        new_c_parent = os.path.normcase(os.path.normpath(os.path.dirname(new_c_path)))
                         self.db_indexer.cursor.execute(
                             "UPDATE files SET path = ?, parentId = ?, file_id = ? WHERE file_id = ? OR path = ?",
                             (new_c_path, new_c_parent, new_c_path, c_fid, c_path)
@@ -784,128 +797,76 @@ class StagingQueueDialog(QDialog):
 
                 self.db_indexer.conn.commit()
 
-            # 3. Renomear no Google Drive pelo ID único do arquivo
-            if self.drive_service and drive_file_id:
-                try:
-                    self.drive_service.files().update(
-                        fileId=drive_file_id, 
-                        body={'name': new_name}, 
-                        supportsAllDrives=True
-                    ).execute()
-                    logging.info(f"✅ Google Drive: arquivo renomeado para '{new_name}' (ID: {drive_file_id})")
-                except Exception as e_drv:
-                    logging.error(f"Erro ao renomear no Google Drive: {e_drv}")
-
         elif item.action_type == 'move':
             src_path = item.old_value or item.path
             dst_path = item.new_value
-            new_file_name_clash = None
+            if not src_path or not os.path.exists(src_path):
+                logging.warning(f"Arquivo de origem para mover não encontrado: {src_path}")
+                return
+
+            norm_src = os.path.normcase(os.path.normpath(src_path))
+            norm_dst = os.path.normcase(os.path.normpath(dst_path))
 
             # 0. Proteção contra Loop Infinito (mover pasta para dentro de si mesma)
-            if src_path and os.path.isdir(src_path):
-                norm_src = os.path.normpath(src_path).lower()
-                norm_dst = os.path.normpath(dst_path).lower()
+            if os.path.isdir(src_path):
                 if norm_dst == norm_src or norm_dst.startswith(norm_src + os.sep):
                     raise RuntimeError(f"Não é permitido mover uma pasta para dentro de si mesma: {src_path} -> {dst_path}")
 
             # 1. Mover arquivo localmente no disco com proteção de File Lock / InSync
-            local_moved_successfully = False
-            if src_path and os.path.exists(src_path):
-                import shutil
+            if norm_src != norm_dst:
                 dst_dir = os.path.dirname(dst_path)
                 os.makedirs(dst_dir, exist_ok=True)
-                if os.path.normpath(src_path) != os.path.normpath(dst_path):
-                    # Se o arquivo destino já existe no local, resolve o conflito de nome
-                    if os.path.exists(dst_path):
-                        base, ext = os.path.splitext(dst_path)
-                        counter = 1
-                        while True:
-                            candidate_path = f"{base}_{counter}{ext}"
-                            if not os.path.exists(candidate_path):
-                                dst_path = candidate_path
-                                break
-                            counter += 1
-                        
-                        item.new_value = dst_path
-                        new_file_name_clash = os.path.basename(dst_path)
-                        logging.warning(f"⚠️ Conflito detectado! Renomeando arquivo para evitar sobreposição: {new_file_name_clash}")
+                
+                # Se o arquivo destino já existe no local, resolve o conflito de nome
+                if os.path.exists(dst_path):
+                    base, ext = os.path.splitext(dst_path)
+                    counter = 1
+                    while True:
+                        candidate_path = f"{base}_{counter}{ext}"
+                        if not os.path.exists(candidate_path):
+                            dst_path = candidate_path
+                            norm_dst = os.path.normcase(os.path.normpath(dst_path))
+                            break
+                        counter += 1
+                    item.new_value = dst_path
+                    logging.warning(f"⚠️ Conflito detectado! Renomeando arquivo de destino para evitar sobreposição: {os.path.basename(dst_path)}")
 
-                    from src.utils.utils import safe_move_file
-                    success, err_msg = safe_move_file(src_path, dst_path, retries=3, delay=0.5)
-                    if not success:
-                        raise RuntimeError(f"Falha ao mover arquivo local: {err_msg}")
+                from src.utils.utils import safe_move_file
+                success, err_msg = safe_move_file(src_path, dst_path, retries=3, delay=0.5)
+                if not success:
+                    raise RuntimeError(f"Falha ao mover arquivo local: {err_msg}")
+                logging.info(f"✅ Arquivo local movido com sucesso: {src_path} -> {dst_path}")
 
-                    local_moved_successfully = True
-                    logging.info(f"✅ Arquivo local movido com sucesso: {src_path} -> {dst_path}")
-
-            # 2. Mover na API do Google Drive se o serviço estiver ativo (com rollback em caso de falha)
-            if self.drive_service and drive_file_id:
-                try:
-                    f_info = self.drive_service.files().get(
-                        fileId=drive_file_id, fields="parents", supportsAllDrives=True
-                    ).execute()
-                    current_parents = ",".join(f_info.get('parents', []))
-
-                    dst_dir = os.path.dirname(dst_path)
-                    dst_folder_name = os.path.basename(dst_dir)
-                    target_parent_id = self._resolve_drive_folder_id_by_path(dst_dir, create_if_missing=True)
-
-                    if target_parent_id:
-                        update_kwargs = {
-                            'fileId': drive_file_id,
-                            'addParents': target_parent_id,
-                            'removeParents': current_parents,
-                            'supportsAllDrives': True
-                        }
-                        if new_file_name_clash:
-                            update_kwargs['body'] = {'name': new_file_name_clash}
-
-                        self.drive_service.files().update(**update_kwargs).execute()
-                        logging.info(f"✅ Google Drive: arquivo {item.file_name} movido com sucesso para a pasta '{dst_folder_name}' (ID: {target_parent_id})" + (f" e renomeado para {new_file_name_clash}" if new_file_name_clash else ""))
-                    else:
-                        logging.error(f"❌ Não foi possível resolver o ID da pasta destino no Google Drive para o caminho: {dst_dir}")
-                except Exception as e_drive:
-                    # Rollback atômico: se o Drive falhar, reverte o arquivo local para não desemparelhar com o InSync
-                    if local_moved_successfully and os.path.exists(dst_path):
-                        try:
-                            shutil.move(dst_path, src_path)
-                            logging.warning(f"↩️ Rollback local executado para manter sincronia: {dst_path} -> {src_path}")
-                        except Exception:
-                            pass
-                    raise RuntimeError(f"Erro ao mover arquivo no Google Drive: {e_drive}. Operação revertida por segurança.")
-
-            # 3. Atualizar no banco SQLite apenas após confirmação do movimento
-            if self.db_indexer and item.file_id:
-                new_parent_path = os.path.dirname(dst_path)
+            # 2. Atualizar no banco SQLite com chave canônica normcase(normpath)
+            if self.db_indexer:
+                new_parent_path = os.path.normcase(os.path.normpath(os.path.dirname(dst_path)))
                 new_name = os.path.basename(dst_path)
                 from src.database.search import SearchEngine
                 norm_engine = SearchEngine(None)
                 norm_name = norm_engine.normalize_text(new_name)
                 self.db_indexer.cursor.execute(
-                    "UPDATE files SET path = ?, parentId = ?, name = ?, name_normalized = ? WHERE file_id = ? OR path = ?",
-                    (dst_path, new_parent_path, new_name, new_name.lower(), item.file_id, src_path)
+                    "UPDATE files SET path = ?, parentId = ?, name = ?, name_normalized = ?, file_id = ? WHERE file_id = ? OR path = ?",
+                    (norm_dst, new_parent_path, new_name, new_name.lower(), norm_dst, norm_src, norm_src)
                 )
                 self.db_indexer.cursor.execute(
-                    "UPDATE search_index SET name = ?, normalized_name = ?, file_id = ? WHERE file_id = ? OR file_id = ?",
-                    (new_name, norm_name, dst_path, item.file_id, src_path)
+                    "UPDATE search_index SET name = ?, normalized_name = ?, file_id = ? WHERE file_id = ?",
+                    (new_name, norm_name, norm_dst, norm_src)
                 )
 
                 # Se for um diretório, atualizar recursivamente os caminhos de todos os arquivos e subpastas filhos
-                if os.path.isdir(dst_path) or (src_path and os.path.isdir(src_path)):
-                    norm_src = os.path.normpath(src_path)
-                    norm_dst = os.path.normpath(dst_path)
-
+                if os.path.isdir(dst_path) or os.path.isdir(src_path):
+                    escaped_src = norm_src.replace('\\', '\\\\').replace('_', '\\_').replace('%', '\\%')
                     self.db_indexer.cursor.execute(
-                        "SELECT file_id, path, parentId FROM files WHERE path LIKE ? OR path LIKE ?",
-                        (f"{norm_src}\\%", f"{norm_src}/%")
+                        "SELECT file_id, path, parentId FROM files WHERE path LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\'",
+                        (f"{escaped_src}\\\\%", f"{escaped_src}/%")
                     )
                     child_rows = self.db_indexer.cursor.fetchall()
                     for c_fid, c_path, c_parent in child_rows:
                         if not c_path:
                             continue
                         rel = os.path.relpath(c_path, norm_src)
-                        new_c_path = os.path.normpath(os.path.join(norm_dst, rel))
-                        new_c_parent = os.path.normpath(os.path.dirname(new_c_path))
+                        new_c_path = os.path.normcase(os.path.normpath(os.path.join(norm_dst, rel)))
+                        new_c_parent = os.path.normcase(os.path.normpath(os.path.dirname(new_c_path)))
                         self.db_indexer.cursor.execute(
                             "UPDATE files SET path = ?, parentId = ?, file_id = ? WHERE file_id = ? OR path = ?",
                             (new_c_path, new_c_parent, new_c_path, c_fid, c_path)
@@ -918,53 +879,36 @@ class StagingQueueDialog(QDialog):
                 self.db_indexer.conn.commit()
 
         elif item.action_type == 'delete':
-            # 1. Enviar para a Lixeira do Windows nativa (SHFileOperationW)
-            if item.path and os.path.exists(item.path):
+            del_path = item.path or item.old_value
+            if not del_path:
+                return
+
+            # 1. Enviar para a Lixeira do Windows nativa
+            if os.path.exists(del_path):
                 from src.utils.utils import send_to_recycle_bin
-                moved_to_trash = send_to_recycle_bin(item.path)
+                moved_to_trash = send_to_recycle_bin(del_path)
                 if not moved_to_trash:
-                    try:
-                        if os.path.isdir(item.path):
-                            import shutil
-                            shutil.rmtree(item.path)
-                        else:
-                            os.remove(item.path)
-                    except Exception as e_del:
-                        logging.warning(f"Não foi possível remover arquivo local '{item.path}': {e_del}")
-                else:
-                    logging.info(f"🗑️ Arquivo/pasta local movido para a Lixeira do Windows: '{item.path}'")
+                    raise RuntimeError(f"Não foi possível mover para a Lixeira do Windows: '{del_path}'. Exclusão abortada por segurança.")
+                logging.info(f"🗑️ Arquivo/pasta local movido para a Lixeira do Windows: '{del_path}'")
 
-            # 2. Apagar no banco de dados SQLite local (inclusive arquivos filhos se for pasta)
+            # 2. Apagar no banco de dados SQLite local (inclusive arquivos filhos se for pasta) com ESCAPE (F12)
             if self.db_indexer:
-                del_id = item.file_id or item.path
-                if del_id:
-                    norm_del = os.path.normpath(del_id)
-                    self.db_indexer.cursor.execute(
-                        "DELETE FROM files WHERE file_id = ? OR path = ? OR path LIKE ? OR path LIKE ? OR parentId = ? OR parentId LIKE ? OR parentId LIKE ?",
-                        (del_id, norm_del, f"{del_id}\\%", f"{norm_del}/%", del_id, f"{del_id}\\%", f"{norm_del}/%")
-                    )
-                    self.db_indexer.cursor.execute(
-                        "DELETE FROM search_index WHERE file_id = ? OR file_id LIKE ? OR file_id LIKE ?",
-                        (del_id, f"{del_id}\\%", f"{norm_del}/%")
-                    )
-                    self.db_indexer.conn.commit()
-
-            # 3. Enviar para a lixeira do Google Drive pelo ID único
-            if self.drive_service and drive_file_id:
-                try:
-                    self.drive_service.files().update(
-                        fileId=drive_file_id, 
-                        body={'trashed': True}, 
-                        supportsAllDrives=True
-                    ).execute()
-                    logging.info(f"🗑️ Google Drive: arquivo '{item.file_name}' (ID: {drive_file_id}) movido para a lixeira.")
-                except Exception as e_drv:
-                    logging.error(f"Erro ao enviar para a lixeira no Drive: {e_drv}")
+                norm_del = os.path.normcase(os.path.normpath(del_path))
+                escaped_del = norm_del.replace('\\', '\\\\').replace('_', '\\_').replace('%', '\\%')
+                self.db_indexer.cursor.execute(
+                    "DELETE FROM files WHERE file_id = ? OR path = ? OR path LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\' OR parentId = ? OR parentId LIKE ? ESCAPE '\\' OR parentId LIKE ? ESCAPE '\\'",
+                    (norm_del, norm_del, f"{escaped_del}\\\\%", f"{escaped_del}/%", norm_del, f"{escaped_del}\\\\%", f"{escaped_del}/%")
+                )
+                self.db_indexer.cursor.execute(
+                    "DELETE FROM search_index WHERE file_id = ? OR file_id LIKE ? ESCAPE '\\' OR file_id LIKE ? ESCAPE '\\'",
+                    (norm_del, f"{escaped_del}\\\\%", f"{escaped_del}/%")
+                )
+                self.db_indexer.conn.commit()
 
         elif item.action_type == 'create_folder':
             target_folder_path = item.new_value or item.path
             if target_folder_path:
-                norm_p = os.path.normpath(target_folder_path)
+                norm_p = os.path.normcase(os.path.normpath(target_folder_path))
                 os.makedirs(norm_p, exist_ok=True)
                 if self.db_indexer:
                     now = int(time.time())
@@ -973,9 +917,6 @@ class StagingQueueDialog(QDialog):
                         (norm_p, os.path.basename(norm_p), norm_p, 'folder', 'local', '', os.path.dirname(norm_p), now, now)
                     )
                     self.db_indexer.conn.commit()
-                if self.drive_service:
-                    parent_dir = os.path.dirname(norm_p)
-                    parent_drive_id = self._resolve_drive_folder_id_by_path(parent_dir)
                     if parent_drive_id:
                         folder_metadata = {
                             'name': os.path.basename(norm_p),

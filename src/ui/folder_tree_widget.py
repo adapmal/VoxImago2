@@ -419,6 +419,10 @@ class FolderTreeWidget(QWidget):
         self.tree_view.setRootIndex(self.model.index(self.root_dir))
 
     def create_new_folder(self, target_parent_path=None):
+        if self.config_mgr.is_read_only():
+            QMessageBox.warning(self, "Modo Somente Leitura", "O aplicativo está em Modo Somente Leitura. Desative o modo somente leitura para criar pastas.")
+            return
+
         if not target_parent_path:
             indexes = self.tree_view.selectedIndexes()
             if indexes:

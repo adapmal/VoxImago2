@@ -164,9 +164,10 @@ def safe_move_file(src_path, dst_path, retries=3, delay=0.5):
 
     for attempt in range(retries):
         try:
-            # Teste de lock: tentar abrir para leitura rápida antes de mover
-            with open(src_ext, 'rb') as _:
-                pass
+            # Teste de lock: tentar abrir para leitura rápida antes de mover apenas se for arquivo
+            if os.path.isfile(src_path):
+                with open(src_ext, 'rb') as _:
+                    pass
             shutil.move(src_ext, dst_ext)
             return True, None
         except PermissionError as pe:

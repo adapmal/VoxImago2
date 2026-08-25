@@ -488,8 +488,7 @@ class DriveSync(QObject):
         valid_items = [
             item for item in page_items
             if item.get('size', 0) > 0 and
-            (item.get('description') or item.get(
-                'thumbnailLink') or item.get('webContentLink'))
+            ((item.get('description') and item.get('description').strip()) or item.get('thumbnailLink') or item.get('webContentLink'))
         ]
 
         if not valid_items:
@@ -499,13 +498,15 @@ class DriveSync(QObject):
             try:
                 matches = find_local_matches(drive_item, indexer.cursor, self.service)
                 if matches:
+                    drive_desc = (drive_item.get('description') or '').strip()
                     for local_id in matches:
                         indexer.update_description(
                             local_id,
-                            drive_item.get('description', ''),
+                            drive_desc if drive_desc else None,
                             drive_item.get('thumbnailLink', ''),
                             drive_item.get('webContentLink', ''),
                             commit=False,
+                            allow_empty_override=False,
                         )
                         fusion_count += 1
                     matched_drive_ids.append(drive_item['id'])
@@ -552,14 +553,16 @@ class DriveSync(QObject):
                 }
                 matches = find_local_matches(drive_item, cursor)
                 if matches:
+                    drive_desc = (drive_item.get('description') or '').strip()
                     for local_id in matches:
                         try:
                             indexer.update_description(
                                 local_id,
-                                drive_item['description'],
+                                drive_desc if drive_desc else None,
                                 drive_item.get('thumbnailLink'),
                                 drive_item.get('webContentLink'),
                                 commit=False,
+                                allow_empty_override=False,
                             )
                             total_fusions += 1
                         except Exception as e:

@@ -641,46 +641,22 @@ class FileDetailsPanel(QFrame):
             ext = ext.lower()
 
             try:
-                if ext in raw_exts:
-                    # Para arquivos RAW da câmera: não sobrescreve o arquivo bruto original.
-                    # Rotaciona a miniatura no cache local.
-                    cache_path = thumbnails.ThumbnailCache.get_existing_thumbnail_cache_path(item_data)
-                    if not cache_path or not os.path.exists(cache_path):
-                        cache_path = thumbnails.ThumbnailManager.generate_local_thumbnail(item_data, size=(300, 300))
-                    
-                    if cache_path and os.path.exists(cache_path):
-                        with Image.open(cache_path) as img:
-                            rotated = img.rotate(-90, expand=True)
-                            rotated.save(cache_path, 'PNG')
-                        rotated_count += 1
+                # Rotação 100% não destrutiva para todos os formatos:
+                # O arquivo master original nunca é modificado nem recompactado.
+                # Apenas a miniatura no cache local é rotacionada.
+                cache_path = thumbnails.ThumbnailCache.get_existing_thumbnail_cache_path(item_data)
+                if not cache_path or not os.path.exists(cache_path):
+                    cache_path = thumbnails.ThumbnailManager.generate_local_thumbnail(item_data, size=(300, 300))
+                
+                if cache_path and os.path.exists(cache_path):
+                    with Image.open(cache_path) as img:
+                        rotated = img.rotate(-90, expand=True)
+                        rotated.save(cache_path, 'PNG')
+                    rotated_count += 1
                 else:
-                    # Para imagens convencionais (JPEG, PNG, WEBP, etc.)
-                    try:
-                        with Image.open(fpath) as img:
-                            rotated = img.rotate(-90, expand=True)
-                            rotated.save(fpath)
-
-                        # Limpar a miniatura do cache e recriar
-                        cache_path = thumbnails.ThumbnailCache.get_existing_thumbnail_cache_path(item_data)
-                        if cache_path and os.path.exists(cache_path):
-                            try:
-                                os.remove(cache_path)
-                            except Exception:
-                                pass
-                        thumbnails.ThumbnailManager.generate_local_thumbnail(item_data, size=(300, 300))
-                        rotated_count += 1
-                    except Exception as img_err:
-                        # Fallback: se o arquivo original for somente leitura, rotaciona a miniatura
-                        cache_path = thumbnails.ThumbnailCache.get_existing_thumbnail_cache_path(item_data)
-                        if not cache_path or not os.path.exists(cache_path):
-                            cache_path = thumbnails.ThumbnailManager.generate_local_thumbnail(item_data, size=(300, 300))
-                        if cache_path and os.path.exists(cache_path):
-                            with Image.open(cache_path) as img:
-                                rotated = img.rotate(-90, expand=True)
-                                rotated.save(cache_path, 'PNG')
-                            rotated_count += 1
+                    logging.warning(f"Não foi possível obter miniatura para rotacionar: {fpath}")
             except Exception as e:
-                logging.error(f"Erro ao rotacionar imagem {fpath}: {e}")
+                logging.error(f"Erro ao rotacionar miniatura de {fpath}: {e}")
 
         if rotated_count > 0:
             # Recarregar a miniatura no painel de detalhes

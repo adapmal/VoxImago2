@@ -1,3 +1,4 @@
+import os
 import time
 import logging
 from datetime import datetime, timezone
@@ -140,14 +141,20 @@ class IncrementalSyncWorker(QObject):
 
                 local_updated = False
                 if target_local_fid:
-                    local_indexer.cursor.execute(
-                        "UPDATE files SET description = ?, modifiedTime = ?, webContentLink = ? WHERE file_id = ?",
-                        (desc, mod_time, wlink, target_local_fid)
-                    )
-                    local_indexer.cursor.execute(
-                        "UPDATE search_index SET description = ?, normalized_description = ? WHERE file_id = ?",
-                        (desc, norm_desc, target_local_fid)
-                    )
+                    if desc:
+                        local_indexer.cursor.execute(
+                            "UPDATE files SET description = ?, modifiedTime = ?, webContentLink = ? WHERE file_id = ?",
+                            (desc, mod_time, wlink, target_local_fid)
+                        )
+                        local_indexer.cursor.execute(
+                            "UPDATE search_index SET description = ?, normalized_description = ? WHERE file_id = ?",
+                            (desc, norm_desc, target_local_fid)
+                        )
+                    else:
+                        local_indexer.cursor.execute(
+                            "UPDATE files SET modifiedTime = ?, webContentLink = COALESCE(?, webContentLink) WHERE file_id = ?",
+                            (mod_time, wlink, target_local_fid)
+                        )
                     local_updated = True
 
                 # Se o arquivo não existia nem no Drive nem localmente, inserir novo registro do Drive
