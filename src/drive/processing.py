@@ -119,19 +119,22 @@ def start_drive_folder_processing(parent, service, indexer, force_dialog=False):
                 else:
                     print("✅ Thread finalizada normalmente")
 
-            if 'worker' in locals() and worker:
-                try:
-                    worker.deleteLater()
-                    print("✅ Worker removido")
-                except:
-                    pass
-
-            if 'thread' in locals() and thread:
-                try:
-                    thread.deleteLater()
-                    print("✅ Thread removida")
-                except:
-                    pass
+            thread_still_running = ('thread' in locals() and thread and thread.isRunning())
+            if not thread_still_running:
+                if 'worker' in locals() and worker:
+                    try:
+                        worker.deleteLater()
+                        print("✅ Worker removido")
+                    except:
+                        pass
+                if 'thread' in locals() and thread:
+                    try:
+                        thread.deleteLater()
+                        print("✅ Thread removida")
+                    except:
+                        pass
+            else:
+                print("⚠️ Thread ainda ativa em segundo plano; adiando deleteLater para evitar crash do Qt.")
 
             print("✅ Cleanup completo concluído")
         except Exception as e:

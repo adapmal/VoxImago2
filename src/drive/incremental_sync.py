@@ -90,11 +90,21 @@ class IncrementalSyncWorker(QObject):
                 parent_id = parents[0] if parents else None
                 mod_time = int(datetime.strptime(file.get('modifiedTime'), "%Y-%m-%dT%H:%M:%S.%fZ").timestamp()) if file.get('modifiedTime') else int(time.time())
                 
-                # 1. Atualizar registro no banco onde file_id = fid (drive)
-                local_indexer.cursor.execute(
-                    "UPDATE files SET description = ?, modifiedTime = ?, webContentLink = ? WHERE file_id = ?",
-                    (desc, mod_time, wlink, fid)
-                )
+                # 1. Atualizar registro no banco onde file_id = fid (drive) com proteção de descrição vazia (F8)
+                if desc:
+                    local_indexer.cursor.execute(
+                        "UPDATE files SET description = ?, modifiedTime = ?, webContentLink = ? WHERE file_id = ?",
+                        (desc, mod_time, wlink, fid)
+                    )
+                    local_indexer.cursor.execute(
+                        "UPDATE search_index SET description = ?, normalized_description = ? WHERE file_id = ?",
+                        (desc, norm_desc, fid)
+                    )
+                else:
+                    local_indexer.cursor.execute(
+                        "UPDATE files SET modifiedTime = ?, webContentLink = COALESCE(?, webContentLink) WHERE file_id = ?",
+                        (mod_time, wlink, fid)
+                    )
                 drive_updated = (local_indexer.cursor.rowcount > 0)
                 
                 # 2. Localizar o arquivo local correspondente com isolamento estrito de pasta e ID

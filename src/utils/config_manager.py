@@ -72,10 +72,15 @@ class ConfigManager:
         return bool(self.get('read_only_mode', False))
 
     def is_sandbox(self):
-        return bool(self.get('sandbox_mode', True))
+        return bool(self.get('sandbox_mode', False))
 
     def get_sandbox_path(self):
         return self.get('sandbox_path', r'L:\Drives Compartilhados\_TestesBanco')
+
+    def get_db_path(self):
+        if self.is_sandbox():
+            return os.path.join('data', 'sandbox_file_index.db')
+        return os.path.join('data', 'file_index.db')
 
     def get_current_drive_id(self):
         if self.is_sandbox():

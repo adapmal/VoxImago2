@@ -619,7 +619,7 @@ class FileDetailsPanel(QFrame):
             self.staging_queue.add_item(item)
 
     def _rotate_image_action(self):
-        """Rotaciona a imagem 90° no sentido horário imediatamente no arquivo local e na miniatura."""
+        """Rotaciona a miniatura no cache de visualização 90° no sentido horário, preservando o arquivo original intacto."""
         if self.config_mgr.is_read_only():
             return
             
@@ -668,7 +668,7 @@ class FileDetailsPanel(QFrame):
                 self.parent_app.file_list_view.viewport().update()
 
             try:
-                self.window().status_bar.showMessage(f"✅ {rotated_count} imagem(ns) rotacionada(s) com sucesso!", 3000)
+                self.window().status_bar.showMessage(f"✅ {rotated_count} miniatura(s) de visualização rotacionada(s)!", 3000)
             except Exception:
                 pass
 

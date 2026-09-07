@@ -10,7 +10,7 @@ import logging
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem,
     QPushButton, QLabel, QMessageBox, QWidget, QFrame, QSplitter,
-    QAbstractItemView, QProgressDialog
+    QAbstractItemView, QProgressDialog, QPlainTextEdit
 )
 from PyQt6.QtCore import Qt, QObject, pyqtSignal, QCoreApplication
 from src.utils.config_manager import ConfigManager
@@ -196,7 +196,10 @@ class StagingQueue:
             self.queueChanged.emit(len(self.items))
             self._save_to_disk()
 
-    def clear(self):
+    def clear(self, discard_placeholder=True):
+        if discard_placeholder:
+            for item in list(self.items):
+                self._cleanup_staged_folder(item)
         self.items.clear()
         self.cleared.emit()
         self.queueChanged.emit(0)
@@ -204,6 +207,98 @@ class StagingQueue:
 
     def count(self):
         return len(self.items)
+
+
+class QueueExecutionReportDialog(QDialog):
+    """
+    Janela expansível e rolável para exibição completa de erros de execução da fila.
+    Permite selecionar, copiar todos os erros e abrir a pasta de logs.
+    """
+    def __init__(self, parent=None, executed_count=0, errors=None):
+        super().__init__(parent)
+        self.setWindowTitle("⚠️ Relatório de Execução da Fila")
+        self.setMinimumSize(680, 450)
+        self.resize(760, 520)
+
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        # Cabeçalho com ícones e status
+        err_count = len(errors or [])
+        header_text = (
+            f"<h3 style='margin: 0; padding-bottom: 4px;'>📊 Execução da Fila Concluída com Avisos</h3>"
+            f"<b>✅ {executed_count} alteração(ões) aplicada(s) com sucesso.</b><br>"
+            f"<span style='color: #ff5555; font-weight: bold;'>❌ {err_count} alteração(ões) encontraram erros e permaneceram salvas na fila:</span>"
+        )
+        lbl_header = QLabel(header_text)
+        lbl_header.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(lbl_header)
+
+        # Caixa de texto de erros rolável e copiável
+        self.text_errors = QPlainTextEdit()
+        self.text_errors.setReadOnly(True)
+        
+        error_lines = []
+        for i, err in enumerate(errors or [], 1):
+            error_lines.append(f"[{i}] {err}")
+        
+        self.raw_error_text = "\n".join(error_lines)
+        self.text_errors.setPlainText(self.raw_error_text)
+        self.text_errors.setStyleSheet("""
+            QPlainTextEdit {
+                background-color: #1e1e1e;
+                color: #f8f8f2;
+                font-family: 'Consolas', 'Courier New', monospace;
+                font-size: 12px;
+                border: 1px solid #444;
+                border-radius: 4px;
+                padding: 8px;
+            }
+        """)
+        layout.addWidget(self.text_errors)
+
+        # Botões de Ação
+        btn_layout = QHBoxLayout()
+        
+        self.lbl_copied = QLabel("")
+        self.lbl_copied.setStyleSheet("color: #50fa7b; font-weight: bold;")
+        btn_layout.addWidget(self.lbl_copied)
+        
+        btn_layout.addStretch()
+
+        btn_copy = QPushButton("📋 Copiar Todos os Erros")
+        btn_copy.clicked.connect(self._copy_to_clipboard)
+        btn_layout.addWidget(btn_copy)
+
+        btn_logs = QPushButton("📁 Abrir Pasta de Logs")
+        btn_logs.clicked.connect(self._open_logs_folder)
+        btn_layout.addWidget(btn_logs)
+
+        btn_close = QPushButton("Fechar")
+        btn_close.setDefault(True)
+        btn_close.clicked.connect(self.accept)
+        btn_layout.addWidget(btn_close)
+
+        layout.addLayout(btn_layout)
+
+    def _copy_to_clipboard(self):
+        from PyQt6.QtWidgets import QApplication
+        QApplication.clipboard().setText(self.raw_error_text)
+        self.lbl_copied.setText("✅ Copiado para a área de transferência!")
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(3000, lambda: self.lbl_copied.setText(""))
+
+    def _open_logs_folder(self):
+        import subprocess
+        log_dir = os.path.abspath("logs")
+        os.makedirs(log_dir, exist_ok=True)
+        try:
+            os.startfile(log_dir)
+        except Exception:
+            try:
+                subprocess.Popen(["explorer", log_dir])
+            except Exception:
+                pass
 
 
 class StagingQueueDialog(QDialog):
@@ -481,7 +576,7 @@ class StagingQueueDialog(QDialog):
                 except RuntimeError:
                     pass
             if items_to_remove:
-                self.queue.remove_items_batch(items_to_remove)
+                self.queue.remove_items_batch(items_to_remove, discard_placeholder=True)
 
     def _clear_queue(self):
         if self.queue.count() > 0:
@@ -491,7 +586,7 @@ class StagingQueueDialog(QDialog):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
             if reply == QMessageBox.StandardButton.Yes:
-                self.queue.clear()
+                self.queue.clear(discard_placeholder=True)
 
     def _execute_queue(self):
         if self.config_mgr.is_read_only():
@@ -529,7 +624,19 @@ class StagingQueueDialog(QDialog):
             QCoreApplication.processEvents()
 
             try:
-                self._execute_single_item(item)
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        self._execute_single_item(item)
+                        break
+                    except Exception as e_item:
+                        if "locked" in str(e_item).lower() and attempt < max_retries - 1:
+                            time.sleep(0.4 * (attempt + 1))
+                            if self.db_indexer:
+                                self.db_indexer.ensure_conn()
+                            continue
+                        raise e_item
+
                 executed_count += 1
                 executed_items.append(item)
             except Exception as e:
@@ -543,10 +650,8 @@ class StagingQueueDialog(QDialog):
             self.queue.remove_items_batch(executed_items)
 
         if errors:
-            QMessageBox.warning(
-                self, "Execução Concluída com Avisos",
-                f"{executed_count} alteração(ões) aplicada(s).\n\nErros:\n" + "\n".join(errors[:5])
-            )
+            dlg = QueueExecutionReportDialog(self, executed_count=executed_count, errors=errors)
+            dlg.exec()
         else:
             try:
                 # Mostrar mensagem não intrusiva de sucesso por 2 segundos na StatusBar principal
@@ -591,7 +696,19 @@ class StagingQueueDialog(QDialog):
                 QCoreApplication.processEvents()
 
             try:
-                self._execute_single_item(item)
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        self._execute_single_item(item)
+                        break
+                    except Exception as e_item:
+                        if "locked" in str(e_item).lower() and attempt < max_retries - 1:
+                            time.sleep(0.4 * (attempt + 1))
+                            if self.db_indexer:
+                                self.db_indexer.ensure_conn()
+                            continue
+                        raise e_item
+
                 executed_items.append(item)
                 executed_count += 1
             except Exception as e:
@@ -606,7 +723,8 @@ class StagingQueueDialog(QDialog):
             self.queue.remove_items_batch(executed_items)
 
         if errors:
-            QMessageBox.warning(self, "Aviso", f"{executed_count} item(ns) executado(s).\n\nErros:\n" + "\n".join(errors[:5]))
+            dlg = QueueExecutionReportDialog(self, executed_count=executed_count, errors=errors)
+            dlg.exec()
         self.executionCompleted.emit(executed_count)
 
     def _get_drive_file_id(self, item):
@@ -677,14 +795,22 @@ class StagingQueueDialog(QDialog):
         return fid
 
     def _execute_single_item(self, item):
+        if self.config_mgr.is_read_only():
+            raise RuntimeError("Operação bloqueada: o aplicativo está no Modo Somente Leitura.")
+
+        if self.config_mgr.is_sandbox():
+            target_check = item.path or item.new_value or item.old_value
+            if target_check and '_TestesBanco' not in target_check:
+                raise RuntimeError(f"Operação bloqueada pelo Modo Sandbox: '{target_check}' está fora do diretório de testes (_TestesBanco).")
+
         if self.db_indexer:
             self.db_indexer.ensure_conn()
-        drive_file_id = self._get_drive_file_id(item) if self.drive_service else None
 
         # 1. Processar alteração de tags / descrição
         if item.action_type in ('add_tags', 'remove_tags', 'set_description'):
             lookup_id = item.file_id or item.path
-            canon_id = os.path.normcase(os.path.normpath(lookup_id)) if lookup_id else None
+            from src.database.database import to_canonical_id
+            canon_id = to_canonical_id(lookup_id)
             
             # Buscar a descrição VIVA mais recente do banco SQLite no momento da execução (F11)
             current_live_desc = item.old_value or ''
@@ -725,41 +851,44 @@ class StagingQueueDialog(QDialog):
                 )
                 self.db_indexer.conn.commit()
 
-            # Atualizar na API do Google Drive se o serviço de drive estiver ativo
-            if self.drive_service and drive_file_id:
-                try:
-                    self.drive_service.files().update(
-                        fileId=drive_file_id, 
-                        body={'description': new_desc}, 
-                        supportsAllDrives=True
-                    ).execute()
-                    logging.info(f"✅ Google Drive atualizado com sucesso: {item.file_name} -> {new_desc}")
-                except Exception as e:
-                    logging.error(f"Erro na API Drive ao atualizar desc {drive_file_id}: {e}")
-                    raise e
+            # Atualizar na API do Google Drive se o serviço de drive estiver ativo (R6: resolvido somente quando necessário)
+            if self.drive_service:
+                drive_file_id = self._get_drive_file_id(item)
+                if drive_file_id:
+                    try:
+                        self.drive_service.files().update(
+                            fileId=drive_file_id, 
+                            body={'description': new_desc}, 
+                            supportsAllDrives=True
+                        ).execute()
+                        logging.info(f"✅ Google Drive atualizado com sucesso: {item.file_name} -> {new_desc}")
+                    except Exception as e:
+                        logging.error(f"Erro na API Drive ao atualizar desc {drive_file_id}: {e}")
+                        raise e
 
         elif item.action_type == 'rename':
             new_name = item.new_value
             old_path = item.path or item.old_value
             if not old_path or not os.path.exists(old_path):
-                logging.warning(f"Arquivo de origem para renomear não encontrado: {old_path}")
-                return
+                raise RuntimeError(f"Arquivo ou pasta de origem para renomear não encontrado: {old_path}")
 
             parent_dir = os.path.dirname(old_path)
-            new_path = os.path.normpath(os.path.join(parent_dir, new_name))
-            old_norm = os.path.normcase(os.path.normpath(old_path))
-            new_norm = os.path.normcase(new_path)
+            new_path_norm = os.path.normpath(os.path.join(parent_dir, new_name))
+            old_path_norm = os.path.normpath(old_path)
+            old_norm = os.path.normcase(old_path_norm)
+            new_norm = os.path.normcase(new_path_norm)
 
-            if old_norm != new_norm:
-                # Checagem estrita de colisão (F3): nunca sobrescrever arquivo existente
-                if os.path.exists(new_path):
+            # R5: Comparar com normpath preservando caixa para permitir renomear maiúsculas/minúsculas no disco
+            if old_path_norm != new_path_norm:
+                # Checagem estrita de colisão (F3): nunca sobrescrever outro arquivo existente
+                if old_norm != new_norm and os.path.exists(new_path_norm):
                     raise RuntimeError(f"Já existe um arquivo ou pasta com o nome '{new_name}' em '{parent_dir}'. Renomeação abortada para evitar perda de dados.")
 
                 from src.utils.utils import safe_move_file
-                success, err_msg = safe_move_file(old_path, new_path, retries=3, delay=0.5)
+                success, err_msg = safe_move_file(old_path, new_path_norm, retries=3, delay=0.5)
                 if not success:
                     raise RuntimeError(f"Erro ao renomear localmente: {err_msg}")
-                logging.info(f"✅ Arquivo/pasta local renomeado: {old_path} -> {new_path}")
+                logging.info(f"✅ Arquivo/pasta local renomeado: {old_path} -> {new_path_norm}")
 
             # Atualizar no banco SQLite com chave canônica normcase(normpath)
             if self.db_indexer:
@@ -773,7 +902,7 @@ class StagingQueueDialog(QDialog):
                 )
 
                 # Se for diretório, atualizar recursivamente os caminhos dos arquivos filhos com ESCAPE (F12)
-                if os.path.isdir(new_path) or os.path.isdir(old_path):
+                if os.path.isdir(new_path_norm) or os.path.isdir(old_path):
                     escaped_old = old_norm.replace('\\', '\\\\').replace('_', '\\_').replace('%', '\\%')
                     self.db_indexer.cursor.execute(
                         "SELECT file_id, path, parentId FROM files WHERE path LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\'",
@@ -801,8 +930,7 @@ class StagingQueueDialog(QDialog):
             src_path = item.old_value or item.path
             dst_path = item.new_value
             if not src_path or not os.path.exists(src_path):
-                logging.warning(f"Arquivo de origem para mover não encontrado: {src_path}")
-                return
+                raise RuntimeError(f"Arquivo ou pasta de origem para mover não encontrado: {src_path}")
 
             norm_src = os.path.normcase(os.path.normpath(src_path))
             norm_dst = os.path.normcase(os.path.normpath(dst_path))
@@ -891,7 +1019,7 @@ class StagingQueueDialog(QDialog):
                     raise RuntimeError(f"Não foi possível mover para a Lixeira do Windows: '{del_path}'. Exclusão abortada por segurança.")
                 logging.info(f"🗑️ Arquivo/pasta local movido para a Lixeira do Windows: '{del_path}'")
 
-            # 2. Apagar no banco de dados SQLite local (inclusive arquivos filhos se for pasta) com ESCAPE (F12)
+            # 2. Apagar no banco de dados SQLite local (inclusive arquivos filhos se for pasta e registros drive) com ESCAPE (F12, R11)
             if self.db_indexer:
                 norm_del = os.path.normcase(os.path.normpath(del_path))
                 escaped_del = norm_del.replace('\\', '\\\\').replace('_', '\\_').replace('%', '\\%')
@@ -917,34 +1045,19 @@ class StagingQueueDialog(QDialog):
                         (norm_p, os.path.basename(norm_p), norm_p, 'folder', 'local', '', os.path.dirname(norm_p), now, now)
                     )
                     self.db_indexer.conn.commit()
-                    if parent_drive_id:
-                        folder_metadata = {
-                            'name': os.path.basename(norm_p),
-                            'mimeType': 'application/vnd.google-apps.folder',
-                            'parents': [parent_drive_id]
-                        }
-                        res = self.drive_service.files().create(
-                            body=folder_metadata,
-                            fields='id',
-                            supportsAllDrives=True
-                        ).execute()
-                        new_folder_id = res.get('id')
-                        if not hasattr(self, '_drive_folder_id_cache'):
-                            self._drive_folder_id_cache = {}
-                        self._drive_folder_id_cache[norm_p.lower()] = new_folder_id
-                        if self.db_indexer and new_folder_id:
-                            self.db_indexer.cursor.execute(
-                                "UPDATE files SET file_id = ? WHERE path = ?",
-                                (new_folder_id, norm_p)
-                            )
-                            self.db_indexer.conn.commit()
 
         elif item.action_type == 'rotate_90':
-            if item.path and os.path.exists(item.path):
+            # R10: Rotação 100% não destrutiva na fila (modifica apenas a miniatura no cache local)
+            item_data = {'id': item.file_id or item.path, 'path': item.path, 'source': 'local'}
+            from src.ui import thumbnails
+            cache_path = thumbnails.ThumbnailCache.get_existing_thumbnail_cache_path(item_data)
+            if not cache_path or not os.path.exists(cache_path):
+                cache_path = thumbnails.ThumbnailManager.generate_local_thumbnail(item_data, size=(300, 300))
+            if cache_path and os.path.exists(cache_path):
                 from PIL import Image
-                with Image.open(item.path) as img:
-                    img = img.rotate(-90, expand=True)
-                    img.save(item.path)
+                with Image.open(cache_path) as img:
+                    rotated = img.rotate(-90, expand=True)
+                    rotated.save(cache_path, 'PNG')
 
     def _resolve_drive_folder_id_by_path(self, full_folder_path, create_if_missing=False):
         """

@@ -84,14 +84,14 @@ class AdvancedSettingsDialog(QDialog):
             updates = 0
             with open(file_path, 'r', encoding='utf-8-sig') as f:
                 reader = csv.DictReader(f)
-                self.indexer.ensure_conn()
+                from src.database.database import to_canonical_id
                 from src.database.search import SearchEngine
                 norm_engine = SearchEngine(None)
                 for row in reader:
                     file_id = row.get('file_id') or row.get('id') or row.get('path')
                     description = (row.get('description') or '').strip()
                     if file_id and description:
-                        canon_id = os.path.normcase(os.path.normpath(file_id))
+                        canon_id = to_canonical_id(file_id)
                         norm_desc = norm_engine.normalize_text(description)
                         # Restaura a descrição no banco local e no índice FTS5
                         self.indexer.cursor.execute(
