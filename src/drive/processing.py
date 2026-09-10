@@ -19,13 +19,13 @@ def start_drive_folder_processing(parent, service, indexer, force_dialog=False):
     if force_dialog:
         folder_dialog = DriveFolderDialog(service, parent)
         if folder_dialog.exec() != folder_dialog.DialogCode.Accepted:
-            return  # Usuário cancelou
+            return False  # Usuário cancelou
         folder_dialog.save_settings()
         selected_folders = folder_dialog.get_selected_folders()
         if not selected_folders:
             QMessageBox.warning(
                 parent, "Aviso", "Nenhuma pasta do Drive selecionada.")
-            return
+            return False
     else:
         settings = load_settings()
         selected_folders = settings.get('drive_folders', [])
@@ -33,13 +33,13 @@ def start_drive_folder_processing(parent, service, indexer, force_dialog=False):
         if not selected_folders:
             folder_dialog = DriveFolderDialog(service, parent)
             if folder_dialog.exec() != folder_dialog.DialogCode.Accepted:
-                return
+                return False
             folder_dialog.save_settings()
             selected_folders = folder_dialog.get_selected_folders()
             if not selected_folders:
                 QMessageBox.warning(
                     parent, "Aviso", "Nenhuma pasta do Drive selecionada.")
-                return
+                return False
         else:
             folder_names = []
             for folder_id in selected_folders:
@@ -50,7 +50,7 @@ def start_drive_folder_processing(parent, service, indexer, force_dialog=False):
                 else:
                     folder_names.append(f"Pasta: {folder_id[:15]}...")
 
-            print(f"📁 Usando configurações salvas: {', '.join(folder_names)}")
+            logging.info("Usando configuracoes salvas: %s", ', '.join(folder_names))
             logging.info(f"📁 Usando configurações salvas: {selected_folders}")
     thread = QThread()
     worker = DriveSync(service, db_name=indexer.db_name,
@@ -71,10 +71,19 @@ def start_drive_folder_processing(parent, service, indexer, force_dialog=False):
 
     def on_total_found(total):
         total_files_to_sync[0] = total
-        print(f"DEBUG Drive: Total de arquivos a sincronizar: {total:,}")
+        logging.debug("Total de arquivos a sincronizar: %s", f'{total:,}')
+        if hasattr(parent, 'update_drive_sync_progress'):
+            parent.update_drive_sync_progress(
+                0, f"Preparando {total:,} arquivos do Drive..."
+            )
 
     def update_progress(value, msg):
-        progress.setValue(value)
+        if value < 0:
+            progress.setRange(0, 0)
+        else:
+            if progress.maximum() == 0:
+                progress.setRange(0, 100)
+            progress.setValue(value)
         progress.setLabelText(msg)
         if value >= 100:
             progress.setValue(100)
@@ -82,28 +91,28 @@ def start_drive_folder_processing(parent, service, indexer, force_dialog=False):
 
     def update_status(msg):
         progress.setLabelText(msg)
-        print(f"DEBUG Status: {msg}")
+        logging.debug("Status da sincronizacao: %s", msg)
 
     cleanup_executed = [False]
 
     def cleanup_thread():
         if cleanup_executed[0]:
-            print("🔄 Cleanup já executado, ignorando...")
+            logging.debug("Cleanup da sincronizacao ja executado.")
             return
 
         cleanup_executed[0] = True
-        print("🧹 Iniciando cleanup robusto do thread...")
+        logging.debug("Iniciando cleanup do thread de sincronizacao.")
 
         try:
             if 'worker' in locals() and worker:
-                print("⏹️ Parando worker...")
+                logging.debug("Parando worker de sincronizacao.")
                 worker.terminate()
                 worker.is_running = False
 
             if 'progress' in locals() and progress:
                 try:
                     progress.close()
-                    print("✅ Progress dialog fechado")
+                    logging.debug("Dialogo de progresso fechado.")
                 except:
                     pass
 
@@ -111,34 +120,36 @@ def start_drive_folder_processing(parent, service, indexer, force_dialog=False):
                 worker.is_running = False
 
             if 'thread' in locals() and thread and thread.isRunning():
-                print("⏳ Aguardando thread finalizar de forma cooperativa...")
+                logging.debug("Aguardando thread finalizar de forma cooperativa.")
                 thread.quit()
                 if not thread.wait(5000):
-                    print("⚠️ Thread ainda em processamento, aguardando conclusão...")
+                    logging.warning("Thread de sincronizacao demorou para finalizar.")
                     thread.wait(2000)
                 else:
-                    print("✅ Thread finalizada normalmente")
+                    logging.debug("Thread de sincronizacao finalizada.")
 
             thread_still_running = ('thread' in locals() and thread and thread.isRunning())
             if not thread_still_running:
                 if 'worker' in locals() and worker:
                     try:
                         worker.deleteLater()
-                        print("✅ Worker removido")
+                        logging.debug("Worker de sincronizacao liberado.")
                     except:
                         pass
                 if 'thread' in locals() and thread:
                     try:
                         thread.deleteLater()
-                        print("✅ Thread removida")
+                        logging.debug("Thread de sincronizacao liberada.")
                     except:
                         pass
             else:
-                print("⚠️ Thread ainda ativa em segundo plano; adiando deleteLater para evitar crash do Qt.")
+                logging.warning(
+                    "Thread de sincronizacao ainda ativa; deleteLater adiado."
+                )
 
-            print("✅ Cleanup completo concluído")
+            logging.debug("Cleanup da sincronizacao concluido.")
         except Exception as e:
-            print(f"❌ Erro no cleanup: {e}")
+            logging.exception("Erro no cleanup da sincronizacao: %s", e)
             try:
                 if 'progress' in locals() and progress:
                     progress.close()
@@ -148,47 +159,55 @@ def start_drive_folder_processing(parent, service, indexer, force_dialog=False):
     def on_sync_finished():
         import datetime
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-        print(f"✅ [{timestamp}] Sincronização Drive FINALIZADA com sucesso!")
+        logging.info("[%s] Sincronizacao Drive finalizada.", timestamp)
 
         try:
             if hasattr(parent, 'on_drive_sync_finished'):
                 parent.on_drive_sync_finished()
         except Exception as e:
-            print(f"⚠️ Erro ao notificar UI sobre término: {e}")
+            logging.warning("Erro ao notificar termino da sincronizacao: %s", e)
 
         cleanup_thread()
 
     def on_sync_failed(error):
         import datetime
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-        print(f"❌ [{timestamp}] Sincronização FALHOU: {error}")
+        logging.error("[%s] Sincronizacao Drive falhou: %s", timestamp, error)
 
         try:
             if hasattr(parent, 'on_drive_sync_failed'):
                 parent.on_drive_sync_failed(str(error))
         except Exception as e:
-            print(f"⚠️ Erro ao notificar UI sobre falha: {e}")
+            logging.warning("Erro ao notificar falha da sincronizacao: %s", e)
 
         cleanup_thread()
 
     def on_canceled():
         import datetime
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-        print(f"🛑 [{timestamp}] Cancelamento SOLICITADO pelo usuário")
+        logging.info("[%s] Cancelamento da sincronizacao solicitado.", timestamp)
 
         try:
             if hasattr(parent, 'drive_sync_running'):
                 parent.drive_sync_running = False
-                print("✅ Flag drive_sync_running liberada após cancelamento")
+                logging.debug("Flag drive_sync_running liberada apos cancelamento.")
+            if hasattr(parent, 'progress_bar'):
+                parent.progress_bar.setVisible(False)
+            if hasattr(parent, 'status_bar'):
+                parent.status_bar.showMessage(
+                    "Sincronização do Drive cancelada.", 4000
+                )
+            if hasattr(parent, '_run_deferred_incremental_sync'):
+                parent._run_deferred_incremental_sync()
         except Exception as e:
-            print(f"⚠️ Erro ao liberar flag após cancelamento: {e}")
+            logging.warning("Erro ao liberar estado apos cancelamento: %s", e)
 
         cleanup_thread()
 
     def emergency_cleanup():
         import datetime
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-        print(f"🚨 [{timestamp}] EMERGENCY CLEANUP - App fechando!")
+        logging.info("[%s] Cleanup de emergencia da sincronizacao.", timestamp)
         try:
             if 'worker' in locals() and worker:
                 worker.is_running = False
@@ -203,14 +222,13 @@ def start_drive_folder_processing(parent, service, indexer, force_dialog=False):
 
     worker.total_files_found.connect(on_total_found)
     worker.progress_update.connect(update_progress)
+    if hasattr(parent, 'update_drive_sync_progress'):
+        worker.progress_update.connect(parent.update_drive_sync_progress)
     worker.update_status.connect(update_status)
+    if hasattr(parent, 'update_drive_status_message'):
+        worker.update_status.connect(parent.update_drive_status_message)
     worker.sync_finished.connect(on_sync_finished)
     worker.sync_failed.connect(on_sync_failed)
-
-    if hasattr(parent, 'on_drive_sync_finished'):
-        worker.sync_finished.connect(parent.on_drive_sync_finished)
-    if hasattr(parent, 'on_drive_sync_failed'):
-        worker.sync_failed.connect(parent.on_drive_sync_failed)
 
     progress.canceled.connect(on_canceled)
     thread.started.connect(worker.run)
@@ -220,5 +238,13 @@ def start_drive_folder_processing(parent, service, indexer, force_dialog=False):
     import datetime
     timestamp = datetime.datetime.now().strftime("%H:%M:%S")
     folder_info = f"{len(selected_folders)} pasta(s) selecionada(s)"
-    print(f"🚀 [{timestamp}] Thread INICIADA para Drive sync de {folder_info}")
+    logging.info(
+        "[%s] Thread de sincronizacao iniciada para %s.",
+        timestamp, folder_info,
+    )
+    if hasattr(parent, 'update_drive_sync_progress'):
+        parent.update_drive_sync_progress(
+            -1, "Preparando sincronização completa do Google Drive..."
+        )
     thread.start()
+    return True

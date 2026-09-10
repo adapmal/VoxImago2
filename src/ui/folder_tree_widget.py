@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QFileSystemModel, QDragEnterEvent, QDragMoveEvent, QDropEvent, QCursor, QColor, QPen, QFont
 from PyQt6.QtCore import pyqtSignal, Qt, QDir, QUrl, QModelIndex
 from src.utils.config_manager import ConfigManager
+from src.utils.path_validation import validate_path_component
 
 
 class FolderFileSystemModel(QFileSystemModel):
@@ -216,21 +217,11 @@ class FolderTreeWidget(QWidget):
             if os.path.exists(sb_path):
                 return sb_path
 
-        scan_folders = self.config_mgr.get('scan_folders', [])
-        if scan_folders:
-            for sf in scan_folders:
-                if os.path.exists(sf):
-                    return sf
+        resolved = self.config_mgr.get_resolved_scan_paths(persist=True)
+        if resolved:
+            return resolved[0]
 
-        possible_roots = [
-            r"L:\Drives Compartilhados\_TestesBanco",
-            r"L:\Drives Compartilhados\Banco de Imagens",
-            r"L:\Banco de Imagens"
-        ]
-        for p in possible_roots:
-            if os.path.exists(p):
-                return p
-        return r"L:\Drives Compartilhados"
+        return os.path.dirname(self.config_mgr.get_sandbox_path())
 
     def _init_ui(self):
         layout = QVBoxLayout(self)
@@ -350,6 +341,14 @@ class FolderTreeWidget(QWidget):
                 win.status_bar.clearMessage()
             return
 
+        maintenance_acquired = False
+        if hasattr(win, 'begin_maintenance_operation'):
+            if not win.begin_maintenance_operation():
+                if hasattr(win, 'status_bar') and win.status_bar:
+                    win.status_bar.clearMessage()
+                return
+            maintenance_acquired = True
+
         try:
             drive_id = self.config_mgr.get_current_drive_id()
             kwargs = {'supportsAllDrives': True, 'includeItemsFromAllDrives': True}
@@ -362,7 +361,7 @@ class FolderTreeWidget(QWidget):
             while True:
                 res = service.files().list(
                     q=f"'{target_folder_id}' in parents and trashed = false and mimeType != 'application/vnd.google-apps.folder'",
-                    fields='nextPageToken, files(id, name, description, webViewLink)',
+                    fields='nextPageToken, files(id, name, description, webViewLink, size)',
                     pageSize=1000, pageToken=page_token, **kwargs
                 ).execute()
                 drive_files.extend(res.get('files', []))
@@ -371,6 +370,7 @@ class FolderTreeWidget(QWidget):
                     break
 
             indexer = getattr(win, 'indexer', None)
+            snapshot_exported = True
             if indexer:
                 indexer.ensure_conn()
                 from src.database.search import SearchEngine
@@ -382,17 +382,23 @@ class FolderTreeWidget(QWidget):
                     norm_desc = norm_engine.normalize_text(desc)
                     link = df.get('webViewLink') or f"https://drive.google.com/file/d/{df['id']}/view?usp=drivesdk"
                     local_p = os.path.normpath(os.path.join(folder_path, fname)).lower()
+                    drive_size = int(df.get('size') or 0)
+                    if drive_size <= 0:
+                        continue
 
                     indexer.cursor.execute(
-                        "UPDATE files SET description = ?, webContentLink = ? WHERE LOWER(path) = ? OR LOWER(file_id) = ?",
-                        (desc, link, local_p, local_p)
+                        "UPDATE files SET description = ?, webContentLink = ? "
+                        "WHERE source = 'local' AND size = ? "
+                        "AND (LOWER(path) = ? OR LOWER(file_id) = ?)",
+                        (desc, link, drive_size, local_p, local_p)
                     )
-                    indexer.cursor.execute(
-                        "UPDATE search_index SET description = ?, normalized_description = ? WHERE LOWER(file_id) = ?",
-                        (desc, norm_desc, local_p)
-                    )
+                    if indexer.cursor.rowcount == 1:
+                        indexer.cursor.execute(
+                            "UPDATE search_index SET description = ?, normalized_description = ? WHERE LOWER(file_id) = ?",
+                            (desc, norm_desc, local_p)
+                        )
                 indexer.conn.commit()
-                indexer.export_to_shared_cache()
+                snapshot_exported = indexer.export_to_shared_cache()
 
             if hasattr(win, '_force_refresh_after_sync'):
                 win._force_refresh_after_sync()
@@ -408,10 +414,20 @@ class FolderTreeWidget(QWidget):
                     list_update.load_next_batch(win)
 
             if hasattr(win, 'status_bar') and win.status_bar:
-                win.status_bar.showMessage(f"✅ {len(drive_files)} arquivos da pasta '{os.path.basename(folder_path)}' sincronizados com o Drive!", 4000)
+                if snapshot_exported:
+                    win.status_bar.showMessage(f"✅ {len(drive_files)} arquivos da pasta '{os.path.basename(folder_path)}' sincronizados com o Drive!", 4000)
+                else:
+                    win.status_bar.showMessage(
+                        "⚠️ Tags sincronizadas, mas o snapshot não foi "
+                        "publicado. Verifique a saúde do banco.",
+                        10000,
+                    )
 
         except Exception as e:
             QMessageBox.critical(self, "Erro na Sincronização", f"Ocorreu um erro ao sincronizar com o Drive:\n{e}")
+        finally:
+            if maintenance_acquired and hasattr(win, 'end_maintenance_operation'):
+                win.end_maintenance_operation()
 
     def _refresh_tree(self):
         self.model.clear_subdirs_cache()
@@ -444,11 +460,11 @@ class FolderTreeWidget(QWidget):
             return
 
         folder_name = folder_name.strip()
-        invalid_chars = ['\\', '/', ':', '*', '?', '"', '<', '>', '|']
-        if any(c in folder_name for c in invalid_chars):
+        valid, error = validate_path_component(folder_name, 'nome da pasta')
+        if not valid:
             QMessageBox.warning(
                 self, "Nome Inválido",
-                "O nome da pasta não pode conter os seguintes caracteres:\n\\ / : * ? \" < > |\n"
+                error
             )
             return
 

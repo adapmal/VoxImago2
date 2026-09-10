@@ -7,15 +7,6 @@ from PyQt6.QtCore import QObject, pyqtSignal
 from src.database.database import FileIndexer
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] %(levelname)s: %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-    filename='app.log',
-    filemode='a'
-)
-
-
 class LocalScan(QObject):
 
     update_status_signal = pyqtSignal(str)
@@ -26,6 +17,7 @@ class LocalScan(QObject):
     def terminate(self):
         logging.info("🚫 Cancelamento solicitado - parando escaneamento local")
         self.is_running = False
+        self.cancelled = True
         self.update_status_signal.emit("Cancelando escaneamento...")
 
     def _count_total_files(self):
@@ -58,8 +50,27 @@ class LocalScan(QObject):
         self.is_running = True
         self.total_processed = 0
         self.indexer = None
+        self.failure_message = None
+        self.cancelled = False
 
     def run(self):
+        try:
+            self._run_impl()
+        except Exception as exc:
+            self.failure_message = str(exc)
+            logging.exception('Falha inesperada durante a varredura local.')
+        finally:
+            if self.indexer:
+                try:
+                    self.indexer.close()
+                except Exception:
+                    logging.debug(
+                        'Falha ao fechar o banco da varredura local.',
+                        exc_info=True,
+                    )
+            self.finished.emit()
+
+    def _run_impl(self):
         logging.info(f"🟢 Iniciando escaneamento local: {self.scan_path}")
         start_time = time.time()
 
@@ -203,14 +214,6 @@ class LocalScan(QObject):
         self.progress_update.emit(total_processed)
         self.update_status_signal.emit(
             f"Concluído: {total_processed} itens processados.")
-
-        if self.indexer:
-            try:
-                self.indexer.close()
-            except Exception:
-                pass
-
-        self.finished.emit()
 
     def _flush_batch(self, items_batch):
         if not items_batch:

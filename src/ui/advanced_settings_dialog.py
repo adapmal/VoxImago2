@@ -13,7 +13,7 @@ class AdvancedSettingsDialog(QDialog):
         self.service = service
         self.config_mgr = ConfigManager()
         self.setWindowTitle("Sistema / Avançado")
-        self.setFixedSize(400, 200)
+        self.setMinimumSize(480, 260)
         
         self.layout = QVBoxLayout(self)
         
@@ -39,8 +39,15 @@ class AdvancedSettingsDialog(QDialog):
         self.restore_btn = QPushButton("Restauração Cega de Tags (via CSV)")
         self.restore_btn.setStyleSheet("background-color: #DC3545; color: white; font-weight: bold; padding: 10px;")
         self.restore_btn.clicked.connect(self._run_blind_restore)
+
+        self.health_btn = QPushButton("Saúde e reparo do banco")
+        self.health_btn.setStyleSheet(
+            "background-color: #1565C0; color: white; font-weight: bold; padding: 10px;"
+        )
+        self.health_btn.clicked.connect(self._open_database_health)
         
         self.settings_layout.addWidget(self.info_label)
+        self.settings_layout.addWidget(self.health_btn)
         self.settings_layout.addWidget(self.restore_btn)
         
         self.main_widget = QWidget()
@@ -112,3 +119,8 @@ class AdvancedSettingsDialog(QDialog):
             self.accept()
         except Exception as e:
             QMessageBox.critical(self, "Erro", f"Falha na restauração: {e}")
+
+    def _open_database_health(self):
+        from src.ui.database_health_dialog import DatabaseHealthDialog
+        dialog = DatabaseHealthDialog(self.parent(), indexer=self.indexer)
+        dialog.exec()

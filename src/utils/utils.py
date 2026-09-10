@@ -8,24 +8,29 @@
 # - Outras funções auxiliares genéricas usadas em todo o projeto
 
 import os
-import json
 from src.database.search import SearchEngine
-
-SETTINGS_FILE = 'config/settings.json'
 
 
 def resolve_shared_folder_path(possible_names, base_paths=None, drive_letters=None):
+    from src.utils.portable_paths import (
+        SHARED_DRIVE_DIR_NAMES,
+        available_drive_letters,
+        discover_shared_folder,
+    )
     if base_paths is None:
-        base_paths = ["Drives compartilhados", "Shared drives"]
+        base_paths = list(SHARED_DRIVE_DIR_NAMES)
     if drive_letters is None:
-        drive_letters = ["L:"]
-    for drive in drive_letters:
-        for base in base_paths:
-            for name in possible_names:
-                path = os.path.join(drive, base, name)
-                if os.path.exists(path):
-                    return path
-    return None
+        try:
+            from src.utils.config_manager import ConfigManager
+            drive_letters = ConfigManager().get_allowed_drive_letters()
+        except Exception:
+            drive_letters = available_drive_letters()
+        drive_letters = drive_letters or ["L:"]
+    return discover_shared_folder(
+        possible_names,
+        drive_letters=drive_letters,
+        base_names=base_paths,
+    )
 
 
 def filter_existing_files(file_records, path_key='caminho'):
@@ -38,15 +43,18 @@ def get_existing_files(file_records):
 
 
 def load_settings():
-    if os.path.exists(SETTINGS_FILE):
-        with open(SETTINGS_FILE, 'r') as f:
-            return json.load(f)
-    return {}
+    from src.utils.config_manager import ConfigManager, _SETTINGS_LOCK
+    manager = ConfigManager()
+    with _SETTINGS_LOCK:
+        return dict(manager.settings)
 
 
 def save_settings(settings):
-    with open(SETTINGS_FILE, 'w') as f:
-        json.dump(settings, f, indent=4)
+    from src.utils.config_manager import ConfigManager, _SETTINGS_LOCK
+    manager = ConfigManager()
+    with _SETTINGS_LOCK:
+        manager.settings.update(dict(settings or {}))
+        manager.save_settings()
 
 
 def format_size(size_in_bytes):
@@ -58,9 +66,6 @@ def format_size(size_in_bytes):
         return f"{size_in_bytes / 1024**2:.2f} MB"
     else:
         return f"{size_in_bytes / 1024**3:.2f} GB"
-
-    return matches
-
 
 def extrair_ano_banco_imagens(path):
     partes = os.path.normpath(path).split(os.sep)
@@ -230,18 +235,25 @@ def resolve_drive_folder_id_by_path(service, full_folder_path, drive_id=None, cr
         res = service.files().list(**kwargs).execute()
         folders = res.get('files', [])
 
+        # O Drive permite pastas irmas com o mesmo nome. Nesse caso nao existe
+        # base segura para escolher uma delas automaticamente.
+        if len(folders) > 1:
+            return None
+
         if not folders:
             # Busca normalizada se nome tiver pequenas variações
             q_all = f"'{current_parent_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
             res_all = service.files().list(q=q_all, supportsAllDrives=True, includeItemsFromAllDrives=True, fields='files(id, name)').execute()
             from src.database.search import SearchEngine
             norm_seg = SearchEngine(None).normalize_text(seg)
-            for cand in res_all.get('files', []):
-                if SearchEngine(None).normalize_text(cand.get('name', '')) == norm_seg:
-                    folders = [cand]
-                    break
+            folders = [
+                cand for cand in res_all.get('files', [])
+                if SearchEngine(None).normalize_text(cand.get('name', '')) == norm_seg
+            ]
+            if len(folders) > 1:
+                return None
 
-        if folders:
+        if len(folders) == 1:
             current_parent_id = folders[0]['id']
         elif create_if_missing:
             try:

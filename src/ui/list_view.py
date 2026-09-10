@@ -124,12 +124,13 @@ class FileListView(QListView):
             has_shift = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
             has_ctrl = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
 
-            # Clicar em área vazia desmarca todos os itens
+            # A area cinza funciona como fundo, nao como comando para abandonar
+            # o contexto atual. Preservar selecao e painel de detalhes evita
+            # perder o fio da meada durante a navegacao.
             if not index.isValid():
                 self._pressed_selected_index = None
-                self._anchor_index = None
                 self.drag_start_position = None
-                self.clearSelection()
+                event.accept()
                 return
 
             # Se clicou sobre um item já selecionado sem Ctrl/Shift, preserva a seleção para arrastar em lote

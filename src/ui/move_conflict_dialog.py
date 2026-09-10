@@ -9,9 +9,10 @@ Permite ao usuário decidir o que fazer quando arquivos com o mesmo nome já exi
 import os
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QRadioButton, 
-    QLineEdit, QPushButton, QListWidget, QButtonGroup, QFrame
+    QLineEdit, QPushButton, QListWidget, QButtonGroup, QFrame, QMessageBox
 )
 from PyQt6.QtCore import Qt
+from src.utils.path_validation import validate_path_component
 
 
 class MoveConflictDialog(QDialog):
@@ -130,6 +131,11 @@ class MoveConflictDialog(QDialog):
         if self.radio_subfolder.isChecked():
             self.chosen_action = "create_subfolder"
             self.subfolder_name = self.txt_subfolder.text().strip() or "mesmonome"
+            valid, error = validate_path_component(self.subfolder_name, 'nome da subpasta')
+            if not valid:
+                QMessageBox.warning(self, "Nome Inválido", error)
+                self.txt_subfolder.setFocus()
+                return
         elif self.radio_rename.isChecked():
             self.chosen_action = "rename"
         elif self.radio_skip.isChecked():

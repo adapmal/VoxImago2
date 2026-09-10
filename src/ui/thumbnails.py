@@ -28,6 +28,54 @@ except ImportError:
 
 THUMBNAIL_CACHE_DIR = 'assets/thumbnail_cache'
 _media_lock = threading.Lock()
+_thumbnail_failure_lock = threading.Lock()
+_thumbnail_failure_counts = {}
+
+
+def _rotation_degrees(file_item):
+    try:
+        value = int((file_item or {}).get('thumbnailRotation', 0) or 0) % 360
+    except (TypeError, ValueError):
+        value = 0
+    return value if value in (0, 90, 180, 270) else 0
+
+
+def _apply_rotation_override(cache_path, file_item):
+    """Aplica uma unica vez o override ao arquivo novo de uma chave rotacionada."""
+    rotation = _rotation_degrees(file_item)
+    if not cache_path or not rotation:
+        return cache_path
+    try:
+        from PIL import Image
+        with Image.open(cache_path) as image:
+            rotated = image.rotate(-rotation, expand=True)
+            if os.path.splitext(cache_path)[1].lower() in ('.jpg', '.jpeg'):
+                if rotated.mode not in ('RGB', 'L'):
+                    rotated = rotated.convert('RGB')
+                rotated.save(cache_path, 'JPEG')
+            else:
+                rotated.save(cache_path, 'PNG')
+    except Exception as exc:
+        _record_thumbnail_failure(
+            'rotacao', f'[THUMB][ROTACAO][ERRO] {cache_path}: {exc}'
+        )
+    return cache_path
+
+
+def _record_thumbnail_failure(category, message, *args):
+    """Mantem o detalhe no DEBUG e resume repeticoes no log normal."""
+    logging.debug(message, *args)
+    with _thumbnail_failure_lock:
+        count = _thumbnail_failure_counts.get(category, 0) + 1
+        _thumbnail_failure_counts[category] = count
+
+    if count in (1, 10, 100, 1000) or count % 10000 == 0:
+        logging.warning(
+            "Falhas de miniatura (%s): %d nesta execucao. "
+            "Use VOXIMAGO_LOG_LEVEL=DEBUG para detalhes por arquivo.",
+            category,
+            count,
+        )
 
 
 
@@ -63,7 +111,10 @@ class ThumbnailWorker(QObject):
             if response.status_code == 200:
                 with open(thumbnail_path, 'wb') as f:
                     f.write(response.content)
-                self.finished.emit(response.content, thumbnail_path)
+                _apply_rotation_override(thumbnail_path, self.file_item)
+                with open(thumbnail_path, 'rb') as f:
+                    rendered_content = f.read()
+                self.finished.emit(rendered_content, thumbnail_path)
             else:
                 self.finished.emit(b'', '')
         except Exception:
@@ -254,22 +305,25 @@ class ThumbnailManager:
             raw_result = ThumbnailManager.generate_local_raw_thumbnail(
                 file_item, size[0])
             if raw_result:
-                return raw_result
+                return _apply_rotation_override(raw_result, file_item)
 
         if extension in image_extensions:
             image_result = ThumbnailManager.generate_local_image_thumbnail(
                 file_item, size[0])
             if image_result:
-                return image_result
+                return _apply_rotation_override(image_result, file_item)
 
         if extension in pdf_extensions:
             pdf_result = ThumbnailManager.generate_local_pdf_thumbnail(
                 file_item, size[0])
             if pdf_result:
-                return pdf_result
+                return _apply_rotation_override(pdf_result, file_item)
 
         if extension in video_extensions:
-            return ThumbnailManager.generate_local_video_thumbnail(file_item, size[0])
+            video_result = ThumbnailManager.generate_local_video_thumbnail(
+                file_item, size[0]
+            )
+            return _apply_rotation_override(video_result, file_item)
 
         return None
 
@@ -287,7 +341,7 @@ class ThumbnailManager:
             if ThumbnailCache.is_thumbnail_cached(file_item):
                 return ThumbnailCache.get_existing_thumbnail_cache_path(file_item)
 
-            logging.info(
+            logging.debug(
                 f"[THUMB][VIDEO] Tentando gerar thumbnail para: {local_path}")
             if os.path.isdir(local_path):
                 logging.debug(
@@ -321,26 +375,30 @@ class ThumbnailManager:
                     elif hasattr(cv2, 'utils') and hasattr(cv2.utils, 'logging') and hasattr(cv2.utils.logging, 'setLogLevel'):
                         cv2.utils.logging.setLogLevel(0)
                 except Exception as log_e:
-                    logging.warning(
+                    _record_thumbnail_failure(
+                        "video-opencv-logging",
                         f"[THUMB][VIDEO][WARN] Não foi possível silenciar logs do OpenCV: {log_e}")
             except Exception as e:
-                logging.error(
+                _record_thumbnail_failure(
+                    "video-dependencias",
                     f"[THUMB][VIDEO][ERRO] Falha ao importar OpenCV/numpy: {e}")
                 return None
             with _media_lock:
                 cap = cv2.VideoCapture(local_path)
                 if not cap.isOpened():
-                    logging.warning(
+                    _record_thumbnail_failure(
+                        "video-abertura",
                         f"[THUMB][VIDEO][ERRO] Não foi possível abrir o vídeo: {local_path}")
                     return None
                 ret, frame = cap.read()
                 if not ret:
-                    logging.info(
+                    logging.debug(
                         f"[THUMB][VIDEO][WARN] Frame inicial não lido, tentando 500ms...")
                     cap.set(cv2.CAP_PROP_POS_MSEC, 500)
                     ret, frame = cap.read()
                     if not ret:
-                        logging.warning(
+                        _record_thumbnail_failure(
+                            "video-frame",
                             f"[THUMB][VIDEO][ERRO] Não foi possível ler frame do vídeo: {local_path}")
                         cap.release()
                         return None
@@ -351,7 +409,8 @@ class ThumbnailManager:
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     frame_rgb = np.ascontiguousarray(frame_rgb)
                 except Exception as e:
-                    logging.error(
+                    _record_thumbnail_failure(
+                        "video-conversao",
                         f"[THUMB][VIDEO][ERRO] Falha ao converter frame para RGB: {e}")
                     return None
                 h, w, ch = frame_rgb.shape
@@ -360,7 +419,8 @@ class ThumbnailManager:
                     img = QImage(frame_rgb.data, w, h, bytes_per_line,
                                  QImage.Format.Format_RGB888).copy()
                 except Exception as e:
-                    logging.error(
+                    _record_thumbnail_failure(
+                        "video-qimage",
                         f"[THUMB][VIDEO][ERRO] Falha ao criar QImage: {e}")
                     return None
 
@@ -371,14 +431,15 @@ class ThumbnailManager:
             ThumbnailCache.ensure_thumbnail_cache_dir()
             ok = img.save(cache_path, 'PNG')
             if ok:
-                logging.info(
+                logging.debug(
                     f"[THUMB][VIDEO] Thumbnail salva em: {cache_path}")
             else:
-                logging.error(
+                _record_thumbnail_failure(
+                    "video-gravacao",
                     f"[THUMB][VIDEO][ERRO] Falha ao salvar thumbnail em: {cache_path}")
             return cache_path if ok else None
         except Exception as e:
-            logging.error(f'[THUMB][VIDEO][ERRO] {e}')
+            _record_thumbnail_failure("video", f'[THUMB][VIDEO][ERRO] {e}')
             return None
 
     def generate_local_pdf_thumbnail(file_item, base_size=256):
@@ -413,7 +474,7 @@ class ThumbnailManager:
             img.save(cache_path, 'PNG')
             return cache_path
         except Exception as e:
-            logging.error(f'[THUMB][PDF][ERRO] {e}')
+            _record_thumbnail_failure("pdf", f'[THUMB][PDF][ERRO] {e}')
             return None
 
     def generate_local_image_thumbnail(file_item, base_size=256):
@@ -432,6 +493,26 @@ class ThumbnailManager:
                 if not guessed or not guessed.startswith('image/'):
                     return None
 
+            # Pillow corrige EXIF de camera antes de redimensionar. QImage puro
+            # nem sempre aplica essa orientacao de forma consistente entre
+            # plugins/formatos.
+            try:
+                from PIL import Image, ImageOps
+                with _media_lock:
+                    with Image.open(local_path) as pil_source:
+                        pil_img = ImageOps.exif_transpose(pil_source)
+                        if pil_img.mode not in ('RGB', 'RGBA'):
+                            pil_img = pil_img.convert('RGBA' if 'A' in pil_img.getbands() else 'RGB')
+                        pil_img.thumbnail((base_size, base_size), Image.LANCZOS)
+                        cache_path = ThumbnailCache.get_thumbnail_cache_path(
+                            file_item, 'png'
+                        )
+                        ThumbnailCache.ensure_thumbnail_cache_dir()
+                        pil_img.save(cache_path, 'PNG')
+                        return cache_path
+            except Exception:
+                pass
+
             img = QImage(local_path)
             if img.isNull():
                 _, ext = os.path.splitext(local_path)
@@ -449,7 +530,8 @@ class ThumbnailManager:
                         img = QImage(arr.data, w, h, bytes_per_line,
                                      QImage.Format.Format_RGB888).copy()
                     except Exception as heic_e:
-                        logging.error(
+                        _record_thumbnail_failure(
+                            "imagem-heic",
                             f'[THUMB][IMG][HEIC] Falha ao abrir HEIC/HEIF: {heic_e}')
                         return None
                 else:
@@ -465,7 +547,7 @@ class ThumbnailManager:
                 return None
             return cache_path
         except Exception as e:
-            logging.error(f'[THUMB][IMG][ERRO] {e}')
+            _record_thumbnail_failure("imagem", f'[THUMB][IMG][ERRO] {e}')
             return None
 
     def generate_local_raw_thumbnail(file_item, base_size=256):
@@ -478,13 +560,15 @@ class ThumbnailManager:
                 if file_item.get('orig_path') and os.path.exists(file_item['orig_path']):
                     local_path = file_item['orig_path']
                 else:
-                    logging.error(
+                    _record_thumbnail_failure(
+                        "raw-caminho",
                         f'[THUMB][RAW][ERRO] Caminho inválido ou arquivo não existe: {local_path}')
                     return None
             raw_exts = ['.raw', '.arw', '.cr2', '.nef',
                         '.dng', '.raf', '.orf', '.srw', '.rw2', '.pef']
             if not any(local_path.lower().endswith(ext) for ext in raw_exts):
-                logging.error(
+                _record_thumbnail_failure(
+                    "raw-extensao",
                     f'[THUMB][RAW][ERRO] Extensão não suportada para RAW: {local_path}')
                 return None
             try:
@@ -512,7 +596,10 @@ class ThumbnailManager:
                             pil_img = Image.open(local_path)
                             pil_img = pil_img.convert('RGB')
                         except Exception as pil_err:
-                            logging.error(f"[THUMB][RAW][ERRO] Falha em todos os metodos (rawpy e Pillow) para {local_path}: {pil_err}")
+                            _record_thumbnail_failure(
+                                "raw-decodificacao",
+                                f"[THUMB][RAW][ERRO] Falha em todos os metodos (rawpy e Pillow) para {local_path}: {pil_err}",
+                            )
                             return None
 
                     if pil_img is None:
@@ -522,12 +609,14 @@ class ThumbnailManager:
                         pil_img.thumbnail((base_size, base_size), Image.LANCZOS)
                         img = np.array(pil_img)
                     except Exception as resize_e:
-                        logging.error(
+                        _record_thumbnail_failure(
+                            "raw-redimensionamento",
                             f'[THUMB][RAW][ERRO] Falha ao redimensionar thumb: {resize_e} | arquivo: {local_path}')
                         return None
 
                     if img is None or img.size == 0 or len(img.shape) != 3:
-                        logging.error(
+                        _record_thumbnail_failure(
+                            "raw-imagem-invalida",
                             f'[THUMB][RAW][ERRO] Imagem extraída do RAW/Pillow é inválida. | arquivo: {local_path}')
                         return None
 
@@ -538,7 +627,8 @@ class ThumbnailManager:
                         qimg = QImage(img.data, w, h, bytes_per_line,
                                       QImage.Format.Format_RGB888).copy()
                     except Exception as qimg_e:
-                        logging.error(
+                        _record_thumbnail_failure(
+                            "raw-qimage",
                             f'[THUMB][RAW][ERRO] Falha ao criar QImage: {qimg_e} | arquivo: {local_path}')
                         return None
 
@@ -546,16 +636,19 @@ class ThumbnailManager:
                         file_item, 'png')
                     ThumbnailCache.ensure_thumbnail_cache_dir()
                     if not qimg.save(cache_path, 'PNG'):
-                        logging.error(
+                        _record_thumbnail_failure(
+                            "raw-gravacao",
                             f'[THUMB][RAW][ERRO] Falha ao salvar thumbnail PNG: {cache_path} | arquivo: {local_path}')
                         return None
                     return cache_path
             except Exception as raw_e:
-                logging.error(
+                _record_thumbnail_failure(
+                    "raw-leitura",
                     f'[THUMB][RAW][ERRO] Falha ao ler arquivo RAW: {raw_e} | arquivo: {local_path}')
                 return None
         except Exception as e:
-            logging.error(
+            _record_thumbnail_failure(
+                "raw",
                 f'[THUMB][RAW][ERRO] {e} | arquivo: {file_item.get("path") if file_item else None}')
             return None
 
@@ -607,16 +700,20 @@ class ThumbnailManager:
 class ThumbnailCache:
     @staticmethod
     def get_thumbnail_cache_key(file_item):
+        rotation = _rotation_degrees(file_item)
         if file_item.get('source') == 'local':
             path = file_item.get('physical_path') or file_item.get('orig_path') or file_item.get('path') or ''
             mtime = str(file_item.get('modifiedTime', ''))
             size = str(file_item.get('size', ''))
-            key = hashlib.sha1(f"{path}|{mtime}|{size}".encode()).hexdigest()
+            key = hashlib.sha1(
+                f"{path}|{mtime}|{size}|rotation={rotation}".encode()
+            ).hexdigest()
         else:
             file_id = file_item.get('id', '')
             modified_time = str(file_item.get('modifiedTime', ''))
             key = hashlib.sha1(
-                f"{file_id}|{modified_time}".encode()).hexdigest()
+                f"{file_id}|{modified_time}|rotation={rotation}".encode()
+            ).hexdigest()
         return key
 
     @staticmethod

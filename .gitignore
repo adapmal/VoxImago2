@@ -123,6 +123,7 @@ Icon
 # 📊 LOGS E TEMPORÁRIOS
 # =================================
 *.log
+logs/
 *.tmp
 *.temp
 temp/

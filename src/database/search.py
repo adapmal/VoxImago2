@@ -269,7 +269,7 @@ class SearchEngine:
                     elif tf == 'untagged':
                         where_parts.append("(description IS NULL OR TRIM(description) = '')")
 
-            details_query = f"SELECT file_id, name, path, mimeType, source, description, thumbnailLink, thumbnailPath, size, modifiedTime, createdTime, parentId, starred, webContentLink FROM files"
+            details_query = f"SELECT file_id, name, path, mimeType, source, description, thumbnailLink, thumbnailPath, size, modifiedTime, createdTime, parentId, starred, webContentLink, thumbnailRotation FROM files"
             
             # Remover o bloqueio global de pastas na busca normal
             # where_parts.append("mimeType != 'folder'")
@@ -400,7 +400,7 @@ class SearchEngine:
                         files_where_clauses.append("(description IS NOT NULL AND TRIM(description) != '')")
                     elif tf == 'untagged':
                         files_where_clauses.append("(description IS NULL OR TRIM(description) = '')")
-            query = f"SELECT file_id, name, path, mimeType, source, description, thumbnailLink, thumbnailPath, size, modifiedTime, createdTime, parentId, starred, webContentLink FROM files WHERE {' AND '.join(files_where_clauses)} ORDER BY {order_by_clause} LIMIT ? OFFSET ?"
+            query = f"SELECT file_id, name, path, mimeType, source, description, thumbnailLink, thumbnailPath, size, modifiedTime, createdTime, parentId, starred, webContentLink, thumbnailRotation FROM files WHERE {' AND '.join(files_where_clauses)} ORDER BY {order_by_clause} LIMIT ? OFFSET ?"
             if explorer_special:
                 query = query.replace("WHERE", "WHERE source = 'local' AND")
             files_params.extend([page_size, offset])
@@ -421,7 +421,8 @@ class SearchEngine:
                     'createdTime': row[10],
                     'parentId': row[11],
                     'starred': bool(row[12]),
-                    'webContentLink': row[13] if len(row) > 13 else ''
+                    'webContentLink': row[13] if len(row) > 13 else '',
+                    'thumbnailRotation': int(row[14] or 0) if len(row) > 14 else 0,
                 } for row in rows
             ]
             self._paged_cache[cache_key] = files

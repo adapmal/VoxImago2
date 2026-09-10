@@ -18,7 +18,9 @@ from src.utils.utils import format_size
 from src.ui.thumbnails import ThumbnailCache, ThumbnailManager
 from src.drive.auto_tagger import AutoTagger
 from src.ui.staging_queue import StagingQueue, StagingItem
+from src.drive.match import select_unique_drive_candidate_by_size
 from src.utils.config_manager import ConfigManager
+from src.utils.path_validation import validate_path_component
 from src.ui.vocab_panel import VocabManager
 from src.ui.tag_chips import TagChipsWidget
 
@@ -202,7 +204,9 @@ class FileDetailsPanel(QFrame):
         # para acumular na Fila de Revisão (Staging Queue). Apenas a execução no Drive é bloqueada.
         self.name_edit.setReadOnly(False)
         self.name_edit.setStyleSheet("background-color: #FFFFFF; color: #000000;")
-        self.btn_rotate.setEnabled(True)
+        # A rotacao grava uma preferencia persistente no banco, portanto nao
+        # deve aparentar estar disponivel quando nenhuma escrita e permitida.
+        self.btn_rotate.setEnabled(not self.config_mgr.is_read_only())
         self.btn_delete.setEnabled(True)
         self.btn_add_all_suggestions.setEnabled(True)
         self.tag_chips_widget.setEnabled(True)
@@ -215,6 +219,7 @@ class FileDetailsPanel(QFrame):
         self.current_file_item = file_item
         self.current_files_list = [file_item]
         self._is_batch_mode = False
+        self.btn_rotate.setText("🔄 Girar 90°")
 
         self.title_label.setText("Detalhes do Arquivo")
         self.name_edit.setText(file_item.get('name', 'N/A'))
@@ -351,7 +356,17 @@ class FileDetailsPanel(QFrame):
         # Renderiza pílulas coloridas em lote: Branco (originais), Verde (adicionadas), Vermelho (removidas)
         self.tag_chips_widget.set_tags(orig_desc, staged_added, staged_removed)
         
-        self.btn_rotate.setEnabled(not self.config_mgr.is_read_only())
+        rotatable_count = sum(
+            1 for item in files_list
+            if item and item.get('source') == 'local'
+            and item.get('path') and os.path.isfile(item.get('path'))
+        )
+        self.btn_rotate.setText(
+            f"🔄 Girar seleção 90° ({rotatable_count})"
+        )
+        self.btn_rotate.setEnabled(
+            bool(rotatable_count) and not self.config_mgr.is_read_only()
+        )
         self.btn_delete.setEnabled(not self.config_mgr.is_read_only())
         
         self.open_drive_button.setVisible(False)
@@ -614,49 +629,95 @@ class FileDetailsPanel(QFrame):
             if it.file_id == fid and it.action_type == 'rename':
                 self.staging_queue.remove_item(it)
 
-        if new_name.strip() and new_name.strip() != old_name:
-            item = StagingItem(fid, old_name, fpath, 'rename', old_value=old_name, new_value=new_name.strip())
+        candidate = new_name.strip()
+        valid, error = validate_path_component(candidate, 'novo nome')
+        if not valid:
+            self.name_edit.setStyleSheet('border: 1px solid #DC3545;')
+            self.name_edit.setToolTip(error)
+            return
+
+        self.name_edit.setStyleSheet('')
+        self.name_edit.setToolTip('')
+        if candidate != old_name:
+            item = StagingItem(fid, old_name, fpath, 'rename', old_value=old_name, new_value=candidate)
             self.staging_queue.add_item(item)
 
     def _rotate_image_action(self):
-        """Rotaciona a miniatura no cache de visualização 90° no sentido horário, preservando o arquivo original intacto."""
+        """Persiste um override de 90 graus sem alterar o arquivo original."""
         if self.config_mgr.is_read_only():
             return
-            
-        files_to_process = getattr(self, 'current_files_list', []) if getattr(self, '_is_batch_mode', False) else [self.current_file_item]
-        import src.ui.thumbnails as thumbnails
-        from PIL import Image
 
-        raw_exts = {'.raw', '.arw', '.cr2', '.nef', '.dng', '.raf', '.orf', '.srw', '.rw2', '.pef'}
-        
+        files_to_process = (
+            list(getattr(self, 'current_files_list', []))
+            if getattr(self, '_is_batch_mode', False)
+            else [self.current_file_item]
+        )
+        eligible = [
+            item for item in files_to_process
+            if item and item.get('source') == 'local'
+            and item.get('path') and os.path.isfile(item.get('path'))
+        ]
+        if not eligible:
+            return
+
+        indexer = getattr(self.parent_app, 'indexer', None)
+        if not indexer:
+            logging.error('Banco de dados indisponivel para rotacionar miniaturas.')
+            return
+
+        try:
+            rotations = indexer.rotate_thumbnail_rotations([
+                (
+                    item.get('file_id') or item.get('id') or item.get('path'),
+                    item.get('path'),
+                )
+                for item in eligible
+            ])
+        except Exception as exc:
+            logging.exception('Falha ao persistir rotacao de miniaturas.')
+            QMessageBox.warning(
+                self,
+                'Rotacao nao aplicada',
+                f'Nenhuma rotacao do lote foi salva.\n\nDetalhe: {exc}',
+            )
+            return
+
+        rotations_by_key = {}
+        for result in rotations:
+            for raw_key in (result.get('file_id'), result.get('path')):
+                if raw_key:
+                    rotations_by_key[os.path.normcase(
+                        os.path.normpath(raw_key)
+                    )] = result['thumbnailRotation']
+
+        model = getattr(self.parent_app, 'file_list_model', None)
         rotated_count = 0
-        for item_data in files_to_process:
-            if not item_data:
-                continue
-            fpath = item_data.get('path')
-            if not fpath or not os.path.exists(fpath):
+        for item_data in eligible:
+            keys = [
+                item_data.get('file_id') or item_data.get('id'),
+                item_data.get('path'),
+            ]
+            new_rotation = None
+            for raw_key in keys:
+                if raw_key:
+                    key = os.path.normcase(os.path.normpath(raw_key))
+                    if key in rotations_by_key:
+                        new_rotation = rotations_by_key[key]
+                        break
+            if new_rotation is None:
                 continue
 
-            _, ext = os.path.splitext(fpath)
-            ext = ext.lower()
-
-            try:
-                # Rotação 100% não destrutiva para todos os formatos:
-                # O arquivo master original nunca é modificado nem recompactado.
-                # Apenas a miniatura no cache local é rotacionada.
-                cache_path = thumbnails.ThumbnailCache.get_existing_thumbnail_cache_path(item_data)
-                if not cache_path or not os.path.exists(cache_path):
-                    cache_path = thumbnails.ThumbnailManager.generate_local_thumbnail(item_data, size=(300, 300))
-                
-                if cache_path and os.path.exists(cache_path):
-                    with Image.open(cache_path) as img:
-                        rotated = img.rotate(-90, expand=True)
-                        rotated.save(cache_path, 'PNG')
-                    rotated_count += 1
-                else:
-                    logging.warning(f"Não foi possível obter miniatura para rotacionar: {fpath}")
-            except Exception as e:
-                logging.error(f"Erro ao rotacionar miniatura de {fpath}: {e}")
+            item_data['thumbnailRotation'] = new_rotation
+            rotated_count += 1
+            if model and hasattr(model, 'updateFileById'):
+                model_id = item_data.get('id') or item_data.get('path')
+                if not model.updateFileById(
+                    model_id, {'thumbnailRotation': new_rotation}
+                ):
+                    model.updateFileById(
+                        item_data.get('path'),
+                        {'thumbnailRotation': new_rotation},
+                    )
 
         if rotated_count > 0:
             # Recarregar a miniatura no painel de detalhes
@@ -784,7 +845,7 @@ class FileDetailsPanel(QFrame):
                                 q_seg = f"name = '{clean_seg}' and '{curr_pid}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
                                 res_seg = drive_service.files().list(q=q_seg, fields='files(id, name)', **kwargs).execute()
                                 seg_folders = res_seg.get('files', [])
-                                if seg_folders:
+                                if len(seg_folders) == 1:
                                     curr_pid = seg_folders[0]['id']
                                 else:
                                     path_ok = False
@@ -794,66 +855,58 @@ class FileDetailsPanel(QFrame):
                                 q_exact = f"name = '{clean_name}' and '{curr_pid}' in parents and trashed = false"
                                 res_exact = drive_service.files().list(q=q_exact, fields='files(id, name, webViewLink, webContentLink, size)', **kwargs).execute()
                                 exact_matches = res_exact.get('files', [])
-                                if exact_matches:
-                                    matched_file = exact_matches[0]
+                                matched_file = select_unique_drive_candidate_by_size(
+                                    exact_matches, file_size
+                                )
                     except Exception as e_top:
                         logging.debug(f"Falha na resolução top-down: {e_top}")
 
-                # 2. Fallback: Correspondência por pasta pai direta
-                if not matched_file:
-                    parent_folder_name = os.path.basename(os.path.dirname(fpath)) if fpath else None
-                    if parent_folder_name:
-                        clean_pname = parent_folder_name.replace("'", "\\'")
-                        q_folder = f"name = '{clean_pname}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-                        try:
-                            res_f = drive_service.files().list(q=q_folder, fields='files(id, name)', **kwargs).execute()
-                            folders = res_f.get('files', [])
-                            if folders:
-                                folder_ids = [f['id'] for f in folders[:5]]
-                                parents_cond = " or ".join([f"'{f_id}' in parents" for f_id in folder_ids])
-                                q_file = f"name = '{clean_name}' and ({parents_cond}) and trashed = false"
-                                res_file = drive_service.files().list(q=q_file, fields='files(id, name, webViewLink, size)', **kwargs).execute()
-                                exact_files = res_file.get('files', [])
-                                if exact_files:
-                                    matched_file = exact_files[0]
-                        except Exception as e_f:
-                            logging.debug(f"Falha na busca por pasta pai: {e_f}")
-
-                # 3. Fallback: Desambiguação geral por nome e tamanho
+                # 2. Fallback: nome e tamanho exatos em todo o Drive. Todas as
+                # paginas sao consideradas para que um homonimo tardio nao seja ignorado.
                 if not matched_file:
                     q = f"name='{clean_name}' and trashed=false"
-                    res = drive_service.files().list(q=q, fields='files(id, name, webViewLink, size, parents)', **kwargs).execute()
-                    candidates = res.get('files', [])
-                    if len(candidates) == 1:
-                        matched_file = candidates[0]
-                    elif len(candidates) > 1:
-                        if file_size:
-                            for cand in candidates:
-                                cand_size = int(cand.get('size') or 0)
-                                if cand_size and abs(cand_size - int(file_size)) < 1024:
-                                    matched_file = cand
-                                    break
-                        if not matched_file:
-                            matched_file = candidates[0]
+                    candidates = []
+                    page_token = None
+                    while True:
+                        res = drive_service.files().list(
+                            q=q,
+                            fields='nextPageToken, files(id, name, webViewLink, size, parents)',
+                            pageSize=1000,
+                            pageToken=page_token,
+                            **kwargs,
+                        ).execute()
+                        candidates.extend(res.get('files', []))
+                        page_token = res.get('nextPageToken')
+                        if not page_token:
+                            break
+                    matched_file = select_unique_drive_candidate_by_size(
+                        candidates, file_size
+                    )
 
                 if matched_file and matched_file.get('webViewLink'):
                     wlink = matched_file['webViewLink']
                     self.current_file_item['webContentLink'] = wlink
                     if hasattr(win, 'indexer') and win.indexer:
                         win.indexer.ensure_conn()
-                        win.indexer.cursor.execute("UPDATE files SET webContentLink = ? WHERE file_id = ? OR path = ?", (wlink, self.current_file_item.get('file_id'), fpath))
+                        win.indexer.cursor.execute(
+                            "UPDATE files SET webContentLink = ? "
+                            "WHERE source = 'local' AND size = ? "
+                            "AND (file_id = ? OR path = ?)",
+                            (
+                                wlink,
+                                int(file_size or 0),
+                                self.current_file_item.get('file_id'),
+                                fpath,
+                            ),
+                        )
                         win.indexer.conn.commit()
                     webbrowser.open(wlink)
                     return
             except Exception as e:
                 logging.error(f"Erro ao buscar link do Drive: {e}")
 
-        # 2. Se já existe link gravado no banco de dados, abre ele diretamente
-        cached_link = self.current_file_item.get('webContentLink') or self.current_file_item.get('webViewLink')
-        if cached_link and 'drive.google.com' in cached_link:
-            webbrowser.open(cached_link)
-            return
-
+        # Links locais legados nao sao mais abertos sem revalidacao: podem ter
+        # sido produzidos pelo algoritmo antigo que escolhia o primeiro homonimo.
         fid = self.current_file_item.get('file_id') or self.current_file_item.get('id')
         if fid and not ('/' in fid or '\\' in fid or (len(fid) > 1 and fid[1] == ':')):
             webbrowser.open(f"https://drive.google.com/file/d/{fid}/view")

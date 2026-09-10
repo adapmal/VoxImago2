@@ -1,12 +1,22 @@
-import os
 import time
 import logging
+from collections import Counter
 from datetime import datetime, timezone
-from PyQt6.QtCore import QObject, pyqtSignal, QThread
+from PyQt6.QtCore import QObject, pyqtSignal
+
+from src.drive.match import (
+    DriveHierarchyResolver,
+    build_local_link_index,
+    match_drive_to_local,
+)
+from src.utils.path_validation import configured_operation_roots
 
 class IncrementalSyncWorker(QObject):
     sync_finished = pyqtSignal(int)  # number of updated files
     sync_failed = pyqtSignal(str)
+    sync_warning = pyqtSignal(str)
+    # Valor negativo indica uma etapa de duracao indeterminada (consulta da API).
+    progress_update = pyqtSignal(int, str)
 
     def __init__(self, service, config_mgr, indexer=None, force_window_days=None):
         super().__init__()
@@ -16,7 +26,11 @@ class IncrementalSyncWorker(QObject):
         self.force_window_days = force_window_days
 
     def run(self):
+        local_indexer = None
         try:
+            self.progress_update.emit(
+                -1, "Consultando alterações no Google Drive..."
+            )
             from src.database.database import FileIndexer
             local_indexer = FileIndexer()
             
@@ -39,7 +53,7 @@ class IncrementalSyncWorker(QObject):
                 'pageSize': 1000,
                 'includeItemsFromAllDrives': True,
                 'supportsAllDrives': True,
-                'fields': "nextPageToken, files(id, name, mimeType, description, size, modifiedTime, createdTime, parents, thumbnailLink, webViewLink)",
+                'fields': "nextPageToken, files(id, name, mimeType, description, size, md5Checksum, modifiedTime, createdTime, parents, thumbnailLink, webViewLink)",
             }
             
             current_drive = self.config_mgr.get_current_drive_id()
@@ -60,6 +74,10 @@ class IncrementalSyncWorker(QObject):
                 response = self.service.files().list(**kwargs).execute()
                 items = response.get('files', [])
                 updated_files.extend(items)
+                self.progress_update.emit(
+                    -1,
+                    f"Consultando o Drive: {len(updated_files):,} item(ns) localizado(s)...",
+                )
                 
                 page_token = response.get('nextPageToken')
                 if not page_token:
@@ -68,19 +86,29 @@ class IncrementalSyncWorker(QObject):
             if not updated_files:
                 logging.info("Nenhum arquivo novo ou modificado encontrado no Drive.")
                 self.config_mgr.set('last_sync_timestamp', int(time.time()))
+                self.progress_update.emit(100, "Google Drive já está atualizado.")
                 self.sync_finished.emit(0)
                 return
 
             logging.info(f"🔄 Sincronização Incremental encontrou {len(updated_files)} arquivos alterados. Processando...")
+            total_updated = len(updated_files)
+            self.progress_update.emit(
+                0,
+                f"Sincronizando: 0/{total_updated:,} arquivos (0%)...",
+            )
 
             local_indexer.ensure_conn()
-            is_sb = self.config_mgr.is_sandbox()
-
             from src.database.search import SearchEngine
             norm_engine = SearchEngine(None)
-            parent_name_cache = {}
+            self.progress_update.emit(
+                1, f"Preparando correspondências para {total_updated:,} arquivos..."
+            )
+            match_resolver = DriveHierarchyResolver(self.service)
+            match_roots = configured_operation_roots(self.config_mgr)
+            link_index = build_local_link_index(local_indexer.cursor, match_roots)
+            match_outcomes = Counter()
 
-            for file in updated_files:
+            for position, file in enumerate(updated_files, start=1):
                 fid = file.get('id')
                 fname = file.get('name')
                 desc = (file.get('description') or '').strip()
@@ -96,6 +124,7 @@ class IncrementalSyncWorker(QObject):
                         "UPDATE files SET description = ?, modifiedTime = ?, webContentLink = ? WHERE file_id = ?",
                         (desc, mod_time, wlink, fid)
                     )
+                    drive_updated = (local_indexer.cursor.rowcount > 0)
                     local_indexer.cursor.execute(
                         "UPDATE search_index SET description = ?, normalized_description = ? WHERE file_id = ?",
                         (desc, norm_desc, fid)
@@ -105,56 +134,30 @@ class IncrementalSyncWorker(QObject):
                         "UPDATE files SET modifiedTime = ?, webContentLink = COALESCE(?, webContentLink) WHERE file_id = ?",
                         (mod_time, wlink, fid)
                     )
-                drive_updated = (local_indexer.cursor.rowcount > 0)
-                
-                # 2. Localizar o arquivo local correspondente com isolamento estrito de pasta e ID
-                # 2a. Primeiro tenta por vínculo direto gravado
-                local_indexer.cursor.execute(
-                    "SELECT file_id, path FROM files WHERE (webContentLink LIKE ? OR file_id = ?) AND source = 'local'",
-                    (f"%{fid}%", fid)
+                    drive_updated = (local_indexer.cursor.rowcount > 0)
+
+                # 2. So atualiza o registro local quando tamanho/hierarquia produzem
+                # um unico vencedor. Empates permanecem como itens separados do Drive.
+                match = match_drive_to_local(
+                    file,
+                    local_indexer.cursor,
+                    self.service,
+                    hierarchy_resolver=match_resolver,
+                    allowed_roots=match_roots,
+                    link_index=link_index,
                 )
-                direct_matches = local_indexer.cursor.fetchall()
-                
-                target_local_fid = None
-                if direct_matches:
-                    target_local_fid = direct_matches[0][0]
-                elif parent_id:
-                    # 2b. Se não está vinculado, resolve o nome da pasta pai no Drive
-                    if parent_id not in parent_name_cache:
-                        try:
-                            p_info = self.service.files().get(fileId=parent_id, supportsAllDrives=True, fields='name').execute()
-                            parent_name_cache[parent_id] = p_info.get('name', '')
-                        except Exception:
-                            parent_name_cache[parent_id] = ''
-                    drive_parent_name = parent_name_cache.get(parent_id, '')
-
-                    # Buscar candidatos locais com o mesmo nome de arquivo
-                    local_indexer.cursor.execute(
-                        "SELECT file_id, path FROM files WHERE (name = ? OR name_normalized = ?) AND source = 'local'",
-                        (fname, fname.lower())
-                    )
-                    candidates = local_indexer.cursor.fetchall()
-
-                    matched_candidates = []
-                    for c_fid, c_path in candidates:
-                        if is_sb and '_TestesBanco' not in c_fid:
-                            continue
-                        if not is_sb and '_TestesBanco' in c_fid:
-                            continue
-                        if c_path and drive_parent_name:
-                            p_folder = os.path.basename(os.path.dirname(c_path))
-                            if norm_engine.normalize_text(p_folder) == norm_engine.normalize_text(drive_parent_name):
-                                matched_candidates.append(c_fid)
-
-                    if len(matched_candidates) == 1:
-                        target_local_fid = matched_candidates[0]
+                match_outcomes[match.status] += 1
+                target_local_fid = match.local_id if match.matched else None
 
                 local_updated = False
                 if target_local_fid:
+                    # ``modifiedTime`` do registro local descreve os bytes no
+                    # disco e faz parte da chave da thumbnail. Uma alteracao de
+                    # tag no Drive nao pode fingir que a imagem local mudou.
                     if desc:
                         local_indexer.cursor.execute(
-                            "UPDATE files SET description = ?, modifiedTime = ?, webContentLink = ? WHERE file_id = ?",
-                            (desc, mod_time, wlink, target_local_fid)
+                            "UPDATE files SET description = ?, webContentLink = ? WHERE file_id = ?",
+                            (desc, wlink, target_local_fid)
                         )
                         local_indexer.cursor.execute(
                             "UPDATE search_index SET description = ?, normalized_description = ? WHERE file_id = ?",
@@ -162,8 +165,8 @@ class IncrementalSyncWorker(QObject):
                         )
                     else:
                         local_indexer.cursor.execute(
-                            "UPDATE files SET modifiedTime = ?, webContentLink = COALESCE(?, webContentLink) WHERE file_id = ?",
-                            (mod_time, wlink, target_local_fid)
+                            "UPDATE files SET webContentLink = COALESCE(?, webContentLink) WHERE file_id = ?",
+                            (wlink, target_local_fid)
                         )
                     local_updated = True
 
@@ -192,16 +195,62 @@ class IncrementalSyncWorker(QObject):
                     }
                     local_indexer.save_files_in_batch([new_item], source='drive')
 
+                if (position == 1 or position % 25 == 0
+                        or position == total_updated):
+                    percent = min(96, max(1, int(position * 96 / total_updated)))
+                    self.progress_update.emit(
+                        percent,
+                        f"Sincronizando: {position:,}/{total_updated:,} "
+                        f"arquivos ({percent}%)...",
+                    )
+
+                # Evita reter o unico lock de escrita do SQLite durante todo um
+                # inventario grande. O coordenador da interface ainda impede a
+                # fila de iniciar ao mesmo tempo; este commit limita o impacto
+                # de processos externos ou de uma interrupcao inesperada.
+                if position % 100 == 0:
+                    local_indexer.conn.commit()
+
             local_indexer.conn.commit()
+            logging.info(
+                "Matching incremental Drive/local: seguros=%d, ambiguos=%d, "
+                "conflitos=%d, sem correspondencia=%d.",
+                match_outcomes['matched'],
+                match_outcomes['ambiguous'],
+                match_outcomes['conflict'],
+                match_outcomes['no_match'],
+            )
             
             # Exportar cache compartilhado (.db e .csv)
-            local_indexer.export_to_shared_cache()
+            self.progress_update.emit(
+                98, "Finalizando e exportando o índice compartilhado..."
+            )
+            snapshot_exported = local_indexer.export_to_shared_cache()
 
             # Atualizar Timestamp
             self.config_mgr.set('last_sync_timestamp', int(time.time()))
-            
+
+            self.progress_update.emit(
+                100,
+                f"Sincronização concluída: {total_updated:,} arquivo(s) processado(s).",
+            )
             self.sync_finished.emit(len(updated_files))
+            if not snapshot_exported:
+                self.sync_warning.emit(
+                    'Os dados locais foram sincronizados, mas o snapshot '
+                    'compartilhado nao foi publicado. Abra Sistema / '
+                    'Avancado > Saude e reparo do banco.'
+                )
 
         except Exception as e:
             logging.error(f"❌ Erro na Sincronização Incremental: {e}", exc_info=True)
             self.sync_failed.emit(str(e))
+        finally:
+            if local_indexer is not None and hasattr(local_indexer, 'close'):
+                try:
+                    local_indexer.close()
+                except Exception:
+                    logging.debug(
+                        "Falha ao fechar banco da sincronizacao incremental.",
+                        exc_info=True,
+                    )

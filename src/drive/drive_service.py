@@ -160,7 +160,7 @@ class DriveService:
 
     def list_files_paginated(self, base_q, is_shared_drive_sync, shared_drive_id, page_token=None, page_size=1000, recursive_folders=None, fields_override=None):
         try:
-            fields = fields_override or "nextPageToken, files(id, name, mimeType, description, parents, modifiedTime, createdTime, size, webViewLink, thumbnailLink)"
+            fields = fields_override or "nextPageToken, files(id, name, mimeType, description, parents, modifiedTime, createdTime, size, md5Checksum, webViewLink, thumbnailLink)"
 
             if is_shared_drive_sync:
                 response = self.service.files().list(

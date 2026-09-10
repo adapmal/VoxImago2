@@ -6,6 +6,7 @@
 
 import os
 import webbrowser
+import logging
 from src.authentication import AuthWorker
 from src.services.local_scan import LocalScan
 from src.drive.processing import start_drive_folder_processing
@@ -68,8 +69,7 @@ class DriveFileGalleryApp(QMainWindow):
     thumbnail_generated = pyqtSignal(str)
 
     def _reindex_local_files(self):
-        settings = load_settings()
-        scan_paths = settings.get('scan_paths')
+        scan_paths = self.config_mgr.get_resolved_scan_paths(persist=True)
         if scan_paths and len(scan_paths) > 0:
             self._start_local_scan(scan_paths)
             self.status_bar.showMessage("Reindexando arquivos locais...", 5000)
@@ -134,10 +134,16 @@ class DriveFileGalleryApp(QMainWindow):
         self.is_authenticated = False
         self.drive_sync_after_local_scan = False
         self.drive_sync_running = False
+        self.queue_execution_running = False
+        self.maintenance_running = False
+        self.full_sync_deferred = False
+        self.incremental_sync_deferred = False
+        self.incremental_sync_deferred_manual = False
 
         self.auth_thread = None
         self.auth_worker = None
         self.local_scan_thread = None
+        self.inc_sync_thread = None
         self.local_scan_worker = None
         self.search_timer = QTimer()
         self.search_timer.setSingleShot(True)
@@ -420,8 +426,12 @@ class DriveFileGalleryApp(QMainWindow):
 
         self.status_bar = self.statusBar()
         self.progress_bar = QProgressBar(self)
+        self.progress_bar.setMinimumWidth(280)
+        self.progress_bar.setMaximumWidth(420)
+        self.progress_bar.setTextVisible(True)
         self.progress_bar.setVisible(False)
-        self.status_bar.addWidget(self.progress_bar, 1)
+        # Widget permanente: mensagens temporarias da QStatusBar nao o ocultam.
+        self.status_bar.addPermanentWidget(self.progress_bar)
 
         self.all_loaded_label = QLabel("Todos os arquivos foram carregados.")
         self.all_loaded_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -764,7 +774,7 @@ class DriveFileGalleryApp(QMainWindow):
         self.starred_checkbox.setChecked(False)
 
     def clear_thumbnail_cache(self):
-        self.indexer.clear_cache()
+        self.indexer.clear_thumbnail_cache()
         self.status_bar.showMessage("Cache de miniaturas limpo.", 5000)
         self.current_page = 0
         self.all_files_loaded = False
@@ -821,8 +831,45 @@ class DriveFileGalleryApp(QMainWindow):
     def _run_incremental_sync(self, force_manual=True):
         if not self.is_authenticated or not self.service:
             return
+
+        try:
+            local_scan_running = bool(
+                self.local_scan_thread and self.local_scan_thread.isRunning()
+            )
+        except (AttributeError, RuntimeError):
+            local_scan_running = False
+
+        if (self.queue_execution_running or self.maintenance_running
+                or local_scan_running):
+            self.incremental_sync_deferred = True
+            self.incremental_sync_deferred_manual = (
+                self.incremental_sync_deferred_manual or bool(force_manual)
+            )
+            if self.queue_execution_running:
+                reason = 'fila'
+            elif self.maintenance_running:
+                reason = 'manutencao'
+            else:
+                reason = 'varredura local'
+            logging.info(
+                "Sincronizacao incremental adiada: %s em andamento.", reason
+            )
+            self.status_bar.showMessage(
+                "Sincronização aguardará a operação atual terminar.", 4000
+            )
+            return
+
+        if self.drive_sync_running:
+            self.incremental_sync_deferred = True
+            self.incremental_sync_deferred_manual = (
+                self.incremental_sync_deferred_manual or bool(force_manual)
+            )
+            self.status_bar.showMessage(
+                "⏳ A sincronização incremental aguardará a sincronização completa.",
+                3000,
+            )
+            return
             
-        import logging
         try:
             if hasattr(self, 'inc_sync_thread') and self.inc_sync_thread is not None and self.inc_sync_thread.isRunning():
                 logging.info("⏳ Sincronização incremental já está em andamento, ignorando ciclo.")
@@ -832,7 +879,9 @@ class DriveFileGalleryApp(QMainWindow):
             self.inc_sync_thread = None
 
         logging.info("⏳ Disparando Sincronização Incremental (Background)...")
-        self.status_bar.showMessage("🔄 Verificando atualizações no Google Drive...", 3000)
+        self.update_drive_sync_progress(
+            -1, "🔄 Verificando atualizações no Google Drive..."
+        )
         
         from src.drive.incremental_sync import IncrementalSyncWorker
         from src.utils.config_manager import ConfigManager
@@ -852,11 +901,13 @@ class DriveFileGalleryApp(QMainWindow):
                 self.inc_sync_thread.wait(2000)
                 self.inc_sync_thread.deleteLater()
                 self.inc_sync_thread = None
+            self.progress_bar.setVisible(False)
             self._force_refresh_after_sync()
             if count > 0:
                 self.status_bar.showMessage(f"✅ Sincronização: {count} arquivo(s) atualizado(s) da nuvem.", 5000)
             else:
                 self.status_bar.showMessage("🔄 Sincronização: Tudo atualizado com o Drive.", 3000)
+            self._run_deferred_incremental_sync()
         
         def on_inc_failed(err):
             if self.inc_sync_thread:
@@ -864,14 +915,93 @@ class DriveFileGalleryApp(QMainWindow):
                 self.inc_sync_thread.wait(2000)
                 self.inc_sync_thread.deleteLater()
                 self.inc_sync_thread = None
-            import logging
+            self.progress_bar.setVisible(False)
             logging.error(f"Sincronização incremental falhou: {err}")
             self.status_bar.showMessage(f"⚠️ Erro no sync em segundo plano: {err}", 4000)
+            self._run_deferred_incremental_sync()
             
         self.inc_sync_worker.sync_finished.connect(on_inc_finished)
         self.inc_sync_worker.sync_failed.connect(on_inc_failed)
+        self.inc_sync_worker.sync_warning.connect(
+            lambda message: self.status_bar.showMessage(
+                f"⚠️ {message}", 10000
+            )
+        )
+        self.inc_sync_worker.progress_update.connect(
+            self.update_drive_sync_progress
+        )
         
         self.inc_sync_thread.start()
+
+    def begin_queue_execution(self):
+        """Reserva a escrita do banco para a fila antes do primeiro item."""
+        incremental_running = False
+        try:
+            incremental_running = bool(
+                self.inc_sync_thread and self.inc_sync_thread.isRunning()
+            )
+        except (AttributeError, RuntimeError):
+            incremental_running = False
+        local_scan_running = False
+        try:
+            local_scan_running = bool(
+                self.local_scan_thread and self.local_scan_thread.isRunning()
+            )
+        except (AttributeError, RuntimeError):
+            local_scan_running = False
+
+        if (self.drive_sync_running or incremental_running
+                or local_scan_running or self.maintenance_running):
+            QMessageBox.warning(
+                self,
+                "Banco ocupado",
+                "Há uma sincronização, varredura ou manutenção em andamento. "
+                "Aguarde sua conclusão antes de executar a fila.",
+            )
+            return False
+        self.queue_execution_running = True
+        return True
+
+    def end_queue_execution(self):
+        self.queue_execution_running = False
+        self._run_deferred_incremental_sync()
+
+    def begin_maintenance_operation(self):
+        if self.queue_execution_running or self.drive_sync_running:
+            QMessageBox.warning(
+                self, 'Operacao em andamento',
+                'Aguarde a fila ou a sincronizacao terminar.',
+            )
+            return False
+        try:
+            if ((self.inc_sync_thread and self.inc_sync_thread.isRunning())
+                    or (self.local_scan_thread and self.local_scan_thread.isRunning())):
+                QMessageBox.warning(
+                    self, 'Operacao em andamento',
+                    'Aguarde a sincronizacao ou varredura terminar.',
+                )
+                return False
+        except (AttributeError, RuntimeError):
+            pass
+        self.maintenance_running = True
+        return True
+
+    def end_maintenance_operation(self):
+        self.maintenance_running = False
+        self._run_deferred_incremental_sync()
+
+    def _run_deferred_incremental_sync(self):
+        if self.full_sync_deferred:
+            self.full_sync_deferred = False
+            QTimer.singleShot(300, self._start_drive_sync)
+            return
+        if self.incremental_sync_deferred:
+            manual = self.incremental_sync_deferred_manual
+            self.incremental_sync_deferred = False
+            self.incremental_sync_deferred_manual = False
+            QTimer.singleShot(
+                300, lambda: self._run_incremental_sync(force_manual=manual)
+            )
 
 
     def update_ui_for_auth_state(self, is_auth):
@@ -1098,10 +1228,17 @@ class DriveFileGalleryApp(QMainWindow):
             self.status_bar.showMessage(msg, 2000)
 
         def on_finished():
-            self.local_scan_progress.setValue(100)
-            self.local_scan_progress.setLabelText("Escaneamento concluído.")
+            failure = getattr(self.local_scan_worker, 'failure_message', None)
+            cancelled = bool(getattr(self.local_scan_worker, 'cancelled', False))
+            if failure or cancelled:
+                self.local_scan_progress.setLabelText("Escaneamento interrompido.")
+            else:
+                self.local_scan_progress.setValue(100)
+                self.local_scan_progress.setLabelText("Escaneamento concluído.")
             self.local_scan_progress.close()
-            self.on_local_scan_finished()
+            self.on_local_scan_finished(
+                error_message=failure, cancelled=cancelled
+            )
 
         self.local_scan_worker.total_files_found.connect(on_total_found)
         self.local_scan_worker.progress_update.connect(update_progress)
@@ -1120,7 +1257,7 @@ class DriveFileGalleryApp(QMainWindow):
         self.local_scan_progress.show()
         self.local_scan_thread.start()
 
-    def on_local_scan_finished(self):
+    def on_local_scan_finished(self, error_message=None, cancelled=False):
         if self.local_scan_worker:
             try:
                 self.local_scan_worker.finished.disconnect(
@@ -1128,18 +1265,43 @@ class DriveFileGalleryApp(QMainWindow):
             except TypeError:
                 pass
 
-        self.indexer = FileIndexer()
-        self.search_engine = SearchEngine(self.indexer)
-        try:
-            file_count = self.indexer.get_file_count(source='local')
-            self.tray_icon.showMessage("Sincronização Local Concluída",
-                                       f"Escaneamento concluído. {file_count} arquivos locais indexados", QSystemTrayIcon.MessageIcon.Information, 3000)
-        except Exception as e:
-            print(f"Erro ao acessar banco em on_local_scan_finished: {e}")
-            self.tray_icon.showMessage("Sincronização Local Concluída",
-                                       "Escaneamento concluído.", QSystemTrayIcon.MessageIcon.Information, 3000)
-
-        self.status_bar.showMessage("Escaneamento local concluído.", 5000)
+        # Conservar o FileIndexer da interface evita conexoes abandonadas e
+        # referencias obsoletas no delegate de thumbnails.
+        self.indexer.ensure_conn()
+        self.indexer.clear_query_cache()
+        self.search_engine.clear_cache()
+        if cancelled:
+            self.status_bar.showMessage("Varredura local cancelada.", 5000)
+        elif error_message:
+            self.tray_icon.showMessage(
+                "Erro na varredura local",
+                f"A varredura foi interrompida: {error_message}",
+                QSystemTrayIcon.MessageIcon.Critical,
+                5000,
+            )
+            self.status_bar.showMessage(
+                f"Erro na varredura local: {error_message}", 8000
+            )
+        else:
+            try:
+                file_count = self.indexer.get_file_count(source='local')
+                self.tray_icon.showMessage(
+                    "Sincronização Local Concluída",
+                    f"Escaneamento concluído. {file_count} arquivos locais indexados",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    3000,
+                )
+            except Exception as e:
+                logging.warning(
+                    "Erro ao acessar banco apos varredura local: %s", e
+                )
+                self.tray_icon.showMessage(
+                    "Sincronização Local Concluída",
+                    "Escaneamento concluído.",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    3000,
+                )
+            self.status_bar.showMessage("Escaneamento local concluído.", 5000)
 
         if self.local_scan_thread:
             self.local_scan_thread.quit()
@@ -1148,6 +1310,7 @@ class DriveFileGalleryApp(QMainWindow):
         self.local_scan_worker = None
         self.local_scan_thread = None
         self.local_scan_progress = None
+        self._run_deferred_incremental_sync()
 
         self.current_view = 'local'
         self.current_filter = "all"
@@ -1245,10 +1408,43 @@ class DriveFileGalleryApp(QMainWindow):
     def _start_drive_sync(self):
         print("🔄 _start_drive_sync chamado pelo usuário")
 
+        try:
+            local_scan_running = bool(
+                self.local_scan_thread and self.local_scan_thread.isRunning()
+            )
+        except (AttributeError, RuntimeError):
+            local_scan_running = False
+
+        if (self.queue_execution_running or self.maintenance_running
+                or local_scan_running):
+            QMessageBox.information(
+                self, "Aviso",
+                "A fila ou a manutencao do banco esta em andamento. "
+                "A sincronizacao foi adiada.",
+            )
+            self.full_sync_deferred = True
+            return
+
         if self.drive_sync_running:
             print("⚠️ Drive sync já está em execução - ignorando nova solicitação")
             QMessageBox.information(
                 self, "Aviso", "Sincronização do Drive já está em andamento.")
+            return
+
+
+        try:
+            incremental_running = (
+                self.inc_sync_thread is not None
+                and self.inc_sync_thread.isRunning()
+            )
+        except (AttributeError, RuntimeError):
+            incremental_running = False
+        if incremental_running:
+            QMessageBox.information(
+                self, "Aviso",
+                "A sincronização completa começará após a incremental."
+            )
+            self.full_sync_deferred = True
             return
 
         if not self.service:
@@ -1260,8 +1456,10 @@ class DriveFileGalleryApp(QMainWindow):
         self.drive_sync_running = True
         print("🚀 Iniciando nova sincronização do Drive...")
 
-        start_drive_folder_processing(
+        started = start_drive_folder_processing(
             self, self.service, self.indexer, force_dialog=True)
+        if not started:
+            self.drive_sync_running = False
 
 
     def _show_drive_folder_selection(self):
@@ -1301,8 +1499,11 @@ class DriveFileGalleryApp(QMainWindow):
         self.status_bar.showMessage("Sincronização do Drive concluída.", 5000)
         self.progress_bar.setVisible(False)
 
-        self.indexer = FileIndexer()
-        self.search_engine = SearchEngine(self.indexer)
+        # O worker ja fechou a conexao dele. Preservar esta instancia evita
+        # que o delegate de thumbnails continue preso a um indexador antigo.
+        self.indexer.ensure_conn()
+        self.indexer.clear_query_cache()
+        self.search_engine.clear_cache()
 
         if hasattr(self.indexer, '_paged_cache'):
             self.indexer._paged_cache.clear()
@@ -1321,13 +1522,14 @@ class DriveFileGalleryApp(QMainWindow):
 
         QTimer.singleShot(
             100, lambda: self._force_refresh_after_sync(prev_selected_id))
+        self._run_deferred_incremental_sync()
 
     def _force_refresh_after_sync(self, prev_selected_id=None):
         try:
             if hasattr(self, 'search_engine'):
                 self.search_engine.clear_cache()
             if hasattr(self, 'indexer'):
-                self.indexer.clear_cache()
+                self.indexer.clear_query_cache()
             self.current_page = 0
             self.all_files_loaded = False
             list_update.clear_display(self)
@@ -1384,7 +1586,7 @@ class DriveFileGalleryApp(QMainWindow):
             self.indexer.ensure_conn()
             self.indexer.cursor.execute(
                 """
-                SELECT file_id, name, path, mimeType, source, description, thumbnailLink, thumbnailPath, size, modifiedTime, createdTime, parentId, starred
+                SELECT file_id, name, path, mimeType, source, description, thumbnailLink, thumbnailPath, size, modifiedTime, createdTime, parentId, starred, thumbnailRotation
                 FROM files WHERE file_id = ?
                 """,
                 (file_id,)
@@ -1405,6 +1607,7 @@ class DriveFileGalleryApp(QMainWindow):
                     'createdTime': row[10],
                     'parentId': row[11],
                     'starred': bool(row[12]) if len(row) > 12 else False,
+                    'thumbnailRotation': int(row[13] or 0) if len(row) > 13 else 0,
                 }
 
                 self.file_list_model.updateFileById(file_id, updated_item)
@@ -1429,7 +1632,7 @@ class DriveFileGalleryApp(QMainWindow):
             self.indexer.ensure_conn()
             self.indexer.cursor.execute(
                 """
-                SELECT file_id, name, path, mimeType, source, description, thumbnailLink, thumbnailPath, size, modifiedTime, createdTime, parentId, starred
+                SELECT file_id, name, path, mimeType, source, description, thumbnailLink, thumbnailPath, size, modifiedTime, createdTime, parentId, starred, thumbnailRotation
                 FROM files WHERE file_id = ?
                 """,
                 (file_id,)
@@ -1451,6 +1654,7 @@ class DriveFileGalleryApp(QMainWindow):
                 'createdTime': row[10],
                 'parentId': row[11],
                 'starred': bool(row[12]) if len(row) > 12 else False,
+                'thumbnailRotation': int(row[13] or 0) if len(row) > 13 else 0,
             }
             self.details_panel.update_details(updated_item)
         except Exception as e:
@@ -1501,12 +1705,25 @@ class DriveFileGalleryApp(QMainWindow):
         self.tray_icon.showMessage(
             "Erro de Sincronização", f"Falha na sincronização do Google Drive: {error_message}", QSystemTrayIcon.MessageIcon.Critical, 5000)
         self.progress_bar.setVisible(False)
-        self.update_ui_for_auth_state(False)
+        auth_error = any(
+            marker in str(error_message).lower()
+            for marker in ('401', 'invalid_grant', 'unauthorized', 'token expired')
+        )
+        if auth_error:
+            self.update_ui_for_auth_state(False)
+        self._run_deferred_incremental_sync()
 
     def update_drive_sync_progress(self, value, msg):
-        self.status_bar.showMessage(msg)
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(value)
+        self.progress_bar.setVisible(True)
+        if value < 0:
+            self.progress_bar.setRange(0, 0)
+            self.progress_bar.setFormat("Consultando...")
+        else:
+            safe_value = max(0, min(100, int(value)))
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(safe_value)
+            self.progress_bar.setFormat(f"{safe_value}%")
+        self.status_bar.showMessage(msg, 0)
 
     def update_drive_status_message(self, msg):
         self.status_bar.showMessage(msg)
@@ -1897,20 +2114,55 @@ class DriveFileGalleryApp(QMainWindow):
 
         fid = staging_item.file_id
         fname = staging_item.file_name
-        fpath = staging_item.path or staging_item.old_value or ''
+        original_path = staging_item.path or staging_item.old_value or ''
+        fpath = original_path
+        target_file_obj = None
 
-        # Se não tiver caminho direto registrado, busca no SQLite
-        if not fpath and hasattr(self, 'indexer') and self.indexer:
+        # Resolver sempre o registro local exato. Nome e usado somente como
+        # ultimo recurso quando existe um unico homonimo no banco.
+        if hasattr(self, 'indexer') and self.indexer:
             try:
+                from src.database.database import to_canonical_id
                 self.indexer.ensure_conn()
-                self.indexer.cursor.execute("SELECT path FROM files WHERE file_id = ? OR name = ? LIMIT 1", (fid, fname))
-                r = self.indexer.cursor.fetchone()
-                if r and r[0]:
-                    fpath = r[0]
-            except Exception:
-                pass
+                columns = (
+                    "file_id,name,path,mimeType,source,description,thumbnailLink,"
+                    "thumbnailPath,size,modifiedTime,createdTime,parentId,starred,"
+                    "webContentLink,thumbnailRotation"
+                )
+                canon_id = to_canonical_id(fid)
+                canon_path = to_canonical_id(original_path)
+                rows = self.indexer.cursor.execute(
+                    f"SELECT {columns} FROM files WHERE source='local' "
+                    "AND (file_id=? OR path=?) LIMIT 2",
+                    (canon_id, canon_path),
+                ).fetchall()
+                if not rows and fname:
+                    rows = self.indexer.cursor.execute(
+                        f"SELECT {columns} FROM files WHERE source='local' "
+                        "AND name=? LIMIT 2",
+                        (fname,),
+                    ).fetchall()
+                if len(rows) == 1:
+                    row = rows[0]
+                    target_file_obj = {
+                        'id': row[0], 'name': row[1], 'path': row[2],
+                        'mimeType': row[3], 'source': row[4],
+                        'description': row[5], 'thumbnailLink': row[6],
+                        'thumbnailPath': row[7], 'size': row[8],
+                        'modifiedTime': row[9], 'createdTime': row[10],
+                        'parentId': row[11], 'starred': bool(row[12]),
+                        'webContentLink': row[13],
+                        'thumbnailRotation': int(row[14] or 0),
+                    }
+                    fpath = row[2] or fpath
+                    fid = row[0]
+            except Exception as exc:
+                logging.warning("Falha ao resolver item da fila para foco: %s", exc)
 
         if not fpath:
+            self.status_bar.showMessage(
+                f"Não foi possível localizar com segurança: {fname}", 5000
+            )
             return
 
         fpath = os.path.normpath(fpath)
@@ -1927,6 +2179,13 @@ class DriveFileGalleryApp(QMainWindow):
                         fpath = os.path.normpath(it.new_value)
                         has_moved_staged = True
                         dst_folder_name = os.path.basename(os.path.dirname(fpath))
+                        if target_file_obj:
+                            target_file_obj = dict(target_file_obj)
+                            target_file_obj['physical_path'] = target_file_obj.get('path')
+                            target_file_obj['orig_path'] = target_file_obj.get('path')
+                            target_file_obj['path'] = fpath
+                            target_file_obj['parentId'] = os.path.dirname(fpath)
+                            target_file_obj['is_staged_move'] = True
                         break
 
         folder_path = os.path.normpath(os.path.dirname(fpath))
@@ -1945,13 +2204,23 @@ class DriveFileGalleryApp(QMainWindow):
                 return
 
             target_idx = -1
-            target_file_obj = None
+            selected_obj = None
             for idx, f in enumerate(self.file_list_model._files):
                 p = os.path.normpath(f.get('path') or '')
-                if p.lower() == fpath.lower() or f.get('name') == fname or f.get('id') == fid or f.get('file_id') == fid:
+                if (p.lower() == fpath.lower()
+                        or f.get('id') == fid or f.get('file_id') == fid):
                     target_idx = idx
-                    target_file_obj = f
+                    selected_obj = f
                     break
+
+            if (target_idx < 0 and target_file_obj
+                    and not getattr(self, 'is_loading', False)):
+                # A grade e paginada e pode estar filtrada. Para um pedido de
+                # foco explicito, inserir o registro exato e mais confiavel que
+                # desistir depois de 400 itens ou selecionar um homonimo.
+                self.file_list_model.addFiles([target_file_obj])
+                target_idx = len(self.file_list_model._files) - 1
+                selected_obj = target_file_obj
 
             if target_idx >= 0:
                 q_idx = self.file_list_model.index(target_idx, 0)
@@ -1961,16 +2230,17 @@ class DriveFileGalleryApp(QMainWindow):
                         q_idx, QItemSelectionModel.SelectionFlag.ClearAndSelect
                     )
                     self.file_list_view.scrollTo(q_idx, QAbstractItemView.ScrollHint.PositionAtCenter)
-                if target_file_obj and hasattr(self, 'details_panel') and self.details_panel:
-                    self.details_panel.update_details(target_file_obj)
+                if selected_obj and hasattr(self, 'details_panel') and self.details_panel:
+                    self.details_panel.update_details(selected_obj)
                 if hasattr(self, 'status_bar') and self.status_bar and not has_moved_staged:
                     self.status_bar.showMessage(f"🔍 Item em foco: {fname}", 4000)
             else:
                 if getattr(self, 'is_loading', False) and retries > 0:
                     QTimer.singleShot(60, lambda: _find_and_select(retries - 1))
-                elif not getattr(self, 'all_files_loaded', False) and len(self.file_list_model._files) < 400 and retries > 0:
-                    list_update.load_next_batch(self)
-                    QTimer.singleShot(60, lambda: _find_and_select(retries - 1))
+                elif retries <= 0:
+                    self.status_bar.showMessage(
+                        f"Não foi possível exibir com segurança: {fname}", 5000
+                    )
 
         QTimer.singleShot(100, lambda: _find_and_select(10))
 
@@ -2031,8 +2301,9 @@ class DriveFileGalleryApp(QMainWindow):
                 self.details_panel.update_details(files_list[0])
             else:
                 self.details_panel.update_details_batch(files_list)
-        else:
-            self.details_panel.clear_details()
+        # Uma selecao vazia pode ser transitoria durante recarga/paginacao ou
+        # resultar de um clique no fundo. O painel conserva o ultimo contexto;
+        # ele so e substituido quando outro arquivo e efetivamente selecionado.
 
     def on_double_click(self, file_item):
         if not file_item:

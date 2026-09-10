@@ -431,9 +431,16 @@ class MainBar(QFrame):
 
             def on_queue_done(count):
                 if count > 0:
+                    snapshot_exported = True
                     if hasattr(win, 'indexer'):
-                        win.indexer.export_to_shared_cache()
+                        snapshot_exported = win.indexer.export_to_shared_cache()
                     win._force_refresh_after_sync()
+                    if not snapshot_exported:
+                        win.status_bar.showMessage(
+                            "⚠️ Alterações aplicadas, mas o snapshot não "
+                            "foi publicado. Verifique a saúde do banco.",
+                            10000,
+                        )
             win._staging_dialog.executionCompleted.connect(on_queue_done)
 
         win._staging_dialog.show()

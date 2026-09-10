@@ -14,38 +14,22 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QObject, pyqtSignal, QCoreApplication
 from src.utils.config_manager import ConfigManager
-
-
-class StagingItem:
-    def __init__(self, file_id, file_name, path, action_type, old_value="", new_value=""):
-        self.file_id = file_id
-        self.file_name = file_name
-        self.path = path
-        self.action_type = action_type  # 'add_tags', 'remove_tags', 'set_description', 'rename', 'move'
-        self.old_value = old_value
-        self.new_value = new_value
-        self.timestamp = time.time()
-
-    def get_description_summary(self):
-        if self.action_type == 'add_tags':
-            return f"[+] Adicionar tags: '{self.new_value}'"
-        elif self.action_type == 'remove_tags':
-            return f"[-] Remover tags: '{self.new_value}'"
-        elif self.action_type == 'set_description':
-            return f"[=] Nova descrição: '{self.new_value}'"
-        elif self.action_type == 'rename':
-            return f"[R] Renomear para: '{self.new_value}'"
-        elif self.action_type == 'move':
-            dst_folder = os.path.basename(os.path.dirname(self.new_value))
-            return f"📦 Mover para a pasta: '{dst_folder}'"
-        elif self.action_type == 'delete':
-            return f"🗑️ Excluir arquivo"
-        elif self.action_type == 'create_folder':
-            folder_name = os.path.basename(self.new_value)
-            return f"📁🟢 Criar nova pasta (Fila): '{folder_name}'"
-        return f"[{self.action_type}] {self.new_value}"
-
-
+from src.drive.match import (
+    DriveHierarchyResolver,
+    extract_drive_file_id,
+    match_drive_to_local,
+    select_unique_drive_candidate_by_size,
+)
+from src.utils.path_validation import (
+    configured_operation_roots,
+    looks_like_local_path,
+    validate_path_in_roots,
+)
+from src.utils.staging_schema import (
+    MAX_QUEUE_FILE_BYTES,
+    MAX_QUEUE_ITEMS,
+    StagingItem,
+)
 
 QUEUE_CACHE_FILE = os.path.join('config', 'staging_queue.json')
 
@@ -78,17 +62,7 @@ class StagingQueue:
     def _save_to_disk(self):
         try:
             os.makedirs(os.path.dirname(QUEUE_CACHE_FILE), exist_ok=True)
-            data = []
-            for it in self.items:
-                data.append({
-                    'file_id': it.file_id,
-                    'file_name': it.file_name,
-                    'path': it.path,
-                    'action_type': it.action_type,
-                    'old_value': it.old_value,
-                    'new_value': it.new_value,
-                    'timestamp': it.timestamp
-                })
+            data = [it.to_dict() for it in self.items]
             with open(QUEUE_CACHE_FILE, 'w', encoding='utf-8') as f:
                 import json
                 json.dump(data, f, indent=2, ensure_ascii=False)
@@ -99,27 +73,41 @@ class StagingQueue:
         if os.path.exists(QUEUE_CACHE_FILE):
             try:
                 import json
+                if os.path.getsize(QUEUE_CACHE_FILE) > MAX_QUEUE_FILE_BYTES:
+                    raise ValueError('Arquivo da fila excede o limite de 10 MB.')
                 with open(QUEUE_CACHE_FILE, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                    for d in data:
+                    records = self._get_queue_records(data)
+                    for position, d in enumerate(records, start=1):
                         try:
-                            it = StagingItem(
-                                d.get('file_id'), d.get('file_name'), d.get('path'),
-                                d.get('action_type'), d.get('old_value', ''), d.get('new_value', '')
-                            )
-                            it.timestamp = d.get('timestamp', time.time())
+                            it = StagingItem.from_dict(d)
                             self.items.append(it)
                         except Exception as item_e:
-                            logging.error(f"Erro ao carregar item individual da fila: {item_e}")
+                            logging.error(f"Item {position} da fila ignorado: {item_e}")
             except Exception as e:
                 logging.error(f"Erro ao carregar fila do disco: {e}")
-                # Clear corrupted queue file
-                try:
-                    os.remove(QUEUE_CACHE_FILE)
-                except:
-                    pass
+
+    @staticmethod
+    def _get_queue_records(data):
+        # Lista simples = formato usado por todas as versoes anteriores.
+        if isinstance(data, list):
+            records = data
+        # Envelope opcional para uma futura evolucao do formato.
+        elif isinstance(data, dict) and isinstance(data.get('items'), list):
+            records = data['items']
+        else:
+            raise ValueError('Formato da fila invalido: esperada uma lista de itens.')
+        if len(records) > MAX_QUEUE_ITEMS:
+            raise ValueError(f'Fila excede o limite de {MAX_QUEUE_ITEMS} itens.')
+        return records
 
     def add_item(self, item):
+        try:
+            item.validate()
+        except Exception as exc:
+            logging.error(f"Item recusado pela validacao da fila: {exc}")
+            return False
+
         # 1. Se for 'delete', remove qualquer 'move', 'rename' ou 'tags' pendentes anteriores desse mesmo arquivo
         if item.action_type == 'delete':
             self.items = [it for it in self.items if it.file_id != item.file_id]
@@ -140,6 +128,7 @@ class StagingQueue:
         self.itemAdded.emit(item)
         self.queueChanged.emit(len(self.items))
         self._save_to_disk()
+        return True
 
     def add_batch_tags(self, files_list, tags_to_add="", tags_to_remove=""):
         count = 0
@@ -303,6 +292,8 @@ class QueueExecutionReportDialog(QDialog):
 
 class StagingQueueDialog(QDialog):
     executionCompleted = pyqtSignal(int)  # Emitido com o número de alterações aplicadas
+    executionStarted = pyqtSignal()
+    executionFinished = pyqtSignal()
     itemFocusRequested = pyqtSignal(object)  # (StagingItem) Solicitado foco no arquivo na interface principal
 
     def __init__(self, parent=None, drive_service=None, db_indexer=None):
@@ -311,6 +302,7 @@ class StagingQueueDialog(QDialog):
         self.drive_service = drive_service
         self.db_indexer = db_indexer
         self.config_mgr = ConfigManager()
+        self._execution_active = False
 
         self.setWindowTitle("📋 Fila de Revisão de Alterações (Staging Queue)")
         self.setWindowFlags(Qt.WindowType.Window)  # Janela independente destacável
@@ -589,6 +581,9 @@ class StagingQueueDialog(QDialog):
                 self.queue.clear(discard_placeholder=True)
 
     def _execute_queue(self):
+        self._run_execution_guarded(self._execute_queue_impl)
+
+    def _execute_queue_impl(self):
         if self.config_mgr.is_read_only():
             QMessageBox.warning(self, "Modo Somente Leitura", "As edições estão desabilitadas no modo Somente Leitura.")
             return
@@ -603,6 +598,9 @@ class StagingQueueDialog(QDialog):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        if not self._begin_execution():
             return
 
         executed_count = 0
@@ -641,6 +639,22 @@ class StagingQueueDialog(QDialog):
                 executed_items.append(item)
             except Exception as e:
                 logging.error(f"Erro ao executar item {item.file_name}: {e}")
+                if 'locked' in str(e).lower():
+                    if self.db_indexer and self.db_indexer.conn:
+                        try:
+                            self.db_indexer.conn.rollback()
+                        except Exception:
+                            pass
+                    errors.append(
+                        "Execução pausada porque o banco ficou ocupado. "
+                        "Os itens restantes continuam pendentes."
+                    )
+                    logging.error(
+                        "Fila interrompida no primeiro lock persistente; "
+                        "%d item(ns) ainda nao iniciado(s).",
+                        total - idx,
+                    )
+                    break
                 errors.append(f"{item.file_name}: {e}")
 
         progress.setValue(total)
@@ -648,6 +662,14 @@ class StagingQueueDialog(QDialog):
 
         if executed_items:
             self.queue.remove_items_batch(executed_items)
+
+        logging.info(
+            "Fila concluida: solicitados=%d, executados=%d, erros=%d, restantes=%d.",
+            total,
+            executed_count,
+            len(errors),
+            self.queue.count(),
+        )
 
         if errors:
             dlg = QueueExecutionReportDialog(self, executed_count=executed_count, errors=errors)
@@ -659,10 +681,14 @@ class StagingQueueDialog(QDialog):
             except Exception:
                 pass
 
+        self._finish_execution()
         self.executionCompleted.emit(executed_count)
         self.accept()
 
     def _execute_next(self):
+        self._run_execution_guarded(self._execute_next_impl)
+
+    def _execute_next_impl(self):
         if self.config_mgr.is_read_only() or self.queue.count() == 0:
             return
 
@@ -672,6 +698,9 @@ class StagingQueueDialog(QDialog):
             items_to_execute = [it for it in self.queue.items if it in target_items_set]
         else:
             items_to_execute = [self.queue.items[0]]
+
+        if not self._begin_execution():
+            return
 
         executed_count = 0
         errors = []
@@ -713,6 +742,20 @@ class StagingQueueDialog(QDialog):
                 executed_count += 1
             except Exception as e:
                 logging.error(f"Erro ao executar item {item.file_name}: {e}")
+                if 'locked' in str(e).lower():
+                    if self.db_indexer and self.db_indexer.conn:
+                        try:
+                            self.db_indexer.conn.rollback()
+                        except Exception:
+                            pass
+                    errors.append(
+                        "Execução pausada porque o banco ficou ocupado. "
+                        "Os itens restantes continuam pendentes."
+                    )
+                    logging.error(
+                        "Execucao parcial interrompida no primeiro lock persistente."
+                    )
+                    break
                 errors.append(f"{item.file_name}: {e}")
 
         if progress:
@@ -722,33 +765,124 @@ class StagingQueueDialog(QDialog):
         if executed_items:
             self.queue.remove_items_batch(executed_items)
 
+        logging.info(
+            "Execucao parcial da fila concluida: solicitados=%d, executados=%d, "
+            "erros=%d, restantes=%d.",
+            total,
+            executed_count,
+            len(errors),
+            self.queue.count(),
+        )
+
         if errors:
             dlg = QueueExecutionReportDialog(self, executed_count=executed_count, errors=errors)
             dlg.exec()
+        self._finish_execution()
         self.executionCompleted.emit(executed_count)
+
+    def _begin_execution(self):
+        if self._execution_active:
+            return False
+        win = self.parent().window() if self.parent() else None
+        if win and hasattr(win, 'begin_queue_execution'):
+            if not win.begin_queue_execution():
+                return False
+        self._execution_active = True
+        self.executionStarted.emit()
+        return True
+
+    def _finish_execution(self):
+        if not self._execution_active:
+            return
+        self._execution_active = False
+        win = self.parent().window() if self.parent() else None
+        if win and hasattr(win, 'end_queue_execution'):
+            win.end_queue_execution()
+        self.executionFinished.emit()
+
+    def _run_execution_guarded(self, callback):
+        try:
+            callback()
+        except Exception as exc:
+            logging.exception('Falha inesperada durante a execucao da fila.')
+            self._finish_execution()
+            QMessageBox.critical(
+                self,
+                'Falha na fila',
+                'A execução foi interrompida com segurança. Os itens não '
+                f'confirmados continuam pendentes.\n\nDetalhe: {exc}',
+            )
+
+    def done(self, result):
+        # Garante a liberacao do coordenador mesmo se a janela for encerrada
+        # por uma excecao ou por outro caminho do Qt.
+        self._finish_execution()
+        super().done(result)
 
     def _get_drive_file_id(self, item):
         fid = item.file_id
         if fid and ('/' in fid or '\\' in fid or fid[1:3] == ':\\'):
+            fpath = item.path or fid
+            local_size = 0
+            stored_link = ''
             # 1. Verificar se o banco de dados já possui o link direto gravado
             if self.db_indexer:
                 try:
                     self.db_indexer.ensure_conn()
                     self.db_indexer.cursor.execute(
-                        "SELECT webContentLink FROM files WHERE file_id = ? OR path = ? LIMIT 1",
-                        (fid, item.path or fid)
+                        "SELECT size, webContentLink FROM files "
+                        "WHERE source = 'local' AND (file_id = ? OR path = ?) LIMIT 1",
+                        (fid, fpath)
                     )
                     row = self.db_indexer.cursor.fetchone()
-                    if row and row[0] and '/d/' in row[0]:
-                        extracted_id = row[0].split('/d/')[1].split('/')[0]
-                        if extracted_id:
-                            return extracted_id
+                    if row:
+                        local_size = int(row[0] or 0)
+                        stored_link = row[1] or ''
                 except Exception as e_db:
                     logging.debug(f"Erro ao buscar link no banco: {e_db}")
 
+            if not local_size and fpath and os.path.isfile(fpath):
+                try:
+                    local_size = os.path.getsize(fpath)
+                except OSError:
+                    local_size = 0
+
             if self.drive_service:
                 try:
-                    fpath = item.path or fid
+                    # Links legados tambem sao revalidados: o ID so e usado se
+                    # o tamanho atual no Drive confirmar o arquivo local.
+                    linked_id = extract_drive_file_id(stored_link)
+                    if linked_id and local_size:
+                        linked_file = self.drive_service.files().get(
+                            fileId=linked_id,
+                            supportsAllDrives=True,
+                            fields='id,name,size,mimeType,webViewLink,parents',
+                        ).execute()
+                        linked_match = match_drive_to_local(
+                            linked_file,
+                            self.db_indexer.cursor,
+                            self.drive_service,
+                            hierarchy_resolver=DriveHierarchyResolver(self.drive_service),
+                            allowed_roots=configured_operation_roots(self.config_mgr),
+                        )
+                        expected_local = os.path.normcase(os.path.normpath(fpath))
+                        matched_local = (
+                            os.path.normcase(os.path.normpath(linked_match.local_id))
+                            if linked_match.matched else ''
+                        )
+                        if linked_match.matched and matched_local == expected_local:
+                            return linked_id
+                        logging.warning(
+                            "Vinculo Drive legado recusado: tamanho, hierarquia ou "
+                            "unicidade nao confirmados."
+                        )
+
+                    if not local_size:
+                        logging.warning(
+                            "Nao foi possivel confirmar o arquivo no Drive: tamanho local indisponivel."
+                        )
+                        return None
+
                     clean_name = item.file_name.replace("'", "\\'")
                     parent_dir = os.path.dirname(fpath)
                     
@@ -764,23 +898,26 @@ class StagingQueueDialog(QDialog):
                             kwargs['corpora'] = 'allDrives'
 
                         q_exact = f"name = '{clean_name}' and '{parent_drive_id}' in parents and trashed = false"
-                        res_exact = self.drive_service.files().list(q=q_exact, fields='files(id, name, webViewLink)', **kwargs).execute()
+                        res_exact = self.drive_service.files().list(q=q_exact, fields='files(id, name, webViewLink, size)', **kwargs).execute()
                         exact_matches = res_exact.get('files', [])
                         
                         # Se não encontrar por nome exato (ex: case mismatch .jpg vs .JPG), faz busca normalizada
                         if not exact_matches:
                             q_all = f"'{parent_drive_id}' in parents and trashed = false"
-                            res_all = self.drive_service.files().list(q=q_all, fields='files(id, name, webViewLink)', **kwargs).execute()
+                            res_all = self.drive_service.files().list(q=q_all, fields='files(id, name, webViewLink, size)', **kwargs).execute()
                             from src.database.search import SearchEngine
                             norm_fname = SearchEngine(None).normalize_text(item.file_name)
+                            exact_matches = []
                             for cand in res_all.get('files', []):
                                 if SearchEngine(None).normalize_text(cand.get('name', '')) == norm_fname:
-                                    exact_matches = [cand]
-                                    break
+                                    exact_matches.append(cand)
 
-                        if exact_matches:
-                            matched_id = exact_matches[0]['id']
-                            wlink = exact_matches[0].get('webViewLink')
+                        matched_file = select_unique_drive_candidate_by_size(
+                            exact_matches, local_size
+                        )
+                        if matched_file:
+                            matched_id = matched_file['id']
+                            wlink = matched_file.get('webViewLink')
                             if wlink and self.db_indexer:
                                 try:
                                     self.db_indexer.cursor.execute("UPDATE files SET webContentLink = ? WHERE file_id = ? OR path = ?", (wlink, fid, fpath))
@@ -788,6 +925,10 @@ class StagingQueueDialog(QDialog):
                                 except Exception:
                                     pass
                             return matched_id
+                        if exact_matches:
+                            logging.warning(
+                                "Correspondencia Drive recusada: nome repetido ou tamanho divergente."
+                            )
                 except Exception as e:
                     logging.error(f"Falha ao buscar ID do Drive para {item.file_name}: {e}")
                     return None
@@ -795,13 +936,11 @@ class StagingQueueDialog(QDialog):
         return fid
 
     def _execute_single_item(self, item):
+        item.validate()
         if self.config_mgr.is_read_only():
             raise RuntimeError("Operação bloqueada: o aplicativo está no Modo Somente Leitura.")
 
-        if self.config_mgr.is_sandbox():
-            target_check = item.path or item.new_value or item.old_value
-            if target_check and '_TestesBanco' not in target_check:
-                raise RuntimeError(f"Operação bloqueada pelo Modo Sandbox: '{target_check}' está fora do diretório de testes (_TestesBanco).")
+        self._validate_local_paths(item)
 
         if self.db_indexer:
             self.db_indexer.ensure_conn()
@@ -861,7 +1000,7 @@ class StagingQueueDialog(QDialog):
                             body={'description': new_desc}, 
                             supportsAllDrives=True
                         ).execute()
-                        logging.info(f"✅ Google Drive atualizado com sucesso: {item.file_name} -> {new_desc}")
+                        logging.debug(f"Google Drive atualizado: {item.file_name} -> {new_desc}")
                     except Exception as e:
                         logging.error(f"Erro na API Drive ao atualizar desc {drive_file_id}: {e}")
                         raise e
@@ -888,7 +1027,7 @@ class StagingQueueDialog(QDialog):
                 success, err_msg = safe_move_file(old_path, new_path_norm, retries=3, delay=0.5)
                 if not success:
                     raise RuntimeError(f"Erro ao renomear localmente: {err_msg}")
-                logging.info(f"✅ Arquivo/pasta local renomeado: {old_path} -> {new_path_norm}")
+                logging.debug(f"Arquivo/pasta local renomeado: {old_path} -> {new_path_norm}")
 
             # Atualizar no banco SQLite com chave canônica normcase(normpath)
             if self.db_indexer:
@@ -963,7 +1102,7 @@ class StagingQueueDialog(QDialog):
                 success, err_msg = safe_move_file(src_path, dst_path, retries=3, delay=0.5)
                 if not success:
                     raise RuntimeError(f"Falha ao mover arquivo local: {err_msg}")
-                logging.info(f"✅ Arquivo local movido com sucesso: {src_path} -> {dst_path}")
+                logging.debug(f"Arquivo local movido: {src_path} -> {dst_path}")
 
             # 2. Atualizar no banco SQLite com chave canônica normcase(normpath)
             if self.db_indexer:
@@ -1017,7 +1156,7 @@ class StagingQueueDialog(QDialog):
                 moved_to_trash = send_to_recycle_bin(del_path)
                 if not moved_to_trash:
                     raise RuntimeError(f"Não foi possível mover para a Lixeira do Windows: '{del_path}'. Exclusão abortada por segurança.")
-                logging.info(f"🗑️ Arquivo/pasta local movido para a Lixeira do Windows: '{del_path}'")
+                logging.debug(f"Arquivo/pasta local movido para a Lixeira do Windows: '{del_path}'")
 
             # 2. Apagar no banco de dados SQLite local (inclusive arquivos filhos se for pasta e registros drive) com ESCAPE (F12, R11)
             if self.db_indexer:
@@ -1047,17 +1186,48 @@ class StagingQueueDialog(QDialog):
                     self.db_indexer.conn.commit()
 
         elif item.action_type == 'rotate_90':
-            # R10: Rotação 100% não destrutiva na fila (modifica apenas a miniatura no cache local)
-            item_data = {'id': item.file_id or item.path, 'path': item.path, 'source': 'local'}
-            from src.ui import thumbnails
-            cache_path = thumbnails.ThumbnailCache.get_existing_thumbnail_cache_path(item_data)
-            if not cache_path or not os.path.exists(cache_path):
-                cache_path = thumbnails.ThumbnailManager.generate_local_thumbnail(item_data, size=(300, 300))
-            if cache_path and os.path.exists(cache_path):
-                from PIL import Image
-                with Image.open(cache_path) as img:
-                    rotated = img.rotate(-90, expand=True)
-                    rotated.save(cache_path, 'PNG')
+            if not self.db_indexer:
+                raise RuntimeError('Banco de dados indisponivel para salvar a rotacao.')
+            canon_id = item.file_id or item.path
+            row = self.db_indexer.cursor.execute(
+                "SELECT thumbnailRotation FROM files "
+                "WHERE source='local' AND (file_id=? OR path=?) LIMIT 1",
+                (canon_id, item.path),
+            ).fetchone()
+            current = int(row[0] or 0) if row else 0
+            self.db_indexer.update_thumbnail_rotation(
+                canon_id, item.path, (current + 90) % 360
+            )
+
+    def _validate_local_paths(self, item):
+        """Valida todas as pontas locais da operacao antes de qualquer escrita."""
+        roots = configured_operation_roots(self.config_mgr)
+
+        def require_allowed(path, label):
+            valid, error = validate_path_in_roots(path, roots, label)
+            if not valid:
+                raise RuntimeError(f'Operacao bloqueada: {error}')
+
+        if item.action_type in ('add_tags', 'remove_tags', 'set_description'):
+            local_path = item.path
+            if not local_path and looks_like_local_path(item.file_id):
+                local_path = item.file_id
+            if local_path:
+                require_allowed(local_path, 'caminho do arquivo')
+        elif item.action_type == 'rename':
+            source = item.path or item.old_value
+            require_allowed(source, 'caminho de origem')
+            destination = os.path.join(os.path.dirname(source), item.new_value)
+            require_allowed(destination, 'caminho de destino')
+        elif item.action_type == 'move':
+            require_allowed(item.old_value or item.path, 'caminho de origem')
+            require_allowed(item.new_value, 'caminho de destino')
+        elif item.action_type == 'delete':
+            require_allowed(item.path or item.old_value, 'caminho de exclusao')
+        elif item.action_type == 'create_folder':
+            require_allowed(item.new_value or item.path, 'caminho da nova pasta')
+        elif item.action_type == 'rotate_90':
+            require_allowed(item.path, 'caminho da imagem')
 
     def _resolve_drive_folder_id_by_path(self, full_folder_path, create_if_missing=False):
         """
@@ -1090,17 +1260,7 @@ class StagingQueueDialog(QDialog):
         filepath, _ = QFileDialog.getSaveFileName(self, "Exportar Fila", "", "JSON Files (*.json)")
         if filepath:
             try:
-                data = []
-                for it in self.queue.items:
-                    data.append({
-                        'file_id': it.file_id,
-                        'file_name': it.file_name,
-                        'path': it.path,
-                        'action_type': it.action_type,
-                        'old_value': it.old_value,
-                        'new_value': it.new_value,
-                        'timestamp': it.timestamp
-                    })
+                data = [it.to_dict() for it in self.queue.items]
                 with open(filepath, 'w', encoding='utf-8') as f:
                     json.dump(data, f, indent=4, ensure_ascii=False)
                 QMessageBox.information(self, "Sucesso", "Fila exportada com sucesso.")
@@ -1114,19 +1274,26 @@ class StagingQueueDialog(QDialog):
         filepath, _ = QFileDialog.getOpenFileName(self, "Importar Fila", "", "JSON Files (*.json)")
         if filepath:
             try:
+                if os.path.getsize(filepath) > MAX_QUEUE_FILE_BYTES:
+                    raise ValueError('Arquivo da fila excede o limite de 10 MB.')
                 with open(filepath, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                
+
+                records = self.queue._get_queue_records(data)
                 count = 0
-                for d in data:
-                    it = StagingItem(
-                        d.get('file_id'), d.get('file_name', ''), d.get('path', ''),
-                        d.get('action_type'), d.get('old_value', ''), d.get('new_value', '')
-                    )
-                    it.timestamp = d.get('timestamp', time.time())
-                    self.queue.add_item(it)
-                    count += 1
-                
-                QMessageBox.information(self, "Sucesso", f"{count} itens importados com sucesso.")
+                rejected = []
+                for position, d in enumerate(records, start=1):
+                    try:
+                        it = StagingItem.from_dict(d)
+                        if self.queue.add_item(it):
+                            count += 1
+                    except Exception as item_error:
+                        rejected.append(f'Item {position}: {item_error}')
+
+                message = f"{count} itens importados com sucesso."
+                if rejected:
+                    message += f"\n{len(rejected)} itens inválidos foram ignorados."
+                    logging.warning('Itens recusados na importacao da fila: %s', '; '.join(rejected))
+                QMessageBox.information(self, "Importação Concluída", message)
             except Exception as e:
                 QMessageBox.warning(self, "Erro", f"Falha ao importar: {e}")

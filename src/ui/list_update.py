@@ -103,7 +103,7 @@ class list_update:
                         try:
                             app.indexer.ensure_conn()
                             app.indexer.cursor.execute(
-                                "SELECT file_id, name, path, mimeType, source, description, thumbnailLink, thumbnailPath, size, modifiedTime, createdTime, parentId, starred, webContentLink FROM files WHERE file_id = ? OR path = ? LIMIT 1",
+                                "SELECT file_id, name, path, mimeType, source, description, thumbnailLink, thumbnailPath, size, modifiedTime, createdTime, parentId, starred, webContentLink, thumbnailRotation FROM files WHERE file_id = ? OR path = ? LIMIT 1",
                                 (it.file_id, it.path)
                             )
                             r = app.indexer.cursor.fetchone()
@@ -127,6 +127,7 @@ class list_update:
                                     'parentId': os.path.dirname(it.new_value),
                                     'starred': bool(r[12]),
                                     'webContentLink': r[13],
+                                    'thumbnailRotation': int(r[14] or 0),
                                     'is_staged_move': True
                                 }
                         except Exception:
@@ -150,6 +151,7 @@ class list_update:
                             'parentId': os.path.dirname(it.new_value),
                             'starred': False,
                             'webContentLink': None,
+                            'thumbnailRotation': 0,
                             'is_staged_move': True
                         }
                     filtered_files.append(file_row)
@@ -342,7 +344,7 @@ class list_update:
 
         # Query ultra-fast using index (0.001s) loading all existing metadata at once
         app.indexer.cursor.execute(
-            """SELECT file_id, name, path, mimeType, modifiedTime, size, description, thumbnailLink, thumbnailPath, webContentLink 
+            """SELECT file_id, name, path, mimeType, modifiedTime, size, description, thumbnailLink, thumbnailPath, webContentLink, thumbnailRotation
                FROM files 
                WHERE parentId IN (?, ?, ?, ?) AND source = 'local'""",
             possible_parents
@@ -379,6 +381,7 @@ class list_update:
                 thumb_link = db_row[7] if (db_row and db_row[7]) else ''
                 thumb_path = db_row[8] if (db_row and db_row[8]) else ''
                 web_link = db_row[9] if (db_row and db_row[9]) else None
+                rotation = int(db_row[10] or 0) if db_row else 0
 
                 item = {
                     'id': entry_path,
@@ -393,7 +396,8 @@ class list_update:
                     'modifiedTime': modified,
                     'createdTime': data_final,
                     'parentId': norm_folder,
-                    'webContentLink': web_link
+                    'webContentLink': web_link,
+                    'thumbnailRotation': rotation,
                 }
 
                 if db_row and db_id_differs:

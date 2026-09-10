@@ -6,14 +6,19 @@ Inclui funções e classes para detectar alterações, transferir arquivos, reso
 atualizar metadados e garantir a consistência entre o armazenamento local e a nuvem.
 """
 
-import os
 import time
 import logging
+from collections import Counter
 from datetime import datetime
-from src.database.database import open_db_for_thread, FileIndexer
-from src.database.search import SearchEngine
+from src.database.database import FileIndexer
 from PyQt6.QtCore import QObject, pyqtSignal, QCoreApplication
-from src.drive.match import find_local_matches
+from src.drive.match import (
+    DriveHierarchyResolver,
+    build_local_link_index,
+    match_drive_to_local,
+)
+from src.utils.config_manager import ConfigManager
+from src.utils.path_validation import configured_operation_roots
 from .drive_service import DriveService
 
 
@@ -35,6 +40,10 @@ class DriveSync(QObject):
         self.selected_folders = selected_folders
         self._sync_completed = False
         self._sync_failed = False
+        self._match_resolver = DriveHierarchyResolver(service)
+        self._match_roots = configured_operation_roots(ConfigManager())
+        self._match_outcomes = Counter()
+        self._link_index = None
 
     def terminate(self):
         self.is_running = False
@@ -140,31 +149,23 @@ class DriveSync(QObject):
                 f"📅 Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
             if not self.is_running:
-                print("🛑 Sync cancelado antes de iniciar")
+                logging.info("Sync cancelado antes de iniciar.")
                 self.sync_failed.emit("Cancelado antes de iniciar")
                 return
 
             status_msg = "Sincronização COMPLETA do Drive..."
             self.update_status.emit(status_msg)
-            self.progress_update.emit(0, status_msg)
+            self.progress_update.emit(-1, status_msg)
 
         except Exception as e:
             error_msg = f"Erro crítico na inicialização: {str(e)}"
-            print(f"🚨 {error_msg}")
             logging.error(error_msg)
             self.sync_failed.emit(error_msg)
             return
 
-        matching_stats = {
-            'total_matches': 0,
-            'exact_matches': 0,
-            'normalized_matches': 0,
-            'aggressive_matches': 0,
-            'similarity_matches': 0,
-            'no_matches': 0,
-            'total_matching_time': 0
-        }
+        self._match_outcomes.clear()
 
+        indexer = None
         try:
 
             page_token = None
@@ -280,6 +281,9 @@ class DriveSync(QObject):
             max_consecutive_errors = 10
 
             indexer = FileIndexer(self.db_name)
+            self._link_index = build_local_link_index(
+                indexer.cursor, self._match_roots
+            )
 
             if total_files_in_drive > 0:
                 self.progress_update.emit(
@@ -384,6 +388,7 @@ class DriveSync(QObject):
                         'thumbnailLink': file.get('thumbnailLink', ''),
                         'thumbnailPath': '',
                         'size': int(file.get('size', 0)) if file.get('size') else 0,
+                        'md5Checksum': file.get('md5Checksum', ''),
                         'modifiedTime': int(datetime.strptime(file.get('modifiedTime'), "%Y-%m-%dT%H:%M:%S.%fZ").timestamp()) if file.get('modifiedTime') else 0,
                         'createdTime': int(datetime.strptime(file.get('createdTime'), "%Y-%m-%dT%H:%M:%S.%fZ").timestamp()) if file.get('createdTime') else 0,
                         'parentId': file.get('parents', [''])[0] if file.get('parents') else '',
@@ -438,6 +443,27 @@ class DriveSync(QObject):
 
                 QCoreApplication.processEvents()
 
+            if not self.is_running:
+                raise RuntimeError('Sincronizacao cancelada antes da conclusao.')
+            if consecutive_errors >= max_consecutive_errors:
+                raise RuntimeError(
+                    'Sincronizacao interrompida apos erros repetidos da API.'
+                )
+            if same_token_count >= 5:
+                raise RuntimeError(
+                    'Sincronizacao interrompida porque a API repetiu o token '
+                    'de paginacao.'
+                )
+            if empty_pages_count >= max_empty_pages and page_token:
+                raise RuntimeError(
+                    'Sincronizacao interrompida por paginas vazias antes do fim.'
+                )
+            if page_count >= max_pages and page_token:
+                raise RuntimeError(
+                    f'Sincronizacao excedeu o limite de {max_pages} paginas '
+                    'sem chegar ao fim.'
+                )
+
             self.update_status.emit("Finalizando sincronização...")
             self.progress_update.emit(
                 95, f"Finalização: {fusion_count:,} fusões realizadas")
@@ -449,22 +475,23 @@ class DriveSync(QObject):
 
             logging.info(
                 f"✅ Sincronização concluída. Total processado: {total_files_processed}, Total fusionado: {fusion_count}")
+            logging.info(
+                "Matching Drive/local: seguros=%d, ambiguos=%d, conflitos=%d, "
+                "sem correspondencia=%d.",
+                self._match_outcomes['matched'],
+                self._match_outcomes['ambiguous'],
+                self._match_outcomes['conflict'],
+                self._match_outcomes['no_match'],
+            )
             self.update_status.emit(
                 f"Sincronização concluída: {total_files_processed} arquivos. Fusionados: {fusion_count}.")
             self.progress_update.emit(100, "Sincronização concluída.")
             
             # Salvar timestamp para a sincronização incremental
-            from src.utils.config_manager import ConfigManager
             config_mgr = ConfigManager()
-            import time
             config_mgr.set('last_sync_timestamp', int(time.time()))
             
             self._emit_finish_signal(success=True)
-            if indexer:
-                try:
-                    indexer.close()
-                except Exception:
-                    pass
             self.finished.emit()
 
         except Exception as e:
@@ -472,6 +499,14 @@ class DriveSync(QObject):
                 success=False, error_msg=f"Erro na sincronização do Drive: {e}")
             logging.error(f"Erro detalhado: {e}", exc_info=True)
         finally:
+            if indexer:
+                try:
+                    indexer.close()
+                except Exception:
+                    logging.debug(
+                        "Falha ao fechar banco da sincronizacao completa.",
+                        exc_info=True,
+                    )
             if not self._sync_completed and not self._sync_failed:
                 if self.is_running:
                     logging.info("✅ FINALLY: Finalizando normalmente")
@@ -496,19 +531,27 @@ class DriveSync(QObject):
 
         for drive_item in valid_items:
             try:
-                matches = find_local_matches(drive_item, indexer.cursor, self.service)
-                if matches:
+                match = match_drive_to_local(
+                    drive_item,
+                    indexer.cursor,
+                    self.service,
+                    hierarchy_resolver=self._match_resolver,
+                    allowed_roots=self._match_roots,
+                    link_index=self._link_index,
+                )
+                self._match_outcomes[match.status] += 1
+                self._match_outcomes[f'reason:{match.reason}'] += 1
+                if match.matched:
                     drive_desc = (drive_item.get('description') or '').strip()
-                    for local_id in matches:
-                        indexer.update_description(
-                            local_id,
-                            drive_desc if drive_desc else None,
-                            drive_item.get('thumbnailLink', ''),
-                            drive_item.get('webContentLink', ''),
-                            commit=False,
-                            allow_empty_override=False,
-                        )
-                        fusion_count += 1
+                    indexer.update_description(
+                        match.local_id,
+                        drive_desc if drive_desc else None,
+                        drive_item.get('thumbnailLink') or None,
+                        drive_item.get('webContentLink') or None,
+                        commit=False,
+                        allow_empty_override=False,
+                    )
+                    fusion_count += 1
                     matched_drive_ids.append(drive_item['id'])
             except Exception as e:
                 logging.warning(
@@ -519,6 +562,8 @@ class DriveSync(QObject):
 
     def fuse_all_data(self, indexer, batch_size=1000):
         cursor = indexer.cursor
+        if self._link_index is None:
+            self._link_index = build_local_link_index(cursor, self._match_roots)
         try:
             cursor.execute("SELECT COUNT(*) FROM files WHERE source='drive'")
             total_drive = cursor.fetchone()[0]
@@ -533,7 +578,8 @@ class DriveSync(QObject):
         while True:
             cursor.execute(
                 """
-                SELECT file_id, name, size, description, thumbnailLink, webContentLink
+                SELECT file_id, name, size, description, thumbnailLink,
+                       webContentLink, parentId, mimeType
                 FROM files WHERE source='drive' LIMIT ? OFFSET ?
                 """,
                 (batch_size, offset)
@@ -542,33 +588,44 @@ class DriveSync(QObject):
             if not rows:
                 break
 
-            for file_id, name, size, description, thumbnailLink, webContentLink in rows:
+            for (file_id, name, size, description, thumbnailLink,
+                 webContentLink, parent_id, mime_type) in rows:
                 drive_item = {
                     'id': file_id,
                     'name': name or '',
                     'size': size or 0,
                     'description': description or '',
                     'thumbnailLink': thumbnailLink or '',
-                    'webContentLink': webContentLink or ''
+                    'webContentLink': webContentLink or '',
+                    'parentId': parent_id or '',
+                    'mimeType': mime_type or '',
                 }
-                matches = find_local_matches(drive_item, cursor)
-                if matches:
+                match = match_drive_to_local(
+                    drive_item,
+                    cursor,
+                    self.service,
+                    hierarchy_resolver=self._match_resolver,
+                    allowed_roots=self._match_roots,
+                    link_index=self._link_index,
+                )
+                self._match_outcomes[match.status] += 1
+                self._match_outcomes[f'reason:{match.reason}'] += 1
+                if match.matched:
                     drive_desc = (drive_item.get('description') or '').strip()
-                    for local_id in matches:
-                        try:
-                            indexer.update_description(
-                                local_id,
-                                drive_desc if drive_desc else None,
-                                drive_item.get('thumbnailLink'),
-                                drive_item.get('webContentLink'),
-                                commit=False,
-                                allow_empty_override=False,
-                            )
-                            total_fusions += 1
-                        except Exception as e:
-                            logging.error(
-                                f"❌ Erro ao fusionar metadados (ID local: {local_id}) a partir do Drive {file_id}: {e}")
-                    matched_to_delete.append(file_id)
+                    try:
+                        indexer.update_description(
+                            match.local_id,
+                            drive_desc if drive_desc else None,
+                            drive_item.get('thumbnailLink') or None,
+                            drive_item.get('webContentLink') or None,
+                            commit=False,
+                            allow_empty_override=False,
+                        )
+                        total_fusions += 1
+                        matched_to_delete.append(file_id)
+                    except Exception as e:
+                        logging.error(
+                            f"❌ Erro ao fusionar metadados (ID local: {match.local_id}) a partir do Drive {file_id}: {e}")
 
             processed += len(rows)
             indexer.conn.commit()

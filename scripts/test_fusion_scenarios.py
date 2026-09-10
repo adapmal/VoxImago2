@@ -5,9 +5,10 @@ Testa: diferentes cenários de fusão de metadados e resolução de conflitos
 
 import os
 import sys
-from database.database import FileIndexer
-from database.search import SearchEngine
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from src.database.database import FileIndexer
+from src.database.search import SearchEngine
 
 src_path = os.path.abspath(os.path.join(
     os.path.dirname(__file__), '..', 'src'))
@@ -180,9 +181,11 @@ class FusionTestScenarios:
         print(f"❌ Falhas de fusão: {results['failed_fusions']}")
         print(f"⚠️ Conflitos detectados: {results['conflicts']}")
 
-        expected_successful = 2
-        expected_failed = 1
-        expected_conflicts = 1
+        # O documento possui dois candidatos com o mesmo nome e tamanho, sem
+        # hierarquia Drive para desempatar; a recusa agora e o resultado seguro.
+        expected_successful = 1
+        expected_failed = 2
+        expected_conflicts = 0
 
         success = (results['successful_fusions'] == expected_successful and
                    results['failed_fusions'] == expected_failed and
