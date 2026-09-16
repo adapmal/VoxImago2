@@ -9,10 +9,10 @@ from PIL import Image
 
 from PyQt6.QtWidgets import (
     QFrame, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QFormLayout, QScrollArea, QMessageBox, QGroupBox, QLineEdit, QProgressBar
+    QFormLayout, QScrollArea, QMessageBox, QGroupBox, QLineEdit, QProgressBar, QApplication
 )
 from PyQt6.QtGui import QFont, QImage, QPainter, QPixmap
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QObject, QEvent
 
 from src.utils.utils import format_size
 from src.ui.thumbnails import ThumbnailCache, ThumbnailManager
@@ -23,6 +23,47 @@ from src.utils.config_manager import ConfigManager
 from src.utils.path_validation import validate_path_component
 from src.ui.vocab_panel import VocabManager
 from src.ui.tag_chips import TagChipsWidget
+
+
+class _BatchTagFocusGuard(QObject):
+    """Distingue a perda automática de foco de uma navegação do usuário."""
+
+    def __init__(self, panel):
+        super().__init__(panel)
+        self.panel = panel
+        self.app = QApplication.instance()
+        focused = self.app.focusWidget()
+        chips = panel.tag_chips_widget
+        self.target = focused if focused in (chips.input_field, chips.text_editor) else None
+        self.selection = self._selection()
+        self.navigated = False
+
+    def _selection(self):
+        return tuple((item.get('file_id') or item.get('id'), item.get('path'))
+                     for item in self.panel.current_files_list)
+
+    def arm(self):
+        # Instalar depois da desabilitação: a mudança automática inicial não
+        # conta como escolha do usuário, mas cliques/teclas seguintes contam.
+        if self.target is not None:
+            self.app.installEventFilter(self)
+
+    def eventFilter(self, watched, event):
+        if event.type() in (QEvent.Type.MouseButtonPress, QEvent.Type.TouchBegin,
+                            QEvent.Type.KeyPress):
+            self.navigated = True
+        elif event.type() == QEvent.Type.WindowDeactivate and watched is self.panel.window():
+            self.navigated = True
+        return False
+
+    def finish(self):
+        self.app.removeEventFilter(self)
+        if (self.target is not None and not self.navigated
+                and self.selection == self._selection()
+                and self.panel.window().isActiveWindow()
+                and self.target.isVisible() and self.target.isEnabled()):
+            self.target.setFocus(Qt.FocusReason.OtherFocusReason)
+        self.deleteLater()
 
 
 class FileDetailsPanel(QFrame):
@@ -580,6 +621,7 @@ class FileDetailsPanel(QFrame):
             [item.to_dict() for item in self.staging_queue.items], list(added), set(removed),
             self.staging_queue.store, self)
         self._batch_worker = worker
+        focus_guard = _BatchTagFocusGuard(self)
         self.content_widget.setEnabled(False)
         cancel = QPushButton('Cancelar preparação', win)
         batch_progress = QProgressBar(win)
@@ -591,6 +633,7 @@ class FileDetailsPanel(QFrame):
         win.status_bar.addPermanentWidget(cancel)
         cancel.clicked.connect(worker.requestInterruption)
         win.status_bar.showMessage(f'Preparando tags para {len(files):,} arquivos...')
+        focus_guard.arm()
 
         def progress(done, total):
             batch_progress.setMaximum(total)
@@ -620,6 +663,7 @@ class FileDetailsPanel(QFrame):
                 self.update_details_batch(self.current_files_list)
             elif self.current_file_item:
                 self.update_details(self.current_file_item)
+            focus_guard.finish()
             worker.deleteLater()
 
         worker.progress.connect(progress)
