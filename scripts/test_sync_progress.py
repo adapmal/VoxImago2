@@ -121,6 +121,19 @@ class FakeStatusBar:
 
 
 class SyncProgressTests(unittest.TestCase):
+    def test_first_sync_after_adoption_ignores_short_manual_window(self):
+        config = FakeConfig()
+        config.values['snapshot_reconcile_pending'] = True
+        service = FakeService([])
+        service.resource.list = Mock(return_value=FakeRequest({'files': []}))
+        indexer = FakeIndexer()
+        worker = IncrementalSyncWorker(service, config, force_window_days=7)
+        with patch('src.database.database.FileIndexer', return_value=indexer):
+            worker.run()
+        self.assertIn('1970-01-01', service.resource.list.call_args.kwargs['q'])
+        self.assertFalse(config.values['snapshot_reconcile_pending'])
+        self.assertFalse(indexer.exported)
+
     def test_local_scan_always_finishes_after_unexpected_error(self):
         worker = LocalScan('unused.db', [])
         worker._run_impl = Mock(side_effect=RuntimeError('disk failure'))
@@ -221,7 +234,7 @@ class SyncProgressTests(unittest.TestCase):
         self.assertTrue(any(value == 0 for value, _text in progress))
         self.assertTrue(any('3/3' in text for _value, text in progress))
         self.assertEqual(100, progress[-1][0])
-        self.assertTrue(indexer.exported)
+        self.assertFalse(indexer.exported)
 
     def test_status_bar_switches_between_busy_and_percentage_modes(self):
         target = SimpleNamespace(

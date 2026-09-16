@@ -124,11 +124,11 @@ class DriveFileGalleryApp(QMainWindow):
         self.current_page = 0
         self.page_size = 50
         self.search_term = ""
-        self.current_filter = "all"
+        self.current_filter = "media"
         self.current_sort = "created_desc"
         self.current_folder_id = None
-        self.advanced_filters = {}
-        self.explorer_special_active = False
+        self.advanced_filters = {'category': 'media'}
+        self.explorer_special_active = True
         self.is_loading = False
         self.all_files_loaded = False
         self.is_authenticated = False
@@ -160,6 +160,13 @@ class DriveFileGalleryApp(QMainWindow):
         self.incremental_sync_timer = QTimer()
         self.incremental_sync_timer.timeout.connect(lambda: self._run_incremental_sync(force_manual=False))
         self.incremental_sync_timer.start(15 * 60 * 1000)  # 15 minutos
+
+        # Backup local independente da sincronização e da distribuição manual.
+        self.catalog_backup_worker = None
+        self.catalog_backup_timer = QTimer(self)
+        self.catalog_backup_timer.timeout.connect(self._backup_local_catalog)
+        self.catalog_backup_timer.start(60 * 60 * 1000)
+        QTimer.singleShot(60000, self._backup_local_catalog)
 
 
         self.completer_model = QStringListModel()
@@ -967,7 +974,7 @@ class DriveFileGalleryApp(QMainWindow):
         self._run_deferred_incremental_sync()
 
     def begin_maintenance_operation(self):
-        if self.queue_execution_running or self.drive_sync_running:
+        if self.queue_execution_running or self.drive_sync_running or self.maintenance_running:
             QMessageBox.warning(
                 self, 'Operacao em andamento',
                 'Aguarde a fila ou a sincronizacao terminar.',
@@ -984,10 +991,53 @@ class DriveFileGalleryApp(QMainWindow):
         except (AttributeError, RuntimeError):
             pass
         self.maintenance_running = True
+        if hasattr(self, 'main_bar'):
+            self.main_bar.staging_queue.busy = True
         return True
+
+    def closeEvent(self, event):
+        worker = getattr(getattr(self, 'details_panel', None), '_batch_worker', None)
+        queue = getattr(getattr(self, 'main_bar', None), 'staging_queue', None)
+        autosave = getattr(queue, '_autosave_worker', None)
+        if ((worker is not None and worker.isRunning())
+                or (autosave is not None and autosave.isRunning())
+                or self.queue_execution_running or self.maintenance_running):
+            QMessageBox.information(self, 'Operação em andamento',
+                'Aguarde a gravação/execução terminar. Para interromper a preparação de tags, use Cancelar preparação na barra inferior.')
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+    def _backup_local_catalog(self):
+        if (self.catalog_backup_worker is not None or self.maintenance_running
+                or self.queue_execution_running or self.drive_sync_running):
+            return
+        if any(worker and worker.isRunning() for worker in
+               (self.inc_sync_thread, self.local_scan_thread)):
+            return
+        if not self.begin_maintenance_operation():
+            return
+        from src.ui.snapshot_dialog import SnapshotWorker
+        from src.services.snapshot_management import local_backup
+        self.catalog_backup_worker = SnapshotWorker(
+            lambda: local_backup(self.indexer.db_name, automatic=True), self)
+        self.catalog_backup_worker.succeeded.connect(
+            lambda path: logging.info('Backup local do catálogo: %s', path) if path else None)
+        def failed(message):
+            logging.warning('Backup local não concluído: %s', message)
+            self.status_bar.showMessage('Backup local não concluído. Consulte o log: ' + message, 15000)
+        self.catalog_backup_worker.failed.connect(failed)
+        def finished():
+            self.catalog_backup_worker.deleteLater()
+            self.catalog_backup_worker = None
+            self.end_maintenance_operation()
+        self.catalog_backup_worker.finished.connect(finished)
+        self.catalog_backup_worker.start()
 
     def end_maintenance_operation(self):
         self.maintenance_running = False
+        if hasattr(self, 'main_bar'):
+            self.main_bar.staging_queue.release()
         self._run_deferred_incremental_sync()
 
     def _run_deferred_incremental_sync(self):
@@ -1188,6 +1238,10 @@ class DriveFileGalleryApp(QMainWindow):
             list_update.load_next_batch(self)
 
     def _start_local_scan(self, paths_to_scan):
+        if self.maintenance_running or self.queue_execution_running:
+            QMessageBox.information(self, 'Operação em andamento',
+                'Aguarde a preparação ou execução da fila terminar antes de iniciar a varredura.')
+            return
         from src.services.local_scan import LocalScan
         self.all_loaded_label.hide()
 
@@ -1908,6 +1962,8 @@ class DriveFileGalleryApp(QMainWindow):
                 self.status_bar.showMessage("🌐 Modo Global: Busca em Todo o Acervo ativada.", 3500)
 
     def on_files_dropped_on_folder(self, dropped_items, target_folder_path):
+        if not self.main_bar.staging_queue.can_edit():
+            return
         if not dropped_items or not target_folder_path:
             return
 

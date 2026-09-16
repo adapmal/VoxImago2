@@ -45,9 +45,12 @@ class AdvancedSettingsDialog(QDialog):
             "background-color: #1565C0; color: white; font-weight: bold; padding: 10px;"
         )
         self.health_btn.clicked.connect(self._open_database_health)
+        self.snapshot_btn = QPushButton('Snapshots — comparar, publicar ou restaurar')
+        self.snapshot_btn.clicked.connect(self._open_snapshots)
         
         self.settings_layout.addWidget(self.info_label)
         self.settings_layout.addWidget(self.health_btn)
+        self.settings_layout.addWidget(self.snapshot_btn)
         self.settings_layout.addWidget(self.restore_btn)
         
         self.main_widget = QWidget()
@@ -112,9 +115,6 @@ class AdvancedSettingsDialog(QDialog):
                         )
                 self.indexer.conn.commit()
                 
-            if self.config_mgr.is_sandbox():
-                self.indexer.export_to_shared_cache()
-                
             QMessageBox.information(self, "Sucesso", f"Restauração concluída!\n{updates} arquivos tiveram suas tags atualizadas localmente.")
             self.accept()
         except Exception as e:
@@ -124,3 +124,7 @@ class AdvancedSettingsDialog(QDialog):
         from src.ui.database_health_dialog import DatabaseHealthDialog
         dialog = DatabaseHealthDialog(self.parent(), indexer=self.indexer)
         dialog.exec()
+
+    def _open_snapshots(self):
+        from src.ui.snapshot_dialog import SnapshotDialog
+        SnapshotDialog(self.parent(), indexer=self.indexer).exec()

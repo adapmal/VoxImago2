@@ -19,13 +19,8 @@ import mimetypes
 
 from src.database.snapshot import (
     SCHEMA_VERSION,
-    build_root_mapping,
     create_manifest,
-    infer_local_roots,
     publish_generation,
-    rebase_local_paths,
-    select_snapshot_database,
-    sqlite_has_files_schema,
     sqlite_is_healthy,
 )
 
@@ -89,124 +84,15 @@ class FileIndexer:
             os.makedirs(db_dir, exist_ok=True)
             logging.info("Pasta de banco criada automaticamente: %s", db_dir)
 
-        # Recuperacao estrutural. A decisao continua conservadora: um banco
-        # apenas desatualizado nunca e sobrescrito automaticamente.
-        needs_restore = False
-        confirmed_corrupt = False
-        restored_manifest = None
-        restored_snapshot = None
-        if not os.path.exists(self.db_name) or os.path.getsize(self.db_name) == 0:
-            needs_restore = True
-        else:
-            test_conn = None
-            try:
-                test_conn = sqlite3.connect(self.db_name, timeout=5.0)
-                test_cur = test_conn.cursor()
-                test_cur.execute("PRAGMA integrity_check")
-                res = test_cur.fetchone()
-                if not res or res[0] != 'ok':
-                    needs_restore = True
-                    confirmed_corrupt = True
-            except sqlite3.Error as exc:
-                message = str(exc).lower()
-                if 'locked' in message or 'busy' in message:
-                    logging.warning(
-                        "Banco temporariamente ocupado durante a verificacao: %s",
-                        exc,
-                    )
-                else:
-                    needs_restore = True
-                    confirmed_corrupt = True
-            except Exception as exc:
-                logging.warning(
-                    "Nao foi possivel verificar o banco local: %s", exc
+        # Um snapshot compartilhado nunca substitui automaticamente o catálogo.
+        # A adoção manual é aplicada na inicialização, antes de abrir conexões.
+        if os.path.isfile(self.db_name) and os.path.getsize(self.db_name):
+            healthy, reason = sqlite_is_healthy(self.db_name)
+            if not healthy:
+                raise RuntimeError(
+                    'Banco local indisponível; nenhum arquivo foi substituído. '
+                    'Use a restauração manual em Snapshots. Detalhe: ' + reason
                 )
-            finally:
-                if test_conn is not None:
-                    test_conn.close()
-
-        if needs_restore and not config_mgr.is_sandbox():
-            s_path, manifest, selection_reason = select_snapshot_database(
-                config_mgr.get_shared_cache_candidates(SCHEMA_VERSION),
-                max_schema_version=SCHEMA_VERSION,
-            )
-            if not s_path:
-                logging.warning(
-                    "[AUTORECOVERY] Restauracao compartilhada indisponivel: %s",
-                    selection_reason,
-                )
-            else:
-                try:
-                    healthy, reason = sqlite_is_healthy(s_path)
-                    if not healthy or not sqlite_has_files_schema(s_path):
-                        raise RuntimeError(
-                            'Snapshot nao e um banco VoxImago utilizavel: '
-                            f'{reason}'
-                        )
-
-                    logging.info(
-                        "[AUTORECOVERY] Banco local corrompido, vazio ou ausente. "
-                        "Restaurando snapshot verificado (%s)...", s_path,
-                    )
-                    for ext in ["-wal", "-shm"]:
-                        wal_path = self.db_name + ext
-                        if os.path.exists(wal_path):
-                            try:
-                                os.remove(wal_path)
-                            except OSError:
-                                pass
-
-                    if os.path.isfile(self.db_name) and os.path.getsize(self.db_name) > 0:
-                        corrupt_copy = (
-                            f"{self.db_name}.corrupt-{time.strftime('%Y%m%d-%H%M%S')}"
-                        )
-                        shutil.copy2(self.db_name, corrupt_copy)
-
-                    restore_tmp = self.db_name + f'.restore-{os.getpid()}.tmp'
-                    shutil.copy2(s_path, restore_tmp)
-                    copied_ok, copied_reason = sqlite_is_healthy(restore_tmp)
-                    if not copied_ok:
-                        raise RuntimeError(
-                            f'Copia local do snapshot falhou na validacao: {copied_reason}'
-                        )
-                    os.replace(restore_tmp, self.db_name)
-                    restored_snapshot = s_path
-                    restored_manifest = manifest
-                    logging.info(
-                        "[OK] Banco local restaurado a partir do snapshot verificado."
-                    )
-                except Exception as e_copy:
-                    logging.warning(
-                        "[AVISO] Nao foi possivel restaurar snapshot %s: %s",
-                        s_path, e_copy,
-                    )
-                    restore_tmp = self.db_name + f'.restore-{os.getpid()}.tmp'
-                    if os.path.exists(restore_tmp):
-                        try:
-                            os.remove(restore_tmp)
-                        except OSError:
-                            pass
-
-        if confirmed_corrupt and not restored_snapshot and os.path.isfile(self.db_name):
-            # Manter o arquivo integralmente recuperavel e permitir que o app
-            # abra um banco novo para posterior scan/sync. Nunca apagar a unica
-            # copia corrompida.
-            corrupt_copy = (
-                f"{self.db_name}.corrupt-{time.strftime('%Y%m%d-%H%M%S')}"
-            )
-            os.replace(self.db_name, corrupt_copy)
-            for extension in ('-wal', '-shm'):
-                sidecar = self.db_name + extension
-                if os.path.exists(sidecar):
-                    try:
-                        os.replace(sidecar, corrupt_copy + extension)
-                    except OSError:
-                        pass
-            logging.error(
-                "[AUTORECOVERY] Snapshot indisponivel. Banco corrompido "
-                "preservado em %s; um indice local novo sera criado.",
-                corrupt_copy,
-            )
 
         self.conn = sqlite3.connect(self.db_name, check_same_thread=False, timeout=30.0)
         self.conn.create_function("py_lower", 1, lambda s: s.lower() if s else s)
@@ -214,25 +100,6 @@ class FileIndexer:
         self.cursor.execute("PRAGMA journal_mode=WAL")
         self.cursor.execute("PRAGMA busy_timeout=30000")
         self._create_tables()
-        if restored_snapshot:
-            target_roots = config_mgr.get_resolved_scan_paths(persist=True)
-            source_roots = list((restored_manifest or {}).get('scan_roots') or [])
-            if not source_roots:
-                source_roots = infer_local_roots(self.conn)
-            for source_root, target_root in build_root_mapping(
-                    source_roots, target_roots):
-                changed = rebase_local_paths(
-                    self.conn, source_root, target_root
-                )
-                logging.info(
-                    "[AUTORECOVERY] %d caminhos remapeados: %s -> %s",
-                    changed, source_root, target_root,
-                )
-            if restored_manifest and restored_manifest.get('generation'):
-                config_mgr.set(
-                    'shared_snapshot_generation',
-                    str(restored_manifest['generation']),
-                )
         self._count_cache = {}
         self._paged_cache = {}
         self._auto_rebuild_search_index()
@@ -1014,7 +881,7 @@ class FileIndexer:
         if commit:
             self.conn.commit()
 
-    def export_to_shared_cache(self, target_path=None):
+    def export_to_shared_cache(self, target_path=None, *, expected_previous_generation=None):
         """Publica uma geracao versionada; o manifesto e trocado por ultimo."""
         local_tmp_db = None
         local_tmp_csv = None
@@ -1075,6 +942,8 @@ class FileIndexer:
                 scan_roots=config_mgr.get_resolved_scan_paths(persist=False),
                 generation=generation,
             )
+            manifest['catalog_mode'] = 'sandbox' if config_mgr.is_sandbox() else 'production'
+            manifest['drive_id'] = config_mgr.get_current_drive_id()
             dest_conn.close()
             dest_conn = None
             remote_db, _remote_csv, pointer = publish_generation(
@@ -1082,9 +951,7 @@ class FileIndexer:
                 local_tmp_db,
                 local_tmp_csv,
                 manifest,
-                expected_previous_generation=config_mgr.get(
-                    'shared_snapshot_generation'
-                ),
+                expected_previous_generation=expected_previous_generation,
             )
             config_mgr.set('shared_snapshot_generation', generation)
 

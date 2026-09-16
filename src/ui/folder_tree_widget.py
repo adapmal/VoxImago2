@@ -398,7 +398,6 @@ class FolderTreeWidget(QWidget):
                             (desc, norm_desc, local_p)
                         )
                 indexer.conn.commit()
-                snapshot_exported = indexer.export_to_shared_cache()
 
             if hasattr(win, '_force_refresh_after_sync'):
                 win._force_refresh_after_sync()
@@ -414,14 +413,7 @@ class FolderTreeWidget(QWidget):
                     list_update.load_next_batch(win)
 
             if hasattr(win, 'status_bar') and win.status_bar:
-                if snapshot_exported:
-                    win.status_bar.showMessage(f"✅ {len(drive_files)} arquivos da pasta '{os.path.basename(folder_path)}' sincronizados com o Drive!", 4000)
-                else:
-                    win.status_bar.showMessage(
-                        "⚠️ Tags sincronizadas, mas o snapshot não foi "
-                        "publicado. Verifique a saúde do banco.",
-                        10000,
-                    )
+                win.status_bar.showMessage(f"✅ {len(drive_files)} arquivos da pasta '{os.path.basename(folder_path)}' sincronizados com o Drive!", 4000)
 
         except Exception as e:
             QMessageBox.critical(self, "Erro na Sincronização", f"Ocorreu um erro ao sincronizar com o Drive:\n{e}")

@@ -18,10 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.database.search import SearchEngine
-from src.database.snapshot import (
-    SCHEMA_VERSION,
-    select_snapshot_database,
-)
+from src.database.snapshot import SCHEMA_VERSION
 from src.utils.config_manager import ConfigManager
 from src.utils.staging_schema import StagingItem
 
@@ -259,7 +256,29 @@ def diagnose(db_path, *, full=False, repair_indexes=False):
         queue_path = PROJECT_ROOT / 'config' / 'staging_queue.json'
         queue_count = 0
         invalid_queue = 0
-        if queue_path.is_file():
+        durable_queue_path = PROJECT_ROOT / 'data' / 'staging_queue.db'
+        if durable_queue_path.is_file():
+            queue_connection = None
+            try:
+                queue_connection = sqlite3.connect(durable_queue_path.as_uri() + '?mode=ro', uri=True)
+                initialized = queue_connection.execute("SELECT value FROM metadata WHERE key='initialized'").fetchone()
+                if not initialized:
+                    raise ValueError('Migração da fila não concluída')
+                for (payload,) in queue_connection.execute('SELECT payload FROM items'):
+                    try:
+                        StagingItem.from_dict(json.loads(payload))
+                        queue_count += 1
+                    except Exception:
+                        invalid_queue += 1
+                uncertain = queue_connection.execute("SELECT COUNT(*) FROM execution JOIN items ON items.id=execution.id WHERE state='uncertain'").fetchone()[0]
+                if uncertain:
+                    _add(report, 'warning', 'execucao_fila', f'{uncertain} operação(ões) com resultado incerto; conferir antes de repetir.')
+            except Exception:
+                invalid_queue += 1
+            finally:
+                if queue_connection is not None:
+                    queue_connection.close()
+        elif queue_path.is_file():
             try:
                 data = json.loads(queue_path.read_text(encoding='utf-8'))
                 records = data if isinstance(data, list) else data.get('items', [])
@@ -280,37 +299,10 @@ def diagnose(db_path, *, full=False, repair_indexes=False):
             invalid=invalid_queue,
         )
 
-        snapshot_path, manifest, snapshot_reason = select_snapshot_database(
-            config.get_shared_cache_candidates(SCHEMA_VERSION)
-        )
-        if snapshot_path:
-            generation = (manifest or {}).get('generation')
-            known_generation = config.get('shared_snapshot_generation')
-            adopted = bool(
-                generation and str(generation) == str(known_generation)
-            )
-            severity = 'ok' if manifest and adopted else 'warning'
-            message = f'Snapshot encontrado: {snapshot_path}'
-            if manifest:
-                message += f'; geracao={generation}'
-                if not adopted:
-                    message += '; esta instalacao ainda nao adotou essa geracao'
-                shared_counts = manifest.get('row_counts') or {}
-                if shared_counts != counts:
-                    message += '; contagens local/compartilhada diferem'
-            _add(
-                report, severity, 'snapshot_compartilhado', message,
-                path=snapshot_path,
-                generation=generation,
-                known_generation=known_generation,
-                local_counts=counts,
-                shared_counts=(manifest or {}).get('row_counts'),
-            )
-        else:
-            _add(
-                report, 'warning', 'snapshot_compartilhado',
-                snapshot_reason,
-            )
+        _add(report, 'info', 'snapshot_compartilhado',
+             'Distribuicao manual. Disponibilidade e diferencas de snapshot nao '
+             'indicam defeito no banco local. Use Sistema / Avancado > Snapshots '
+             'para comparar, publicar ou preparar uma restauracao.')
     finally:
         connection.close()
     return report

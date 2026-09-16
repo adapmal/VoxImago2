@@ -1,4 +1,4 @@
-"""Teste de restauracao automatica e remapeamento entre letras de unidade."""
+"""Teste de restauração exclusivamente manual e remapeamento de caminhos."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.database.database import FileIndexer
 from src.database.snapshot import create_manifest, publish_generation
 from src.utils.config_manager import ConfigManager
+from src.services.snapshot_management import inspect_snapshot, prepare_adoption, apply_pending_adoption
 
 
 class SnapshotRestoreTests(unittest.TestCase):
@@ -34,21 +35,18 @@ class SnapshotRestoreTests(unittest.TestCase):
                     return_value=[],
                 ),
             ):
-                indexer = FileIndexer(db_path)
+                with self.assertRaises(RuntimeError):
+                    FileIndexer(db_path)
+            self.assertEqual(original, Path(db_path).read_bytes())
 
-            self.assertTrue(indexer.search_index_is_consistent()[0])
-            indexer.close()
-            preserved = list(Path(temp_dir).glob('corrupt.db.corrupt-*'))
-            self.assertEqual(1, len(preserved))
-            self.assertEqual(original, preserved[0].read_bytes())
-
-    def test_missing_database_is_restored_and_rebased(self):
+    def test_missing_database_requires_manual_adoption_and_rebase(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             seed_db = os.path.join(temp_dir, 'seed.db')
             seed_csv = os.path.join(temp_dir, 'seed.csv')
             base_path = os.path.join(temp_dir, 'file_index_shared_v2.db')
             old_root = r'L:\Drives Compartilhados\Banco de Imagens'
-            new_root = r'G:\Shared drives\Image Bank'
+            new_root = os.path.join(temp_dir, 'Image Bank')
+            os.mkdir(new_root)
             old_path = old_root + r'\2010\foto.jpg'
 
             with patch.object(ConfigManager, 'is_sandbox', return_value=True):
@@ -82,6 +80,9 @@ class SnapshotRestoreTests(unittest.TestCase):
             publish_generation(base_path, seed_db, seed_csv, manifest)
 
             restored_db = os.path.join(temp_dir, 'restored.db')
+            empty = FileIndexer(restored_db)
+            self.assertEqual(0, empty.conn.execute('SELECT COUNT(*) FROM files').fetchone()[0])
+            empty.close()
             with (
                 patch.object(ConfigManager, 'is_sandbox', return_value=False),
                 patch.object(
@@ -94,8 +95,12 @@ class SnapshotRestoreTests(unittest.TestCase):
                     'get_resolved_scan_paths',
                     return_value=[new_root],
                 ),
-                patch.object(ConfigManager, 'set') as config_set,
+                patch('src.services.snapshot_management.persist_adoption_config') as config_set,
             ):
+                info = inspect_snapshot(base_path)
+                prepare_adoption(restored_db, info, [(old_root, new_root)])
+                backup = apply_pending_adoption(restored_db)
+                self.assertTrue(os.path.isfile(backup))
                 restored = FileIndexer(restored_db)
 
             row = restored.conn.execute(
@@ -106,9 +111,7 @@ class SnapshotRestoreTests(unittest.TestCase):
             )
             self.assertEqual(row[0], row[1])
             self.assertEqual('Brasil, Pará', row[2])
-            config_set.assert_called_with(
-                'shared_snapshot_generation', 'restore-generation'
-            )
+            self.assertEqual('restore-generation', config_set.call_args.args[0]['generation'])
             restored.close()
 
 

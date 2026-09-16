@@ -34,7 +34,10 @@ class IncrementalSyncWorker(QObject):
             from src.database.database import FileIndexer
             local_indexer = FileIndexer()
             
-            if self.force_window_days:
+            if self.config_mgr.get('snapshot_reconcile_pending'):
+                # Uma cópia antiga pode ter mudanças anteriores à janela manual.
+                last_sync = 1
+            elif self.force_window_days:
                 last_sync = int(time.time() - self.force_window_days * 86400)
             else:
                 last_sync = self.config_mgr.get('last_sync_timestamp')
@@ -86,6 +89,7 @@ class IncrementalSyncWorker(QObject):
             if not updated_files:
                 logging.info("Nenhum arquivo novo ou modificado encontrado no Drive.")
                 self.config_mgr.set('last_sync_timestamp', int(time.time()))
+                self.config_mgr.set('snapshot_reconcile_pending', False)
                 self.progress_update.emit(100, "Google Drive já está atualizado.")
                 self.sync_finished.emit(0)
                 return
@@ -221,26 +225,15 @@ class IncrementalSyncWorker(QObject):
                 match_outcomes['no_match'],
             )
             
-            # Exportar cache compartilhado (.db e .csv)
-            self.progress_update.emit(
-                98, "Finalizando e exportando o índice compartilhado..."
-            )
-            snapshot_exported = local_indexer.export_to_shared_cache()
-
             # Atualizar Timestamp
             self.config_mgr.set('last_sync_timestamp', int(time.time()))
+            self.config_mgr.set('snapshot_reconcile_pending', False)
 
             self.progress_update.emit(
                 100,
                 f"Sincronização concluída: {total_updated:,} arquivo(s) processado(s).",
             )
             self.sync_finished.emit(len(updated_files))
-            if not snapshot_exported:
-                self.sync_warning.emit(
-                    'Os dados locais foram sincronizados, mas o snapshot '
-                    'compartilhado nao foi publicado. Abra Sistema / '
-                    'Avancado > Saude e reparo do banco.'
-                )
 
         except Exception as e:
             logging.error(f"❌ Erro na Sincronização Incremental: {e}", exc_info=True)

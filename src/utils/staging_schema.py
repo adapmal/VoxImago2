@@ -2,6 +2,7 @@
 
 import os
 import time
+import uuid
 
 from src.utils.path_validation import validate_path_component
 
@@ -10,8 +11,8 @@ ALLOWED_ACTION_TYPES = {
     'add_tags', 'remove_tags', 'set_description', 'rename', 'move',
     'delete', 'create_folder', 'rotate_90',
 }
-MAX_QUEUE_ITEMS = 10000
-MAX_QUEUE_FILE_BYTES = 10 * 1024 * 1024
+MAX_QUEUE_ITEMS = 100000
+MAX_QUEUE_FILE_BYTES = 64 * 1024 * 1024
 MAX_QUEUE_TEXT_LENGTH = 1024 * 1024
 
 
@@ -24,6 +25,7 @@ class StagingItem:
         self.old_value = old_value
         self.new_value = new_value
         self.timestamp = time.time()
+        self.operation_id = uuid.uuid4().hex
 
     def to_dict(self):
         # A lista e os nomes dos campos permanecem compativeis com as versoes
@@ -37,6 +39,7 @@ class StagingItem:
             'old_value': self.old_value,
             'new_value': self.new_value,
             'timestamp': self.timestamp,
+            'operation_id': self.operation_id,
         }
 
     @classmethod
@@ -64,6 +67,10 @@ class StagingItem:
         if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
             raise ValueError('Campo "timestamp" deve ser numerico.')
         item.timestamp = float(timestamp)
+        operation_id = data.get('operation_id', item.operation_id)
+        if not isinstance(operation_id, str) or not operation_id or len(operation_id) > 128:
+            raise ValueError('Identificador de operação inválido.')
+        item.operation_id = operation_id
         item.validate()
         return item
 

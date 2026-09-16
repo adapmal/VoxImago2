@@ -15,6 +15,11 @@ token.json
 # Banco de dados com arquivos pessoais
 data/file_index.db
 data/file_index.db-*
+data/queue_autosave/
+data/catalog_backups/
+data/*.adoption.json
+data/voximago-instance.lock
+data/staging_queue.db*
 *.db
 *.db-shm
 *.db-wal

@@ -9,7 +9,7 @@ from PIL import Image
 
 from PyQt6.QtWidgets import (
     QFrame, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QFormLayout, QScrollArea, QMessageBox, QGroupBox, QLineEdit
+    QFormLayout, QScrollArea, QMessageBox, QGroupBox, QLineEdit, QProgressBar
 )
 from PyQt6.QtGui import QFont, QImage, QPainter, QPixmap
 from PyQt6.QtCore import Qt, QTimer
@@ -33,6 +33,7 @@ class FileDetailsPanel(QFrame):
         self.auto_tagger = AutoTagger()
         self.staging_queue = StagingQueue()
         self.config_mgr = ConfigManager()
+        self._batch_worker = None
 
         self.main_layout = QVBoxLayout(self)
         self.main_layout.setContentsMargins(10, 10, 10, 10)
@@ -301,11 +302,7 @@ class FileDetailsPanel(QFrame):
         """Retorna a descrição atual considerando itens pendentes na fila de staging."""
         if not file_item:
             return ""
-        fid = file_item.get('file_id') or file_item.get('id')
-        for it in self.staging_queue.items:
-            if it.file_id == fid and it.action_type in ('set_description', 'add_tags', 'remove_tags'):
-                return it.new_value
-        return file_item.get('description', '')
+        return self.staging_queue.effective_description(file_item)
 
     def update_details_batch(self, files_list):
         if hasattr(self, 'tag_chips_widget') and self.tag_chips_widget and getattr(self.tag_chips_widget, '_is_text_mode', False):
@@ -359,7 +356,7 @@ class FileDetailsPanel(QFrame):
         rotatable_count = sum(
             1 for item in files_list
             if item and item.get('source') == 'local'
-            and item.get('path') and os.path.isfile(item.get('path'))
+            and item.get('path') and item.get('mimeType') not in ('folder', 'application/vnd.google-apps.folder')
         )
         self.btn_rotate.setText(
             f"🔄 Girar seleção 90° ({rotatable_count})"
@@ -516,17 +513,26 @@ class FileDetailsPanel(QFrame):
     def _add_all_suggestions_action(self):
         if not self.current_suggestions:
             return
-        for tag in list(self.current_suggestions):
-            self.tag_chips_widget.add_tag(tag)
+        if not self.staging_queue.can_edit():
+            return
+        previous = self._is_updating
+        self._is_updating = True
+        try:
+            for tag in list(self.current_suggestions):
+                self.tag_chips_widget.add_tag(tag)
+        finally:
+            self._is_updating = previous
+        self._on_tags_changed(', '.join(self.tag_chips_widget.get_active_tags()))
         self._refresh_suggestions_view()
 
     def _on_tags_changed(self, new_desc):
         if self._is_updating:
             return
+        if not self.staging_queue.can_edit():
+            return
             
         if getattr(self, '_is_batch_mode', False) and getattr(self, 'current_files_list', None):
             added_tags, removed_tags = self.tag_chips_widget.get_explicit_intent()
-            added_set = set(t.lower() for t in added_tags)
             removed_set = set(t.lower() for t in removed_tags)
             current_active_lower = set(t.lower() for t in self.tag_chips_widget.get_active_tags())
 
@@ -534,45 +540,7 @@ class FileDetailsPanel(QFrame):
             initial_common = getattr(self, '_batch_initial_common_tags', set())
             explicitly_removed = (initial_common - current_active_lower).union(removed_set)
 
-            for item in self.current_files_list:
-                fid = item.get('file_id') or item.get('id')
-                fpath = item.get('path', '')
-                fname = item.get('name', 'N/A')
-                
-                # Buscar a descrição original salva no banco de dados SQLite para comparação
-                db_orig_desc = ""
-                if hasattr(self.parent_app, 'indexer') and self.parent_app.indexer:
-                    self.parent_app.indexer.ensure_conn()
-                    self.parent_app.indexer.cursor.execute(
-                        "SELECT description FROM files WHERE file_id = ? OR path = ? LIMIT 1",
-                        (fid, fpath)
-                    )
-                    r = self.parent_app.indexer.cursor.fetchone()
-                    if r:
-                        db_orig_desc = r[0] or ""
-
-                eff_desc = self._get_effective_description(item)
-                
-                # Partir da descrição EFETIVA do arquivo (preservando edições individuais prévias)
-                current_file_tags = self.tag_chips_widget._parse_tags(eff_desc)
-                final_tags = []
-                for t in current_file_tags:
-                    if t.lower() not in explicitly_removed:
-                        final_tags.append(t)
-                for at in added_tags:
-                    if at.lower() not in [ft.lower() for ft in final_tags]:
-                        final_tags.append(at)
-                
-                file_new_desc = ", ".join(final_tags)
-                
-                for it in list(self.staging_queue.items):
-                    if it.file_id == fid and it.action_type in ('set_description', 'add_tags', 'remove_tags'):
-                        self.staging_queue.remove_item(it)
-                
-                if file_new_desc != db_orig_desc:
-                    st_item = StagingItem(fid, fname, fpath, 'set_description', old_value=db_orig_desc, new_value=file_new_desc)
-                    self.staging_queue.add_item(st_item)
-            self._refresh_suggestions_view()
+            self._start_batch_tags(added_tags, explicitly_removed)
             return
             
         raw_fid = self.current_file_item.get('file_id') or self.current_file_item.get('id') or ''
@@ -593,18 +561,74 @@ class FileDetailsPanel(QFrame):
             if r:
                 old_desc = r[0] or ""
 
-        for it in list(self.staging_queue.items):
-            it_fid = os.path.normcase(os.path.normpath(it.file_id)) if it.file_id else ''
-            it_path = os.path.normcase(os.path.normpath(it.path)) if it.path else ''
-            if (it_fid and (it_fid == norm_fid or it_fid == norm_path)) or (it_path and (it_path == norm_path or it_path == norm_fid)):
-                if it.action_type in ('set_description', 'add_tags', 'remove_tags'):
-                    self.staging_queue.remove_item(it)
-
+        item = None
         if new_desc != old_desc:
             item = StagingItem(raw_fid or raw_path, fname, raw_path, 'set_description', old_value=old_desc, new_value=new_desc)
-            self.staging_queue.add_item(item)
+        self.staging_queue.replace_description(item, {value for value in (norm_fid, norm_path) if value})
             
         self._refresh_suggestions_view()
+
+    def _start_batch_tags(self, added, removed):
+        from src.services.batch_tags import BatchTagsWorker
+        win = self.parent_app
+        if not win.begin_maintenance_operation():
+            self.update_details_batch(self.current_files_list)
+            return
+        self.staging_queue.busy = True
+        files = [dict(item) for item in self.current_files_list]
+        worker = BatchTagsWorker(win.indexer.db_name, files,
+            [item.to_dict() for item in self.staging_queue.items], list(added), set(removed),
+            self.staging_queue.store, self)
+        self._batch_worker = worker
+        self.content_widget.setEnabled(False)
+        cancel = QPushButton('Cancelar preparação', win)
+        batch_progress = QProgressBar(win)
+        batch_progress.setRange(0, len(files))
+        batch_progress.setValue(0)
+        batch_progress.setFormat('Tags: %v/%m (%p%)')
+        batch_progress.setMinimumWidth(220)
+        win.status_bar.addPermanentWidget(batch_progress)
+        win.status_bar.addPermanentWidget(cancel)
+        cancel.clicked.connect(worker.requestInterruption)
+        win.status_bar.showMessage(f'Preparando tags para {len(files):,} arquivos...')
+
+        def progress(done, total):
+            batch_progress.setMaximum(total)
+            batch_progress.setValue(done)
+            win.status_bar.showMessage(f'Preparando tags: {done:,}/{total:,} arquivos')
+
+        def saving():
+            cancel.setEnabled(False)
+            win.status_bar.showMessage('Salvando o lote na fila...')
+
+        def succeeded(records):
+            self.staging_queue.items = [StagingItem.from_dict(row) for row in records]
+            self.staging_queue._tag_index = None
+            self.staging_queue.queueChanged.emit(self.staging_queue.count())
+            win.status_bar.showMessage(f'Tags preparadas para {len(files):,} arquivos. Fila salva.', 10000)
+
+        def finish():
+            win.status_bar.removeWidget(batch_progress)
+            batch_progress.deleteLater()
+            win.status_bar.removeWidget(cancel)
+            cancel.deleteLater()
+            self.content_widget.setEnabled(True)
+            self.staging_queue.release()
+            win.end_maintenance_operation()
+            self._batch_worker = None
+            if self._is_batch_mode and self.current_files_list:
+                self.update_details_batch(self.current_files_list)
+            elif self.current_file_item:
+                self.update_details(self.current_file_item)
+            worker.deleteLater()
+
+        worker.progress.connect(progress)
+        worker.saving.connect(saving)
+        worker.succeeded.connect(succeeded)
+        worker.cancelled.connect(lambda: win.status_bar.showMessage('Preparação cancelada. Fila anterior preservada.', 10000))
+        worker.failed.connect(lambda message: QMessageBox.critical(self, 'Lote não aplicado', message))
+        worker.finished.connect(finish)
+        worker.start()
 
 
     def _on_name_edited(self, new_name):

@@ -10,9 +10,10 @@ import logging
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QListWidget, QListWidgetItem,
     QPushButton, QLabel, QMessageBox, QWidget, QFrame, QSplitter,
-    QAbstractItemView, QProgressDialog, QPlainTextEdit
+    QAbstractItemView, QProgressDialog, QPlainTextEdit, QProgressBar, QListView
 )
-from PyQt6.QtCore import Qt, QObject, pyqtSignal, QCoreApplication
+from PyQt6.QtCore import Qt, QObject, pyqtSignal, QCoreApplication, QTimer, QThread
+from src.utils.queue_store import QueueStore, atomic_json, validated_records
 from src.utils.config_manager import ConfigManager
 from src.drive.match import (
     DriveHierarchyResolver,
@@ -41,6 +42,20 @@ class _StagingSignals(QObject):
     cleared = pyqtSignal()
 
 
+class QueueAutosaveWorker(QThread):
+    failed = pyqtSignal(str)
+
+    def __init__(self, store):
+        super().__init__()
+        self.store = store
+
+    def run(self):
+        try:
+            self.store.autosave()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class StagingQueue:
     _instance = None
 
@@ -53,7 +68,18 @@ class StagingQueue:
             cls._instance.itemRemoved = cls._instance.signals.itemRemoved
             cls._instance.cleared = cls._instance.signals.cleared
             cls._instance.items = []
+            cls._instance.busy = False
+            cls._instance.load_error = None
+            cls._instance._autosave_worker = None
+            cls._instance._autosave_pending = False
+            cls._instance.store = QueueStore(os.path.join('data', 'staging_queue.db'), QUEUE_CACHE_FILE)
             cls._instance._load_from_disk()
+            cls._instance.timer = QTimer(cls._instance.signals)
+            cls._instance.timer.setInterval(5 * 60 * 1000)
+            cls._instance.timer.timeout.connect(cls._instance.request_autosave)
+            cls._instance.timer.start()
+            if cls._instance.load_error:
+                QTimer.singleShot(0, cls._instance._show_load_error)
         return cls._instance
 
     def __init__(self, *args, **kwargs):
@@ -61,31 +87,61 @@ class StagingQueue:
 
     def _save_to_disk(self):
         try:
-            os.makedirs(os.path.dirname(QUEUE_CACHE_FILE), exist_ok=True)
-            data = [it.to_dict() for it in self.items]
-            with open(QUEUE_CACHE_FILE, 'w', encoding='utf-8') as f:
-                import json
-                json.dump(data, f, indent=2, ensure_ascii=False)
+            if self.load_error:
+                raise ValueError(self.load_error)
+            self.store.save([it.to_dict() for it in self.items])
+            self._tag_index = None
+            return True
         except Exception as e:
             logging.error(f"Erro ao salvar fila no disco: {e}")
+            if not self.load_error:
+                self.items = [StagingItem.from_dict(row) for row in self.store.load()]
+            self._tag_index = None
+            QMessageBox.critical(None, 'Fila não salva', str(e))
+            return False
 
     def _load_from_disk(self):
-        if os.path.exists(QUEUE_CACHE_FILE):
-            try:
-                import json
-                if os.path.getsize(QUEUE_CACHE_FILE) > MAX_QUEUE_FILE_BYTES:
-                    raise ValueError('Arquivo da fila excede o limite de 10 MB.')
-                with open(QUEUE_CACHE_FILE, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    records = self._get_queue_records(data)
-                    for position, d in enumerate(records, start=1):
-                        try:
-                            it = StagingItem.from_dict(d)
-                            self.items.append(it)
-                        except Exception as item_e:
-                            logging.error(f"Item {position} da fila ignorado: {item_e}")
-            except Exception as e:
-                logging.error(f"Erro ao carregar fila do disco: {e}")
+        self._tag_index = None
+        try:
+            self.items = [StagingItem.from_dict(row) for row in self.store.initialize()]
+        except Exception as exc:
+            self.load_error = str(exc)
+            logging.exception('Fila preservada no disco, mas não pôde ser carregada.')
+
+    def _show_load_error(self):
+        QMessageBox.critical(None, 'Recuperação da fila necessária',
+            'Não foi possível carregar a fila. Novas edições estão bloqueadas para preservar os dados.\n'
+            'Abra a Fila e use Recuperar autosave.\n\n' + self.load_error)
+
+    def can_edit(self):
+        if self.busy or self.load_error:
+            QMessageBox.warning(None, 'Fila indisponível', self.load_error or 'Aguarde a operação atual da fila terminar.')
+            return False
+        return True
+
+    def request_autosave(self):
+        if self.busy or self.load_error or (self._autosave_worker and self._autosave_worker.isRunning()):
+            self._autosave_pending = True
+            return
+        self._autosave_pending = False
+        self._autosave_worker = QueueAutosaveWorker(self.store)
+        self._autosave_worker.failed.connect(lambda error: QMessageBox.warning(None, 'Falha no autosave', error))
+        self._autosave_worker.start()
+
+    def release(self):
+        self.busy = False
+        if self._autosave_pending:
+            QTimer.singleShot(0, self.request_autosave)
+
+    def effective_description(self, file_item):
+        if self._tag_index is None:
+            self._tag_index = {}
+            for item in self.items:
+                if item.action_type in ('set_description', 'add_tags', 'remove_tags'):
+                    self._tag_index.setdefault(item.file_id, []).append(item)
+        from src.services.batch_tags import effective_description
+        return effective_description(file_item.get('description', '') or '',
+            self._tag_index.get(file_item.get('file_id') or file_item.get('id'), []))
 
     @staticmethod
     def _get_queue_records(data):
@@ -102,6 +158,8 @@ class StagingQueue:
         return records
 
     def add_item(self, item):
+        if not self.can_edit():
+            return False
         try:
             item.validate()
         except Exception as exc:
@@ -125,12 +183,16 @@ class StagingQueue:
             self.items = [it for it in self.items if not (it.file_id == item.file_id and it.action_type == 'rename')]
 
         self.items.append(item)
+        if not self._save_to_disk():
+            self.queueChanged.emit(len(self.items))
+            return False
         self.itemAdded.emit(item)
         self.queueChanged.emit(len(self.items))
-        self._save_to_disk()
         return True
 
     def add_batch_tags(self, files_list, tags_to_add="", tags_to_remove=""):
+        if not self.can_edit():
+            return 0
         count = 0
         for file_item in files_list:
             fid = file_item.get('file_id') or file_item.get('id')
@@ -148,9 +210,9 @@ class StagingQueue:
                 self.items.append(item_rem)
                 count += 1
 
+        saved = self._save_to_disk()
         self.queueChanged.emit(len(self.items))
-        self._save_to_disk()
-        return count
+        return count if saved else 0
 
     def _cleanup_staged_folder(self, item):
         if item.action_type == 'create_folder':
@@ -164,15 +226,19 @@ class StagingQueue:
                     pass
 
     def remove_item(self, item, discard_placeholder=False):
+        if not self.can_edit():
+            return
         if item in self.items:
             if discard_placeholder:
                 self._cleanup_staged_folder(item)
             self.items.remove(item)
+            self._save_to_disk()
             self.itemRemoved.emit(item)
             self.queueChanged.emit(len(self.items))
-            self._save_to_disk()
 
     def remove_items_batch(self, items_to_remove, discard_placeholder=False):
+        if not self.can_edit():
+            return
         changed = False
         for item in items_to_remove:
             if item in self.items:
@@ -182,20 +248,40 @@ class StagingQueue:
                 self.itemRemoved.emit(item)
                 changed = True
         if changed:
-            self.queueChanged.emit(len(self.items))
             self._save_to_disk()
+            self.queueChanged.emit(len(self.items))
 
     def clear(self, discard_placeholder=True):
+        if not self.can_edit():
+            return
         if discard_placeholder:
             for item in list(self.items):
                 self._cleanup_staged_folder(item)
         self.items.clear()
-        self.cleared.emit()
-        self.queueChanged.emit(0)
         self._save_to_disk()
+        self.cleared.emit()
+        self.queueChanged.emit(len(self.items))
 
     def count(self):
         return len(self.items)
+
+    def replace_description(self, item, matching_ids):
+        if not self.can_edit():
+            return False
+        self.items = [old for old in self.items if not (
+            old.action_type in ('set_description', 'add_tags', 'remove_tags')
+            and (os.path.normcase(os.path.normpath(old.file_id)) in matching_ids
+                 or (old.path and os.path.normcase(os.path.normpath(old.path)) in matching_ids)))]
+        if item:
+            self.items.append(item)
+        saved = self._save_to_disk()
+        self.queueChanged.emit(len(self.items))
+        return saved
+
+    def complete_execution(self, item):
+        self.store.complete_execution(item.operation_id)
+        self.items = [old for old in self.items if old.operation_id != item.operation_id]
+        self._tag_index = None
 
 
 class QueueExecutionReportDialog(QDialog):
@@ -303,18 +389,58 @@ class StagingQueueDialog(QDialog):
         self.db_indexer = db_indexer
         self.config_mgr = ConfigManager()
         self._execution_active = False
+        self._list_loading = False
+        self._list_timer = QTimer(self)
+        self._list_timer.setInterval(1)
+        self._list_timer.timeout.connect(self._populate_list_batch)
 
         self.setWindowTitle("📋 Fila de Revisão de Alterações (Staging Queue)")
         self.setWindowFlags(Qt.WindowType.Window)  # Janela independente destacável
         self.setMinimumSize(780, 520)
 
         self._init_ui()
-        self._populate_list()
-        self.queue.queueChanged.connect(lambda c: self._populate_list())
+        self.queue.queueChanged.connect(lambda c: self._populate_list() if self.isVisible() else None)
+        self.recovery_button = QPushButton('Recuperar autosave…', self)
+        self.recovery_button.clicked.connect(self._recover_autosave)
+        self.layout().addWidget(self.recovery_button)
+
+    def _recover_autosave(self):
+        from PyQt6.QtWidgets import QFileDialog
+        if self.queue.busy or (self.queue._autosave_worker and self.queue._autosave_worker.isRunning()):
+            QMessageBox.warning(self, 'Fila ocupada', 'Aguarde a operação atual terminar.')
+            return
+        path, _ = QFileDialog.getOpenFileName(self, 'Escolher autosave (confira a data)',
+            str(self.queue.store.backup_dir.resolve()), 'Autosaves (*.json)')
+        if not path:
+            return
+        try:
+            from src.utils.queue_store import read_queue_json
+            records = read_queue_json(path)
+            answer = QMessageBox.question(self, 'Recuperar fila',
+                f'Restaurar {len(records):,} operações desta cópia? A fila atual será substituída. '
+                'Operações já executadas serão filtradas; resultados incertos continuarão bloqueados.')
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            if not self.queue.load_error:
+                self.queue.store.autosave()
+            records = self.queue.store.restore(path, records=records)
+            self.queue.load_error = None
+            self.queue.items = [StagingItem.from_dict(row) for row in records]
+            self.queue._tag_index = None
+            self.queue.queueChanged.emit(self.queue.count())
+        except Exception as exc:
+            QMessageBox.critical(self, 'Recuperação não realizada', str(exc))
 
     def showEvent(self, event):
         super().showEvent(event)
         self._populate_list()
+
+    def hideEvent(self, event):
+        # A reabertura começa com uma nova visão da fila, nunca com callbacks antigos.
+        self._list_timer.stop()
+        self._list_items = ()
+        self._move_map = {}
+        super().hideEvent(event)
 
     def _init_ui(self):
         self.setStyleSheet("""
@@ -366,7 +492,14 @@ class StagingQueueDialog(QDialog):
 
         layout.addLayout(header_layout)
 
+        self.list_progress = QProgressBar(self)
+        self.list_progress.setAccessibleName("Progresso da montagem da fila")
+        self.list_progress.hide()
+        layout.addWidget(self.list_progress)
+
         self.list_widget = QListWidget()
+        self.list_widget.setLayoutMode(QListView.LayoutMode.Batched)
+        self.list_widget.setBatchSize(200)
         self.list_widget.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.list_widget.setStyleSheet("font-size: 13px;")
         layout.addWidget(self.list_widget)
@@ -431,60 +564,121 @@ class StagingQueueDialog(QDialog):
             else:
                 self.mode_info_label.setText("☁️ Alvo: Produção Oficial (Google Drive)")
                 self.mode_info_label.setStyleSheet("color: #28A745;")
-            self.btn_execute.setEnabled(self.queue.count() > 0)
-            self.btn_execute_next.setEnabled(self.queue.count() > 0)
+            enabled = self.queue.count() > 0 and not self._list_loading
+            self.btn_execute.setEnabled(enabled)
+            self.btn_execute_next.setEnabled(enabled)
 
     def _populate_list(self):
-        self.list_widget.clear()
-        
-        # Mapear arquivos que possuem 'move' na fila
-        move_map = {}
-        for it in self.queue.items:
-            if it.action_type == 'move':
-                dest_name = os.path.basename(os.path.dirname(it.new_value))
-                move_map[it.file_id] = (dest_name, it.new_value)
-                if it.path:
-                    move_map[os.path.normpath(it.path).lower()] = (dest_name, it.new_value)
+        """Agenda a montagem; não faz I/O nem executa operações da fila."""
+        self._list_timer.stop()
+        self._list_loading = True
+        self._list_items = tuple(self.queue.items)
+        self._move_map = {}
+        self._list_position = 0
+        self._list_phase = 'clear'
+        self._list_steps = 0
+        self.list_progress.setRange(0, max(1, self.list_widget.count() + 2 * len(self._list_items)))
+        self.list_progress.setValue(0)
+        self.list_progress.setFormat("Preparando lista… %p%")
+        self.list_progress.show()
+        self.header_label.setText(f"📋 Montando fila ({len(self._list_items):,} operações)…")
+        self.list_widget.clearSelection()
+        self.list_widget.setCurrentRow(-1)
+        self._set_list_controls_enabled(False)
+        self._list_timer.start()
 
-        for idx, item in enumerate(self.queue.items):
-            list_item = QListWidgetItem()
-            
-            # Verificar se este arquivo possui movimento posterior
-            has_subsequent_move = False
-            moved_dest_name = ""
-            if item.action_type != 'move':
-                lookup_key = os.path.normpath(item.path).lower() if item.path else item.file_id
-                if item.file_id in move_map:
-                    has_subsequent_move = True
-                    moved_dest_name = move_map[item.file_id][0]
-                elif lookup_key in move_map:
-                    has_subsequent_move = True
-                    moved_dest_name = move_map[lookup_key][0]
-
-            if item.action_type == 'move':
-                orig_folder = os.path.basename(os.path.dirname(item.old_value or item.path))
-                dest_folder = os.path.basename(os.path.dirname(item.new_value))
-                text = f"{idx+1}. 📦 {item.file_name} ➜ Mover: [{orig_folder}] ➔ [{dest_folder}]"
-            elif item.action_type == 'rename':
-                move_suffix = f"  [📦 Movido para: {moved_dest_name}]" if has_subsequent_move else ""
-                text = f"{idx+1}. ✏️ {item.old_value or item.file_name} ➜ Renomear para [{item.new_value}]{move_suffix}"
-            elif item.action_type == 'delete':
-                text = f"{idx+1}. 🗑️ {item.file_name} ➜ Excluir do acervo"
-            elif item.action_type == 'create_folder':
-                parent_name = os.path.basename(os.path.dirname(item.new_value or item.path))
-                text = f"{idx+1}. 📁🟢 Criar Nova Pasta: [{parent_name}] ➔ [{item.file_name}]"
-            else:
-                move_suffix = f"  [📦 Movido para: {moved_dest_name}]" if has_subsequent_move else ""
-                text = f"{idx+1}. 🏷️ {item.file_name} ➜ {item.get_description_summary()}{move_suffix}"
-
-            list_item.setText(text)
-            list_item.setData(Qt.ItemDataRole.UserRole, item)
-            self.list_widget.addItem(list_item)
-
-        self.header_label.setText(f"📋 Alterações Pendentes para Revisão ({self.queue.count()} itens)")
+    def _set_list_controls_enabled(self, enabled):
+        for widget in (self.list_widget, self.btn_remove_selected, self.btn_clear_all,
+                       self.btn_import, self.btn_export, self.recovery_button):
+            widget.setEnabled(enabled)
         self._update_mode_label()
 
+    def _populate_list_batch(self):
+        # Widgets Qt permanecem na thread gráfica. Cada lote devolve o controle
+        # ao event loop; não usar processEvents (permitiria reentrância aqui).
+        deadline = time.perf_counter() + 0.008
+        processed = 0
+        while processed < 200 and time.perf_counter() < deadline:
+            if self._list_phase == 'clear':
+                if self.list_widget.count():
+                    del_item = self.list_widget.takeItem(self.list_widget.count() - 1)
+                    del del_item
+                else:
+                    self._list_phase = 'map'
+                    self.list_progress.setFormat("Preparando operações… %p%")
+                    continue
+            elif self._list_phase == 'map':
+                if self._list_position == len(self._list_items):
+                    self._list_phase = 'rows'
+                    self._list_position = 0
+                    continue
+                it = self._list_items[self._list_position]
+                if it.action_type == 'move':
+                    value = (os.path.basename(os.path.dirname(it.new_value)), it.new_value)
+                    self._move_map[it.file_id] = value
+                    if it.path:
+                        self._move_map[os.path.normpath(it.path).lower()] = value
+                self._list_position += 1
+            else:
+                if self._list_position == len(self._list_items):
+                    self._list_timer.stop()
+                    self._list_loading = False
+                    self.list_progress.setValue(self.list_progress.maximum())
+                    self.list_progress.hide()
+                    self.header_label.setText(
+                        f"📋 Alterações Pendentes para Revisão ({len(self._list_items)} itens)")
+                    self._list_items = ()
+                    self._move_map = {}
+                    self.details_label.setText("Selecione um item para ver o detalhamento da alteração.")
+                    self._set_list_controls_enabled(True)
+                    return
+                self._append_list_row(self._list_position, self._list_items[self._list_position])
+                self._list_position += 1
+            processed += 1
+            self._list_steps += 1
+        self.list_progress.setValue(self._list_steps)
+        if self._list_phase == 'rows':
+            self.list_progress.setFormat(
+                f"Montando fila: {self._list_position:,}/{len(self._list_items):,} operações — %p%")
+
+    def _append_list_row(self, idx, item):
+        move_map = self._move_map
+        list_item = QListWidgetItem()
+        has_subsequent_move = False
+        moved_dest_name = ""
+        if item.action_type != 'move':
+            lookup_key = os.path.normpath(item.path).lower() if item.path else item.file_id
+            if item.file_id in move_map:
+                has_subsequent_move = True
+                moved_dest_name = move_map[item.file_id][0]
+            elif lookup_key in move_map:
+                has_subsequent_move = True
+                moved_dest_name = move_map[lookup_key][0]
+
+        if item.action_type == 'move':
+            orig_folder = os.path.basename(os.path.dirname(item.old_value or item.path))
+            dest_folder = os.path.basename(os.path.dirname(item.new_value))
+            text = f"{idx+1}. 📦 {item.file_name} ➜ Mover: [{orig_folder}] ➔ [{dest_folder}]"
+        elif item.action_type == 'rename':
+            move_suffix = f"  [📦 Movido para: {moved_dest_name}]" if has_subsequent_move else ""
+            text = f"{idx+1}. ✏️ {item.old_value or item.file_name} ➜ Renomear para [{item.new_value}]{move_suffix}"
+        elif item.action_type == 'delete':
+            text = f"{idx+1}. 🗑️ {item.file_name} ➜ Excluir do acervo"
+        elif item.action_type == 'create_folder':
+            parent_name = os.path.basename(os.path.dirname(item.new_value or item.path))
+            text = f"{idx+1}. 📁🟢 Criar Nova Pasta: [{parent_name}] ➔ [{item.file_name}]"
+        else:
+            move_suffix = f"  [📦 Movido para: {moved_dest_name}]" if has_subsequent_move else ""
+            text = f"{idx+1}. 🏷️ {item.file_name} ➜ {item.get_description_summary()}{move_suffix}"
+
+        list_item.setText(text)
+        list_item.setData(Qt.ItemDataRole.UserRole, item)
+        self.list_widget.addItem(list_item)
+
     def _on_item_selected(self, current, previous):
+        if self._list_loading:
+            self.details_label.setText("Aguarde a montagem da fila para selecionar uma operação.")
+            return
         if current:
             item = current.data(Qt.ItemDataRole.UserRole)
             if item:
@@ -584,6 +778,8 @@ class StagingQueueDialog(QDialog):
         self._run_execution_guarded(self._execute_queue_impl)
 
     def _execute_queue_impl(self):
+        if not self.queue.can_edit():
+            return
         if self.config_mgr.is_read_only():
             QMessageBox.warning(self, "Modo Somente Leitura", "As edições estão desabilitadas no modo Somente Leitura.")
             return
@@ -622,6 +818,7 @@ class StagingQueueDialog(QDialog):
             QCoreApplication.processEvents()
 
             try:
+                self.queue.store.begin_execution(item.operation_id)
                 max_retries = 3
                 for attempt in range(max_retries):
                     try:
@@ -637,6 +834,7 @@ class StagingQueueDialog(QDialog):
 
                 executed_count += 1
                 executed_items.append(item)
+                self.queue.complete_execution(item)
             except Exception as e:
                 logging.error(f"Erro ao executar item {item.file_name}: {e}")
                 if 'locked' in str(e).lower():
@@ -661,7 +859,7 @@ class StagingQueueDialog(QDialog):
         progress.close()
 
         if executed_items:
-            self.queue.remove_items_batch(executed_items)
+            self.queue.queueChanged.emit(self.queue.count())
 
         logging.info(
             "Fila concluida: solicitados=%d, executados=%d, erros=%d, restantes=%d.",
@@ -689,6 +887,8 @@ class StagingQueueDialog(QDialog):
         self._run_execution_guarded(self._execute_next_impl)
 
     def _execute_next_impl(self):
+        if not self.queue.can_edit():
+            return
         if self.config_mgr.is_read_only() or self.queue.count() == 0:
             return
 
@@ -725,6 +925,7 @@ class StagingQueueDialog(QDialog):
                 QCoreApplication.processEvents()
 
             try:
+                self.queue.store.begin_execution(item.operation_id)
                 max_retries = 3
                 for attempt in range(max_retries):
                     try:
@@ -740,6 +941,7 @@ class StagingQueueDialog(QDialog):
 
                 executed_items.append(item)
                 executed_count += 1
+                self.queue.complete_execution(item)
             except Exception as e:
                 logging.error(f"Erro ao executar item {item.file_name}: {e}")
                 if 'locked' in str(e).lower():
@@ -763,7 +965,7 @@ class StagingQueueDialog(QDialog):
             progress.close()
 
         if executed_items:
-            self.queue.remove_items_batch(executed_items)
+            self.queue.queueChanged.emit(self.queue.count())
 
         logging.info(
             "Execucao parcial da fila concluida: solicitados=%d, executados=%d, "
@@ -781,13 +983,16 @@ class StagingQueueDialog(QDialog):
         self.executionCompleted.emit(executed_count)
 
     def _begin_execution(self):
-        if self._execution_active:
+        if self._execution_active or self._list_loading:
+            return False
+        if not self.queue.can_edit():
             return False
         win = self.parent().window() if self.parent() else None
         if win and hasattr(win, 'begin_queue_execution'):
             if not win.begin_queue_execution():
                 return False
         self._execution_active = True
+        self.queue.busy = True
         self.executionStarted.emit()
         return True
 
@@ -795,6 +1000,7 @@ class StagingQueueDialog(QDialog):
         if not self._execution_active:
             return
         self._execution_active = False
+        self.queue.release()
         win = self.parent().window() if self.parent() else None
         if win and hasattr(win, 'end_queue_execution'):
             win.end_queue_execution()
@@ -1252,6 +1458,9 @@ class StagingQueueDialog(QDialog):
         return folder_id
 
     def _export_queue(self):
+        if self.queue.busy:
+            QMessageBox.warning(self, 'Fila ocupada', 'Aguarde a operação terminar para exportar um estado completo.')
+            return
         from PyQt6.QtWidgets import QFileDialog
         import json
         if self.queue.count() == 0:
@@ -1261,13 +1470,15 @@ class StagingQueueDialog(QDialog):
         if filepath:
             try:
                 data = [it.to_dict() for it in self.queue.items]
-                with open(filepath, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, indent=4, ensure_ascii=False)
+                validated_records(data)
+                atomic_json(filepath, data)
                 QMessageBox.information(self, "Sucesso", "Fila exportada com sucesso.")
             except Exception as e:
                 QMessageBox.warning(self, "Erro", f"Falha ao exportar: {e}")
 
     def _import_queue(self):
+        if not self.queue.can_edit():
+            return
         from PyQt6.QtWidgets import QFileDialog
         import json
         
@@ -1275,25 +1486,36 @@ class StagingQueueDialog(QDialog):
         if filepath:
             try:
                 if os.path.getsize(filepath) > MAX_QUEUE_FILE_BYTES:
-                    raise ValueError('Arquivo da fila excede o limite de 10 MB.')
+                    raise ValueError('Arquivo da fila excede o limite de 64 MB.')
                 with open(filepath, 'r', encoding='utf-8') as f:
                     data = json.load(f)
 
                 records = self.queue._get_queue_records(data)
+                imported = [StagingItem.from_dict(d) for d in records]
+                combined = list(self.queue.items)
+                known = {item.operation_id for item in combined}
                 count = 0
-                rejected = []
-                for position, d in enumerate(records, start=1):
-                    try:
-                        it = StagingItem.from_dict(d)
-                        if self.queue.add_item(it):
-                            count += 1
-                    except Exception as item_error:
-                        rejected.append(f'Item {position}: {item_error}')
-
+                for item in imported:
+                    if item.operation_id in known:
+                        continue
+                    if item.action_type == 'delete':
+                        combined = [old for old in combined if old.file_id != item.file_id]
+                    elif item.action_type in ('rename', 'move'):
+                        if item.action_type == 'move' and any(old.file_id == item.file_id and old.action_type == 'delete' for old in combined):
+                            continue
+                        combined = [old for old in combined if not (old.file_id == item.file_id and old.action_type == item.action_type)]
+                    combined.append(item)
+                    known.add(item.operation_id)
+                    count += 1
+                self.queue.busy = True
+                try:
+                    self.queue.store.save([item.to_dict() for item in combined])
+                    self.queue.items = combined
+                    self.queue._tag_index = None
+                finally:
+                    self.queue.release()
+                self.queue.queueChanged.emit(self.queue.count())
                 message = f"{count} itens importados com sucesso."
-                if rejected:
-                    message += f"\n{len(rejected)} itens inválidos foram ignorados."
-                    logging.warning('Itens recusados na importacao da fila: %s', '; '.join(rejected))
                 QMessageBox.information(self, "Importação Concluída", message)
             except Exception as e:
                 QMessageBox.warning(self, "Erro", f"Falha ao importar: {e}")
