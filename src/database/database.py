@@ -116,6 +116,8 @@ class FileIndexer:
                 self.rebuild_search_index_with_normalization()
 
             self._populate_normalized_columns()
+            self._normalize_local_case_and_duplicates()
+            self._auto_rebase_relocated_local_roots()
             consistent, reason = self.search_index_is_consistent()
             if not consistent:
                 logging.warning(
@@ -125,6 +127,123 @@ class FileIndexer:
                 )
         except Exception as e:
             logging.warning("Erro ao verificar/recriar indice de busca: %s", e)
+
+    def _normalize_local_case_and_duplicates(self):
+        """Normaliza parentId/path/file_id locais em caixa mista e deduplica colisoes."""
+        try:
+            rows = self.cursor.execute(
+                "SELECT file_id, path, parentId, description, webContentLink "
+                "FROM files WHERE source='local'"
+            ).fetchall()
+            if not rows:
+                return
+
+            by_canon = {}
+            dups_to_delete = []
+            for fid, path, parent_id, desc, web in rows:
+                canon_fid = os.path.normcase(os.path.normpath(fid))
+                score = (
+                    1 if (desc and str(desc).strip()) else 0,
+                    1 if (web and str(web).strip()) else 0,
+                    1 if fid == canon_fid else 0,
+                )
+                if canon_fid in by_canon:
+                    prev_score, prev_row = by_canon[canon_fid]
+                    if score > prev_score:
+                        dups_to_delete.append(prev_row[0])
+                        by_canon[canon_fid] = (score, (fid, path, parent_id))
+                    else:
+                        dups_to_delete.append(fid)
+                else:
+                    by_canon[canon_fid] = (score, (fid, path, parent_id))
+
+            updates = []
+            for canon_fid, (_score, (fid, path, parent_id)) in by_canon.items():
+                canon_path = os.path.normcase(os.path.normpath(path or fid))
+                canon_parent = os.path.normcase(os.path.normpath(parent_id)) if parent_id else parent_id
+                if fid != canon_fid or path != canon_path or (parent_id and parent_id != canon_parent):
+                    updates.append((canon_fid, canon_path, canon_parent, fid))
+
+            if not dups_to_delete and not updates:
+                return
+
+            with self.conn:
+                if dups_to_delete:
+                    self.cursor.executemany(
+                        "DELETE FROM files WHERE file_id=?",
+                        [(x,) for x in dups_to_delete],
+                    )
+                    self.cursor.executemany(
+                        "DELETE FROM search_index WHERE file_id=?",
+                        [(x,) for x in dups_to_delete],
+                    )
+                if updates:
+                    self.cursor.executemany(
+                        "UPDATE files SET file_id=?, path=?, parentId=? WHERE file_id=?",
+                        updates,
+                    )
+                    fts_map = {old_id: new_id for new_id, _p, _par, old_id in updates if old_id != new_id}
+                    if fts_map:
+                        fts_rows = self.cursor.execute(
+                            "SELECT rowid, file_id FROM search_index WHERE source='local'"
+                        ).fetchall()
+                        fts_updates = [(fts_map[fid], rowid) for rowid, fid in fts_rows if fid in fts_map]
+                        if fts_updates:
+                            self.cursor.executemany(
+                                "UPDATE search_index SET file_id=? WHERE rowid=?",
+                                fts_updates,
+                            )
+            logging.info(
+                "🧹 Normalizacao de caixa local concluida: %d atualizados, %d duplicatas removidas.",
+                len(updates),
+                len(dups_to_delete),
+            )
+        except Exception as e:
+            logging.warning("Aviso na normalizacao de caixa local: %s", e)
+
+    def _auto_rebase_relocated_local_roots(self):
+        """Remapeia automaticamente raizes locais do banco quando o PC usa outra letra/Insync."""
+        try:
+            from src.utils.config_manager import ConfigManager
+            from src.database.snapshot import (
+                build_root_mapping,
+                infer_local_roots,
+                rebase_local_paths,
+            )
+            config_mgr = ConfigManager()
+            if config_mgr.is_sandbox():
+                target_roots = [config_mgr.get_sandbox_path()]
+            else:
+                target_roots = config_mgr.get_resolved_scan_paths(persist=True)
+            target_roots = [r for r in target_roots if r and os.path.isdir(r)]
+            if not target_roots:
+                return
+
+            db_roots = infer_local_roots(self.conn)
+            if not db_roots:
+                return
+
+            # Só remapear raízes que NÃO existem nesta máquina
+            missing_db_roots = [r for r in db_roots if not os.path.exists(r)]
+            if not missing_db_roots:
+                return
+
+            mapping = build_root_mapping(missing_db_roots, target_roots)
+            if not mapping and len(missing_db_roots) == 1 and len(target_roots) == 1:
+                mapping = [(missing_db_roots[0], target_roots[0])]
+
+            for old_root, new_root in mapping:
+                if os.path.normcase(os.path.normpath(old_root)) != os.path.normcase(os.path.normpath(new_root)):
+                    updated_count = rebase_local_paths(self.conn, old_root, new_root)
+                    if updated_count > 0:
+                        logging.info(
+                            "🔄 Auto-rebase multi-PC: %d caminhos locais remapeados de '%s' para '%s'.",
+                            updated_count,
+                            old_root,
+                            new_root,
+                        )
+        except Exception as e:
+            logging.warning("Aviso no auto-rebase de raizes locais: %s", e)
 
     def search_index_is_consistent(self):
         """Valida cardinalidade e IDs do FTS sem alterar o banco."""
@@ -368,12 +487,16 @@ class FileIndexer:
 
                 from src.drive.match import normalize_aggressive
                 data_files = []
+                effective_descs_by_fid = {}
                 for item in files_list:
                     fid = item.get('id')
                     raw_path = item.get('path')
                     if item.get('source') == 'local' and raw_path:
                         raw_path = os.path.normcase(os.path.normpath(raw_path))
                         fid = raw_path
+
+                    name = item.get('name', '')
+                    size_val = int(item.get('size', 0) or 0)
 
                     incoming_desc = item.get('description')
                     if (item.get('source') == 'local') and (not incoming_desc):
@@ -389,6 +512,24 @@ class FileIndexer:
                     else:
                         effective_web_link = incoming_web_link
 
+                    if item.get('source') == 'local' and not effective_desc and size_val > 0 and name:
+                        try:
+                            self.cursor.execute(
+                                "SELECT DISTINCT description, webContentLink FROM files "
+                                "WHERE LOWER(name) = LOWER(?) AND size = ? "
+                                "AND description IS NOT NULL AND TRIM(description) != ''",
+                                (name, size_val)
+                            )
+                            inherited_rows = self.cursor.fetchall()
+                            if len(inherited_rows) == 1:
+                                effective_desc = inherited_rows[0][0]
+                                if not effective_web_link and inherited_rows[0][1]:
+                                    effective_web_link = inherited_rows[0][1]
+                        except Exception:
+                            pass
+
+                    effective_descs_by_fid[fid] = effective_desc or ''
+
                     previous_state = existing_state.get(fid) or ('', '', 0, 0)
                     incoming_rotation = item.get('thumbnailRotation')
                     effective_rotation = (
@@ -400,7 +541,6 @@ class FileIndexer:
                         item.get('starred', previous_state[3] or 0) or 0
                     )
 
-                    name = item.get('name', '')
                     name_normalized = SearchEngine(
                         None).normalize_text(name) if name else ''
                     name_aggressive = normalize_aggressive(
@@ -416,7 +556,7 @@ class FileIndexer:
 
                         item.get('thumbnailLink'),
                         item.get('thumbnailPath'),
-                        item.get('size', 0),
+                        size_val,
                         item.get('modifiedTime'),
                         item.get('createdTime'),
                         item.get('parentId'),
@@ -445,11 +585,9 @@ class FileIndexer:
                         fid = os.path.normcase(os.path.normpath(raw_path))
 
                     name_val = item.get('name', '')
-                    incoming_desc = item.get('description', '')
-                    if (item.get('source') == 'local') and (not incoming_desc):
-                        effective_desc = (existing_state.get(fid) or ('', '', 0, 0))[0] or ''
-                    else:
-                        effective_desc = incoming_desc
+                    effective_desc = effective_descs_by_fid.get(
+                        fid, item.get('description', '') or ''
+                    )
                     data_search_index.append((
                         name_val,
                         effective_desc,
@@ -544,8 +682,8 @@ class FileIndexer:
                 if category != '':
                     category_extensions = {
                         'images': ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.svg', '.ico', '.tiff', '.heic', '.arw', '.cr2', '.nef', '.dng', '.raf', '.orf', '.srw'],
-                        'videos': ['.mp4', '.avi', '.mov', '.wmv', '.flv', '.mkv', '.webm', '.m4v', '.3gp'],
-                        'media': ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.svg', '.ico', '.tiff', '.heic', '.arw', '.cr2', '.nef', '.dng', '.raf', '.orf', '.srw', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.mkv', '.webm', '.m4v', '.3gp'],
+                        'videos': ['.mp4', '.avi', '.mov', '.wmv', '.flv', '.mkv', '.webm', '.m4v', '.3gp', '.mts', '.m2ts', '.ts', '.mpg', '.mpeg', '.vob'],
+                        'media': ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp', '.svg', '.ico', '.tiff', '.heic', '.heif', '.arw', '.cr2', '.nef', '.dng', '.raf', '.orf', '.srw', '.rw2', '.pef', '.raw', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.mkv', '.webm', '.m4v', '.3gp', '.mts', '.m2ts', '.ts', '.mpg', '.mpeg', '.vob'],
                         'documents': ['.pdf', '.doc', '.docx', '.txt', '.rtf', '.odt', '.xls', '.xlsx', '.ppt', '.pptx'],
                         'audios': ['.mp3', '.wav', '.flac', '.aac', '.ogg', '.wma', '.m4a'],
                         'others': []
@@ -858,28 +996,32 @@ class FileIndexer:
             self.conn.rollback()
             raise
 
-    def update_description(self, file_id: str, description: str | None, thumbnailLink: str | None = None, webContentLink: str | None = None, commit: bool = False, allow_empty_override: bool = True):
+    def update_description(self, file_id: str, description: str | None, thumbnailLink: str | None = None, webContentLink: str | None = None, commit: bool = False, allow_empty_override: bool = True) -> bool:
         self.ensure_conn()
         desc = (description or '').strip()
         canon_id = to_canonical_id(file_id)
+        raw_id = file_id or canon_id
 
         if not allow_empty_override and not desc:
             # Não sobrescrever descrição existente com vazio
             self.cursor.execute(
-                "UPDATE files SET thumbnailLink = COALESCE(?, thumbnailLink), webContentLink = COALESCE(?, webContentLink) WHERE file_id = ? OR path = ?",
-                (thumbnailLink, webContentLink, canon_id, canon_id),
+                "UPDATE files SET thumbnailLink = COALESCE(?, thumbnailLink), webContentLink = COALESCE(?, webContentLink) WHERE file_id IN (?, ?) OR path IN (?, ?)",
+                (thumbnailLink, webContentLink, canon_id, raw_id, canon_id, raw_id),
             )
+            updated = self.cursor.rowcount > 0
         else:
             self.cursor.execute(
-                "UPDATE files SET description = ?, thumbnailLink = COALESCE(?, thumbnailLink), webContentLink = COALESCE(?, webContentLink) WHERE file_id = ? OR path = ?",
-                (desc, thumbnailLink, webContentLink, canon_id, canon_id),
+                "UPDATE files SET description = ?, thumbnailLink = COALESCE(?, thumbnailLink), webContentLink = COALESCE(?, webContentLink) WHERE file_id IN (?, ?) OR path IN (?, ?)",
+                (desc, thumbnailLink, webContentLink, canon_id, raw_id, canon_id, raw_id),
             )
+            updated = self.cursor.rowcount > 0
             self.cursor.execute(
-                "UPDATE search_index SET description = ?, normalized_description = ? WHERE file_id = ?",
-                (desc, SearchEngine(None).normalize_text(desc), canon_id),
+                "UPDATE search_index SET description = ?, normalized_description = ? WHERE file_id IN (?, ?)",
+                (desc, SearchEngine(None).normalize_text(desc), canon_id, raw_id),
             )
         if commit:
             self.conn.commit()
+        return updated
 
     def export_to_shared_cache(self, target_path=None, *, expected_previous_generation=None):
         """Publica uma geracao versionada; o manifesto e trocado por ultimo."""
@@ -920,6 +1062,28 @@ class FileIndexer:
             )
             dest_conn = sqlite3.connect(local_tmp_db)
             self.conn.backup(dest_conn)
+
+            # Sanitizar o snapshot exportado: remover itens fora das raizes
+            # configuradas (ex.: _TestesBanco em modo producao) e deduplicar
+            # eventuais colisoes de caixa antes de calcular hash/manifesto.
+            scan_roots = config_mgr.get_resolved_scan_paths(persist=False)
+            if scan_roots:
+                norm_roots = [os.path.normcase(os.path.normpath(r)) for r in scan_roots if r]
+                if norm_roots:
+                    outside_ids = []
+                    for fid, fpath in dest_conn.execute("SELECT file_id, path FROM files WHERE source='local'"):
+                        np = os.path.normcase(os.path.normpath(fpath or fid or ''))
+                        if not any(np == r or np.startswith(r + '\\') for r in norm_roots):
+                            outside_ids.append(fid)
+                    if outside_ids:
+                        with dest_conn:
+                            dest_conn.executemany("DELETE FROM files WHERE file_id=?", [(fid,) for fid in outside_ids])
+                            dest_conn.executemany("DELETE FROM search_index WHERE file_id=?", [(fid,) for fid in outside_ids])
+                            if dest_conn.execute("SELECT 1 FROM sqlite_master WHERE name='drive_link_validation'").fetchone():
+                                dest_conn.executemany(
+                                    "DELETE FROM drive_link_validation WHERE local_file_id=?",
+                                    [(fid,) for fid in outside_ids],
+                                )
 
             # 3. CSV acompanha a mesma geracao e serve para inspecao/recuperacao.
             local_tmp_csv = os.path.join(

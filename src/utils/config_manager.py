@@ -105,7 +105,12 @@ class ConfigManager:
         return bool(self.get('sandbox_mode', False))
 
     def get_sandbox_path(self):
-        return self.get('sandbox_path', r'L:\Drives Compartilhados\_TestesBanco')
+        configured = self.get('sandbox_path', r'L:\Drives Compartilhados\_TestesBanco')
+        if configured and os.path.isdir(configured):
+            return configured
+        allowed_drives = self.get_allowed_drive_letters()
+        resolved = resolve_relocated_path(configured, drive_letters=allowed_drives)
+        return resolved or configured
 
     def get_db_path(self):
         if self.is_sandbox():

@@ -1,3 +1,4 @@
+import os
 import time
 import logging
 from collections import Counter
@@ -155,6 +156,21 @@ class IncrementalSyncWorker(QObject):
 
                 local_updated = False
                 if target_local_fid:
+                    if not os.path.exists(target_local_fid):
+                        from src.services.path_reconciler import resolve_and_heal_local_path
+                        from src.database.database import to_canonical_id
+                        healed = resolve_and_heal_local_path(
+                            {
+                                'file_id': target_local_fid,
+                                'id': target_local_fid,
+                                'name': fname,
+                                'path': target_local_fid,
+                                'size': file.get('size', 0),
+                            },
+                            indexer=local_indexer,
+                        )
+                        if healed:
+                            target_local_fid = to_canonical_id(healed)
                     # ``modifiedTime`` do registro local descreve os bytes no
                     # disco e faz parte da chave da thumbnail. Uma alteracao de
                     # tag no Drive nao pode fingir que a imagem local mudou.
@@ -247,3 +263,64 @@ class IncrementalSyncWorker(QObject):
                         "Falha ao fechar banco da sincronizacao incremental.",
                         exc_info=True,
                     )
+
+
+class DriveUpdateCheckWorker(QObject):
+    """
+    Verifica de forma ultraleve (1 requisição HTTP com pageSize=1) se houve
+    alguma alteração no Google Drive após o último `last_sync_timestamp`.
+    """
+    check_finished = pyqtSignal(bool, str)
+
+    def __init__(self, service, config_mgr):
+        super().__init__()
+        self.service = service
+        self.config_mgr = config_mgr
+
+    def run(self):
+        try:
+            if not self.service:
+                self.check_finished.emit(False, "")
+                return
+
+            if self.config_mgr.get('snapshot_reconcile_pending'):
+                self.check_finished.emit(True, "Reconciliação de snapshot pendente")
+                return
+
+            last_sync = self.config_mgr.get('last_sync_timestamp')
+            if not last_sync:
+                self.check_finished.emit(True, "Sincronização inicial pendente")
+                return
+
+            last_sync_dt = datetime.fromtimestamp(int(last_sync), timezone.utc)
+            formatted_time = last_sync_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+            q = f"modifiedTime > '{formatted_time}' and trashed = false and name != 'vivo.txt'"
+
+            kwargs = {
+                'q': q,
+                'pageSize': 1,
+                'includeItemsFromAllDrives': True,
+                'supportsAllDrives': True,
+                'fields': "files(id, name, modifiedTime)",
+            }
+            current_drive = self.config_mgr.get_current_drive_id()
+            if current_drive:
+                kwargs['corpora'] = 'drive'
+                kwargs['driveId'] = current_drive
+            else:
+                kwargs['corpora'] = 'allDrives'
+
+            resp = self.service.files().list(**kwargs).execute()
+            files = resp.get('files', [])
+            if files:
+                sample_name = files[0].get('name', 'arquivo')
+                self.check_finished.emit(
+                    True,
+                    f"Alterações detectadas no Drive desde a última sincronia (ex: {sample_name}). Clique para sincronizar."
+                )
+            else:
+                self.check_finished.emit(False, "")
+        except Exception as exc:
+            logging.debug("Falha silenciosa na verificação rápida do Drive: %s", exc)
+            self.check_finished.emit(False, "")
+

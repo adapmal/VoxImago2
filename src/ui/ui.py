@@ -33,7 +33,7 @@ from src.ui.folder_tree_widget import FolderTreeWidget
 from src.ui.vocab_panel import VocabPanel
 
 
-SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
+SCOPES = ['https://www.googleapis.com/auth/drive']
 
 
 class ServiceStatusDialog(QDialog):
@@ -76,6 +76,118 @@ class DriveFileGalleryApp(QMainWindow):
         else:
             self.status_bar.showMessage(
                 "Nenhuma pasta local configurada para reindexação.", 5000)
+
+    def check_drive_updates_available(self):
+        if not self.is_authenticated or not self.service:
+            return
+        if self.drive_sync_running or (self.inc_sync_thread and self.inc_sync_thread.isRunning()):
+            return
+        try:
+            if self.drive_check_thread and self.drive_check_thread.isRunning():
+                return
+        except RuntimeError:
+            pass
+
+        from src.drive.incremental_sync import DriveUpdateCheckWorker
+        self.drive_check_thread = QThread(self)
+        self.drive_check_worker = DriveUpdateCheckWorker(self.service, self.config_mgr)
+        self.drive_check_worker.moveToThread(self.drive_check_thread)
+        self.drive_check_thread.started.connect(self.drive_check_worker.run)
+
+        def on_check_done(has_updates, info_text):
+            if hasattr(self, 'main_bar') and self.main_bar:
+                self.main_bar.set_drive_updates_available(has_updates, info_text)
+            if self.drive_check_thread:
+                self.drive_check_thread.quit()
+                self.drive_check_thread.wait(1000)
+                self.drive_check_thread.deleteLater()
+                self.drive_check_thread = None
+            if self.drive_check_worker:
+                self.drive_check_worker.deleteLater()
+                self.drive_check_worker = None
+
+        self.drive_check_worker.check_finished.connect(on_check_done)
+        self.drive_check_thread.start()
+
+    def _start_path_reconciliation(self):
+        if self.maintenance_running or self.queue_execution_running or self.drive_sync_running:
+            QMessageBox.information(
+                self, "Operação em andamento",
+                "Aguarde a operação atual terminar antes de reconciliar os caminhos."
+            )
+            return
+        try:
+            if self.reconcile_thread and self.reconcile_thread.isRunning():
+                return
+        except RuntimeError:
+            pass
+
+        scan_paths = self.config_mgr.get_resolved_scan_paths(persist=True)
+        if not scan_paths:
+            QMessageBox.warning(self, "Aviso", "Nenhuma pasta local configurada.")
+            return
+
+        from src.services.path_reconciler import PathReconcileWorker
+        from PyQt6.QtWidgets import QProgressDialog
+
+        self.maintenance_running = True
+        progress = QProgressDialog(
+            "Reconciliando endereços de arquivos movidos...", "Cancelar", 0, 100, self
+        )
+        progress.setWindowTitle("Reconciliação de Caminhos")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(True)
+        progress.setFixedSize(420, 140)
+        progress.setValue(0)
+
+        self.reconcile_thread = QThread(self)
+        self.reconcile_worker = PathReconcileWorker(self.indexer.db_name, scan_paths)
+        self.reconcile_worker.moveToThread(self.reconcile_thread)
+
+        def on_prog(pct, msg):
+            progress.setValue(max(0, min(100, pct)))
+            progress.setLabelText(msg)
+
+        def cleanup():
+            self.maintenance_running = False
+            if self.reconcile_thread:
+                self.reconcile_thread.quit()
+                self.reconcile_thread.wait(2000)
+                self.reconcile_thread.deleteLater()
+                self.reconcile_thread = None
+            if self.reconcile_worker:
+                self.reconcile_worker.deleteLater()
+                self.reconcile_worker = None
+
+        def on_done(result):
+            progress.close()
+            cleanup()
+            self._force_refresh_after_sync()
+            msg = (
+                f"Reconciliação concluída em {result.get('elapsed_sec', 0):.1f}s!\n\n"
+                f"• Arquivos movidos atualizados: {result.get('relocated', 0):,}\n"
+                f"• Duplicatas fundidas: {result.get('merged', 0):,}\n"
+                f"• Novos arquivos indexados: {result.get('new_files', 0):,}\n"
+                f"• Novas pastas adicionadas: {result.get('new_folders', 0):,}\n"
+                f"• Pastas obsoletas removidas: {result.get('removed_folders', 0):,}"
+            )
+            QMessageBox.information(self, "Reconciliação de Caminhos", msg)
+            self.status_bar.showMessage("✅ Caminhos de arquivos movidos reconciliados com sucesso.", 5000)
+
+        def on_err(err_msg):
+            progress.close()
+            cleanup()
+            if "cancelada" not in str(err_msg).lower():
+                QMessageBox.warning(self, "Aviso", f"Reconciliação interrompida: {err_msg}")
+
+        progress.canceled.connect(self.reconcile_worker.cancel)
+        self.reconcile_worker.progress_update.connect(on_prog)
+        self.reconcile_worker.finished.connect(on_done)
+        self.reconcile_worker.failed.connect(on_err)
+        self.reconcile_thread.started.connect(self.reconcile_worker.run)
+        progress.show()
+        self.reconcile_thread.start()
 
     def __init__(self):
         print('DEBUG: DriveFileGalleryApp.__init__ INICIO')
@@ -145,6 +257,12 @@ class DriveFileGalleryApp(QMainWindow):
         self.local_scan_thread = None
         self.inc_sync_thread = None
         self.local_scan_worker = None
+        self.reconcile_thread = None
+        self.reconcile_worker = None
+        self.drive_check_thread = None
+        self.drive_check_worker = None
+        self.drive_badge_timer = QTimer(self)
+        self.drive_badge_timer.timeout.connect(self.check_drive_updates_available)
         self.search_timer = QTimer()
         self.search_timer.setSingleShot(True)
         self.search_timer.timeout.connect(self.handle_search_request)
@@ -358,6 +476,8 @@ class DriveFileGalleryApp(QMainWindow):
             self._start_drive_sync)
         self.main_bar.action_reindex.triggered.connect(
             self._reindex_local_files)
+        self.main_bar.action_reconcile_paths.triggered.connect(
+            self._start_path_reconciliation)
         self.main_bar.action_clear_cache.triggered.connect(
             self.clear_thumbnail_cache)
         self.main_bar.action_advanced_settings.triggered.connect(
@@ -718,7 +838,8 @@ class DriveFileGalleryApp(QMainWindow):
         image_extencions = {'.jpg', '.jpeg', '.png',
                             '.gif', '.bmp', '.webp', '.svg', '.ico', '.tiff'}
         video_extensions = {'.mp4', '.avi', '.mov', '.wmv',
-                            '.flv', '.mkv', '.webm', '.m4v', '.3gp'}
+                            '.flv', '.mkv', '.webm', '.m4v', '.3gp',
+                            '.mts', '.m2ts', '.ts', '.mpg', '.mpeg', '.vob'}
         document_extensions = {'.pdf', '.doc', '.docx', '.txt',
                                '.rtf', '.odt', '.xls', '.xlsx', '.ppt', '.pptx'}
         audio_extensions = {'.mp3', '.wav',
@@ -837,6 +958,10 @@ class DriveFileGalleryApp(QMainWindow):
 
     def _run_incremental_sync(self, force_manual=True):
         if not self.is_authenticated or not self.service:
+            if hasattr(self, 'folder_tree') and self.folder_tree:
+                self.folder_tree._refresh_tree(show_status=False)
+            if hasattr(self, 'status_bar') and self.status_bar:
+                self.status_bar.showMessage("🔄 Modo Offline: Pastas locais e árvore atualizadas.", 3000)
             return
 
         try:
@@ -894,7 +1019,7 @@ class DriveFileGalleryApp(QMainWindow):
         from src.utils.config_manager import ConfigManager
         
         # Se for acionado manualmente pelo usuário, olhar os últimos 7 dias para garantir tudo
-        window_days = 7 if force_manual else None
+        window_days = 30 if force_manual else None
         
         self.inc_sync_thread = QThread()
         self.inc_sync_worker = IncrementalSyncWorker(self.service, ConfigManager(), self.search_engine.indexer, force_window_days=window_days)
@@ -909,11 +1034,18 @@ class DriveFileGalleryApp(QMainWindow):
                 self.inc_sync_thread.deleteLater()
                 self.inc_sync_thread = None
             self.progress_bar.setVisible(False)
-            self._force_refresh_after_sync()
-            if count > 0:
-                self.status_bar.showMessage(f"✅ Sincronização: {count} arquivo(s) atualizado(s) da nuvem.", 5000)
+            if hasattr(self, 'main_bar') and self.main_bar:
+                self.main_bar.set_drive_updates_available(False)
+            # Se for sync automático de segundo plano e não houve arquivos alterados, não perturba a tela
+            if count > 0 or force_manual:
+                self._force_refresh_after_sync()
             else:
-                self.status_bar.showMessage("🔄 Sincronização: Tudo atualizado com o Drive.", 3000)
+                if hasattr(self, 'folder_tree') and self.folder_tree:
+                    self.folder_tree._refresh_tree(show_status=False)
+            if count > 0:
+                self.status_bar.showMessage(f"✅ Sincronização: {count} arquivo(s) do Drive e pastas locais verificadas.", 5000)
+            else:
+                self.status_bar.showMessage("🔄 Sincronização: Tudo atualizado (Drive e pastas locais).", 4000)
             self._run_deferred_incremental_sync()
         
         def on_inc_failed(err):
@@ -1419,6 +1551,9 @@ class DriveFileGalleryApp(QMainWindow):
         self.update_ui_for_auth_state(True)
 
         self.main_bar.update_profile(service)
+        QTimer.singleShot(1500, self.check_drive_updates_available)
+        if hasattr(self, 'drive_badge_timer'):
+            self.drive_badge_timer.start(180000)
 
         settings = load_settings()
         has_saved_config = bool(settings.get('scan_paths') and len(
@@ -1451,6 +1586,9 @@ class DriveFileGalleryApp(QMainWindow):
             self.update_ui_for_auth_state(False)
 
             self.main_bar.reset_profile()
+            self.main_bar.set_drive_updates_available(False)
+            if hasattr(self, 'drive_badge_timer'):
+                self.drive_badge_timer.stop()
 
             self.current_view = 'local'
             self.current_folder_id = None
@@ -1534,6 +1672,8 @@ class DriveFileGalleryApp(QMainWindow):
     def on_drive_sync_finished(self):
         self.drive_sync_running = False
         print("✅ Drive sync finalizado - flag liberada")
+        if hasattr(self, 'main_bar') and self.main_bar:
+            self.main_bar.set_drive_updates_available(False)
 
         if self.drive_sync_running:
             print("⚠️ AVISO: Flag ainda está True após liberação!")
@@ -1580,28 +1720,72 @@ class DriveFileGalleryApp(QMainWindow):
 
     def _force_refresh_after_sync(self, prev_selected_id=None):
         try:
+            from PyQt6.QtCore import QPoint
+            from PyQt6.QtCore import QItemSelectionModel
             if hasattr(self, 'search_engine'):
                 self.search_engine.clear_cache()
             if hasattr(self, 'indexer'):
                 self.indexer.clear_query_cache()
+
+            # 1. Capturar âncora de scroll e seleção antes de limpar
+            anchor_id = prev_selected_id
+            selected_indexes = self.file_list_view.selectedIndexes()
+            if not anchor_id and selected_indexes:
+                curr_item = self.file_list_model.data(selected_indexes[0], Qt.ItemDataRole.UserRole)
+                if curr_item:
+                    anchor_id = curr_item.get('id') or curr_item.get('path')
+
+            if not anchor_id:
+                top_idx = self.file_list_view.indexAt(QPoint(24, 24))
+                if top_idx.isValid():
+                    top_item = self.file_list_model.data(top_idx, Qt.ItemDataRole.UserRole)
+                    if top_item:
+                        anchor_id = top_item.get('id') or top_item.get('path')
+
+            scroll_bar = self.file_list_view.verticalScrollBar()
+            saved_scroll_value = scroll_bar.value()
+
+            # Determinar quantos lotes já estavam carregados na tela
+            loaded_count = self.file_list_model.rowCount()
+            batches_to_load = max(1, (loaded_count + self.page_size - 1) // self.page_size) if loaded_count > 0 else 1
+
             self.current_page = 0
             self.all_files_loaded = False
             list_update.clear_display(self)
-            list_update.load_next_batch(self)
-            if prev_selected_id:
-                QTimer.singleShot(
-                    200, lambda: self._reselect_and_refresh(prev_selected_id))
 
-            selected_indexes = self.file_list_view.selectedIndexes()
-            if selected_indexes:
-                current_item = self.file_list_model.data(
-                    selected_indexes[0], Qt.ItemDataRole.UserRole)
-                if current_item:
-                    file_id = current_item.get(
-                        'id') or current_item.get('path')
-                    if file_id:
-                        QTimer.singleShot(
-                            300, lambda: self._refresh_details_by_id(file_id))
+            # Recarregar proporcionalmente para manter a posição de trabalho
+            for _ in range(batches_to_load):
+                if self.all_files_loaded:
+                    break
+                list_update.load_next_batch(self)
+
+            # 2. Restaurar posição de rolagem e seleção
+            def _restore_position():
+                restored = False
+                if anchor_id:
+                    target_idx = self._find_model_index_by_id(anchor_id)
+                    if target_idx and target_idx.isValid():
+                        if selected_indexes or prev_selected_id:
+                            sel_model = self.file_list_view.selectionModel()
+                            if sel_model:
+                                sel_model.select(
+                                    target_idx,
+                                    QItemSelectionModel.SelectionFlag.ClearAndSelect | QItemSelectionModel.SelectionFlag.Rows
+                                )
+                            self.file_list_view.setCurrentIndex(target_idx)
+                            self._refresh_details_by_id(anchor_id)
+                        self.file_list_view.scrollTo(target_idx, QAbstractItemView.ScrollHint.PositionAtCenter)
+                        restored = True
+
+                if not restored and saved_scroll_value > 0:
+                    max_scroll = self.file_list_view.verticalScrollBar().maximum()
+                    self.file_list_view.verticalScrollBar().setValue(min(saved_scroll_value, max_scroll))
+
+            QTimer.singleShot(150, _restore_position)
+
+            # 3. Atualizar também a árvore de diretórios e varredura de pastas no disco
+            if hasattr(self, 'folder_tree') and self.folder_tree:
+                self.folder_tree._refresh_tree(show_status=False)
 
             self.status_bar.showMessage(
                 "Interface atualizada com novos metadados.", 3000)
@@ -2400,9 +2584,18 @@ class DriveFileGalleryApp(QMainWindow):
                 except Exception:
                     pass
 
+        if fpath and not os.path.exists(fpath):
+            from src.services.path_reconciler import resolve_and_heal_local_path
+            fpath = resolve_and_heal_local_path(file_item, indexer=getattr(self, 'indexer', None)) or fpath
+
         if fpath:
             norm_p = os.path.normpath(fpath)
             if os.path.exists(norm_p):
+                # Arquivos .MTS / .M2TS usam codec AVCHD/AC-3 que o player nativo do Windows não reconhece sem pacote externo;
+                # abrimos no player interno FFmpeg do VoxImago que decodifica vídeo e áudio nativamente.
+                if os.path.splitext(norm_p)[1].lower() in ('.mts', '.m2ts', '.ts'):
+                    self.file_list_view.show_quick_preview()
+                    return
                 try:
                     os.startfile(norm_p)
                     return

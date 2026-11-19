@@ -38,10 +38,11 @@ class DatabaseHealthDialog(QDialog):
         buttons = QHBoxLayout()
         self.diagnose_btn = QPushButton('Diagnosticar banco')
         self.index_btn = QPushButton('Reparar indice de busca')
+        self.reconcile_paths_btn = QPushButton('Reconciliar arquivos movidos')
         self.audit_btn = QPushButton('Auditar vinculos com Drive')
         self.repair_links_btn = QPushButton('Reparar vinculos seguros')
         for button in (
-            self.diagnose_btn, self.index_btn,
+            self.diagnose_btn, self.index_btn, self.reconcile_paths_btn,
             self.audit_btn, self.repair_links_btn,
         ):
             buttons.addWidget(button)
@@ -67,6 +68,9 @@ class DatabaseHealthDialog(QDialog):
         )
         self.index_btn.clicked.connect(
             lambda: self._run_health(repair=True)
+        )
+        self.reconcile_paths_btn.clicked.connect(
+            self._run_reconcile_paths
         )
         self.audit_btn.clicked.connect(
             lambda: self._run_link_revalidation(apply=False)
@@ -180,9 +184,14 @@ class DatabaseHealthDialog(QDialog):
                 win.end_maintenance_operation()
             self.current_writes = False
 
+    def _run_reconcile_paths(self):
+        win = self._main_window()
+        if win and hasattr(win, '_start_path_reconciliation'):
+            win._start_path_reconciliation()
+
     def _set_buttons_enabled(self, enabled):
         for button in (
-            self.diagnose_btn, self.index_btn,
+            self.diagnose_btn, self.index_btn, self.reconcile_paths_btn,
             self.audit_btn, self.repair_links_btn, self.close_btn,
         ):
             button.setEnabled(enabled)

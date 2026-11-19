@@ -543,7 +543,7 @@ class DriveSync(QObject):
                 self._match_outcomes[f'reason:{match.reason}'] += 1
                 if match.matched:
                     drive_desc = (drive_item.get('description') or '').strip()
-                    indexer.update_description(
+                    updated = indexer.update_description(
                         match.local_id,
                         drive_desc if drive_desc else None,
                         drive_item.get('thumbnailLink') or None,
@@ -551,8 +551,14 @@ class DriveSync(QObject):
                         commit=False,
                         allow_empty_override=False,
                     )
-                    fusion_count += 1
-                    matched_drive_ids.append(drive_item['id'])
+                    if updated:
+                        fusion_count += 1
+                        matched_drive_ids.append(drive_item['id'])
+                    else:
+                        logging.warning(
+                            "⚠️ Match local encontrado mas registro não foi atualizado no DB: %s",
+                            match.local_id,
+                        )
             except Exception as e:
                 logging.warning(
                     f"⚠️ Fusão falhou para {drive_item.get('name', 'unknown')}: {str(e)[:100]}")
@@ -613,7 +619,7 @@ class DriveSync(QObject):
                 if match.matched:
                     drive_desc = (drive_item.get('description') or '').strip()
                     try:
-                        indexer.update_description(
+                        updated = indexer.update_description(
                             match.local_id,
                             drive_desc if drive_desc else None,
                             drive_item.get('thumbnailLink') or None,
@@ -621,8 +627,14 @@ class DriveSync(QObject):
                             commit=False,
                             allow_empty_override=False,
                         )
-                        total_fusions += 1
-                        matched_to_delete.append(file_id)
+                        if updated:
+                            total_fusions += 1
+                            matched_to_delete.append(file_id)
+                        else:
+                            logging.warning(
+                                "⚠️ fuse_all_data: registro local não encontrado no DB para atualizar: %s",
+                                match.local_id,
+                            )
                     except Exception as e:
                         logging.error(
                             f"❌ Erro ao fusionar metadados (ID local: {match.local_id}) a partir do Drive {file_id}: {e}")

@@ -60,6 +60,11 @@ def configured_operation_roots(config_mgr):
     if config_mgr.is_sandbox():
         candidates.append(config_mgr.get_sandbox_path())
     else:
+        if hasattr(config_mgr, 'get_resolved_scan_paths'):
+            try:
+                candidates.extend(config_mgr.get_resolved_scan_paths(persist=False) or [])
+            except Exception:
+                pass
         # ``scan_paths`` e o nome historico ``scan_folders`` coexistem no app.
         for key in ('scan_paths', 'scan_folders', 'local_folders'):
             value = config_mgr.get(key, [])

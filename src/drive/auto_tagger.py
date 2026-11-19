@@ -65,7 +65,7 @@ class AutoTagger:
         # Sugerir por tipo de mídia
         mime = file_item.get('mimeType', '')
         ext = os.path.splitext(file_item.get('name', ''))[1].lower()
-        if 'video' in mime or ext in ['.mp4', '.avi', '.mov', '.mkv', '.wmv']:
+        if 'video' in mime or ext in ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.mts', '.m2ts', '.ts', '.mpg', '.mpeg', '.vob']:
             if 'Vídeo' in self.vocab_mgr.all_tags:
                 suggested.add('Vídeo')
 

@@ -18,12 +18,14 @@ from src.utils.path_validation import validate_path_component
 
 
 class FolderFileSystemModel(QFileSystemModel):
-    """QFileSystemModel otimizado com cache instantâneo de subpastas do banco de dados (0ms)."""
+    """QFileSystemModel otimizado com detecção recursiva instantânea de subpastas do banco de dados e do disco local."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, root_dir=None):
         super().__init__(parent)
         self._known_parent_folders = set()
         self._load_parents_from_db()
+        if root_dir:
+            self._load_parents_from_disk(root_dir)
 
     def _load_parents_from_db(self):
         try:
@@ -35,13 +37,33 @@ class FolderFileSystemModel(QFileSystemModel):
             if os.path.exists(db_path):
                 con = sqlite3.connect(db_path)
                 q = "SELECT DISTINCT parentId FROM files WHERE mimeType IN ('folder', 'application/vnd.google-apps.folder', 'directory')"
-                self._known_parent_folders = {
-                    os.path.normcase(os.path.normpath(r[0]))
-                    for r in con.execute(q) if r[0]
-                }
+                for r in con.execute(q):
+                    if r[0]:
+                        self._known_parent_folders.add(os.path.normcase(os.path.normpath(r[0])))
                 con.close()
         except Exception:
             pass
+
+    def _load_parents_from_disk(self, root_dir=None):
+        """Varre os diretórios em disco (~0.1s) e registra todas as pastas que possuem subpastas em qualquer nível."""
+        if not root_dir or not os.path.exists(root_dir):
+            return
+        try:
+            for root, dirs, _ in os.walk(root_dir):
+                if dirs:
+                    self._known_parent_folders.add(os.path.normcase(os.path.normpath(root)))
+        except Exception:
+            pass
+
+    def refresh_subdirs_cache(self, root_dir=None):
+        """Recarrega os pais conhecidos a partir do DB e do disco local."""
+        self._known_parent_folders.clear()
+        self._load_parents_from_db()
+        if root_dir:
+            self._load_parents_from_disk(root_dir)
+
+    def clear_subdirs_cache(self, root_dir=None):
+        self.refresh_subdirs_cache(root_dir)
 
     def hasChildren(self, parent=QModelIndex()):
         if not parent.isValid():
@@ -57,9 +79,6 @@ class FolderFileSystemModel(QFileSystemModel):
     def add_known_parent(self, path):
         if path:
             self._known_parent_folders.add(os.path.normcase(os.path.normpath(path)))
-
-    def clear_subdirs_cache(self):
-        self._load_parents_from_db()
 
 
 class FolderTreeDelegate(QStyledItemDelegate):
@@ -257,7 +276,7 @@ class FolderTreeWidget(QWidget):
         layout.addLayout(header_layout)
 
         # Modelo do Sistema de Arquivos (com detecção real de subpastas para triângulos)
-        self.model = FolderFileSystemModel(self)
+        self.model = FolderFileSystemModel(self, root_dir=self.root_dir)
         self.model.setFilter(QDir.Filter.Dirs | QDir.Filter.NoDotAndDotDot)
         self.model.setRootPath(self.root_dir)
 
@@ -311,7 +330,7 @@ class FolderTreeWidget(QWidget):
         action_copy_path.triggered.connect(lambda: self._copy_path_to_clipboard(target_path))
         action_open_explorer.triggered.connect(lambda: os.startfile(target_path) if os.path.exists(target_path) else None)
         action_new.triggered.connect(lambda: self.create_new_folder(target_path))
-        action_refresh.triggered.connect(self._refresh_tree)
+        action_refresh.triggered.connect(lambda: self._refresh_tree(target_path))
 
         menu.addSeparator()
         action_sync_drive = menu.addAction("☁️ Sincronizar Tags desta Pasta com o Google Drive")
@@ -421,10 +440,53 @@ class FolderTreeWidget(QWidget):
             if maintenance_acquired and hasattr(win, 'end_maintenance_operation'):
                 win.end_maintenance_operation()
 
-    def _refresh_tree(self):
-        self.model.clear_subdirs_cache()
+    def _refresh_tree(self, target_to_expand=None, show_status=True):
+        """
+        Recarrega a árvore de diretórios descobrindo todas as subpastas em profundidade (recursivo).
+        Preserva as pastas que já estavam expandidas e a seleção atual do usuário.
+        """
+        # 1. Salvar caminhos de pastas atualmente expandidas e a seleção atual
+        expanded_paths = []
+        for p in list(self.model._known_parent_folders):
+            idx = self.model.index(p)
+            if idx.isValid() and self.tree_view.isExpanded(idx):
+                expanded_paths.append(p)
+
+        selected_path = None
+        indexes = self.tree_view.selectedIndexes()
+        if indexes and self.model.isDir(indexes[0]):
+            selected_path = self.model.filePath(indexes[0])
+
+        # 2. Recarregar o cache com DB + varredura rápida de diretórios no disco
+        self.model.refresh_subdirs_cache(self.root_dir)
+
+        # 3. Forçar o QFileSystemModel a invalidar seu cache interno e reler do disco
+        self.model.setRootPath("")
         self.model.setRootPath(self.root_dir)
         self.tree_view.setRootIndex(self.model.index(self.root_dir))
+
+        # 4. Restaurar expansões anteriores
+        for p in sorted(expanded_paths, key=len):
+            idx = self.model.index(p)
+            if idx.isValid():
+                self.tree_view.expand(idx)
+
+        # 5. Se o usuário clicou em uma pasta específica para recarregar ou tinha uma selecionada, expandir e selecionar
+        expand_target = target_to_expand if (target_to_expand and target_to_expand != self.root_dir) else selected_path
+        if expand_target and os.path.exists(expand_target):
+            self.select_and_expand_folder(expand_target)
+
+        # 6. Sincronizar on-the-fly a pasta alvo no SQLite se aplicável
+        win = self.window()
+        if hasattr(win, 'indexer') and win.indexer and expand_target and os.path.isdir(expand_target):
+            try:
+                from src.ui.list_update import list_update
+                list_update._sync_single_folder_on_the_fly(win, expand_target)
+            except Exception:
+                pass
+
+        if show_status and hasattr(win, 'status_bar') and win.status_bar:
+            win.status_bar.showMessage("🔄 Árvore de pastas recarregada com sucesso!", 3500)
 
     def create_new_folder(self, target_parent_path=None):
         if self.config_mgr.is_read_only():
@@ -485,7 +547,7 @@ class FolderTreeWidget(QWidget):
         
         # 3. Registrar como pasta conhecida e atualizar visualização
         self.model.add_known_parent(target_parent_path)
-        self.model.clear_subdirs_cache()
+        self.model.refresh_subdirs_cache(self.root_dir)
         parent_idx = self.model.index(target_parent_path)
         if parent_idx.isValid():
             self.tree_view.expand(parent_idx)
@@ -554,7 +616,8 @@ class FolderTreeWidget(QWidget):
     def set_root_directory(self, path):
         if path and os.path.exists(path):
             self.root_dir = path
-            self.model.clear_subdirs_cache()
+            self.model.refresh_subdirs_cache(self.root_dir)
+            self.model.setRootPath("")
             self.model.setRootPath(self.root_dir)
             self.tree_view.setRootIndex(self.model.index(self.root_dir))
             self.clear_folder_selection()

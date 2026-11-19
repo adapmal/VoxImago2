@@ -284,9 +284,13 @@ class FileListView(QListView):
             dialog = BatchEditorDialog(selected_items, parent=self)
             dialog.exec()
         elif action == open_action:
-            if file_item.get('source') == 'local' and file_item.get('path'):
-                folder = os.path.dirname(file_item['path'])
-                os.startfile(folder)
+            if file_item.get('source') == 'local':
+                from src.services.path_reconciler import resolve_and_heal_local_path
+                resolved_p = resolve_and_heal_local_path(file_item) or file_item.get('path')
+                if resolved_p:
+                    folder = os.path.dirname(resolved_p)
+                    if os.path.exists(folder):
+                        os.startfile(folder)
         elif action == copy_pt_action or action == copy_en_action:
             caminho = file_item.get('path') or file_item.get('webViewLink')
             if caminho:
@@ -341,8 +345,13 @@ class FileListView(QListView):
                 new_indexes = self.selectedIndexes()
                 if new_indexes:
                     new_item = new_indexes[0].data(Qt.ItemDataRole.UserRole)
-                    new_path = new_item.get('path')
+                    from src.services.path_reconciler import resolve_and_heal_local_path
+                    new_path = resolve_and_heal_local_path(new_item) or (new_item.get('path') if new_item else None)
                     if new_path and os.path.exists(new_path):
+                        try:
+                            self.model().setData(new_indexes[0], new_item, Qt.ItemDataRole.UserRole)
+                        except Exception:
+                            pass
                         load_file(new_path)
             else:
                 QDialog.keyPressEvent(dialog, event)
@@ -372,7 +381,7 @@ class FileListView(QListView):
             dialog.setWindowTitle(f"Pré-visualização - {os.path.basename(file_path)}")
 
             ext = os.path.splitext(file_path)[1].lower()
-            video_exts = {'.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v'}
+            video_exts = {'.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.mts', '.m2ts', '.ts', '.mpg', '.mpeg', '.vob'}
             raw_exts = {'.cr2', '.nef', '.arw', '.dng', '.orf', '.rw2',
                         '.pef', '.srw', '.raf', '.raw'}
             heic_exts = {'.heic', '.heif'}
@@ -525,10 +534,15 @@ class FileListView(QListView):
                 layout.addWidget(label)
                 dialog.resize(820, 620)
 
-        # Load first item
+        # Load first item (com auto-cura caso o arquivo tenha sido movido de pasta)
         file_item = indexes[0].data(Qt.ItemDataRole.UserRole)
-        file_path = file_item.get('path')
+        from src.services.path_reconciler import resolve_and_heal_local_path
+        file_path = resolve_and_heal_local_path(file_item) or (file_item.get('path') if file_item else None)
         if file_path and os.path.exists(file_path):
+            try:
+                self.model().setData(indexes[0], file_item, Qt.ItemDataRole.UserRole)
+            except Exception:
+                pass
             load_file(file_path)
         else:
             return

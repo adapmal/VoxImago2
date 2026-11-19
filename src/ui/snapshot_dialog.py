@@ -9,6 +9,7 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit, QProgressBar, QMessageBox, QFileDialog,
 )
 from src.utils.config_manager import ConfigManager
+from src.utils.portable_paths import resolve_relocated_path
 from src.database.snapshot import read_manifest, SCHEMA_VERSION
 from src.services.snapshot_management import (
     catalog_info, inspect_snapshot, prepare_adoption, check_path,
@@ -50,7 +51,13 @@ class SnapshotDialog(QDialog):
         intro.setWordWrap(True)
         layout.addWidget(intro)
         configured = self.config.get('shared_cache_path')
-        root, ext = os.path.splitext(configured)
+        allowed_drives = self.config.get_allowed_drive_letters()
+        resolved_base = resolve_relocated_path(
+            configured,
+            drive_letters=allowed_drives,
+            allow_existing_parent=True,
+        ) or configured
+        root, ext = os.path.splitext(resolved_base)
         mode_suffix = '_sandbox' if self.config.is_sandbox() else ''
         default = f'{root}{mode_suffix}_v{SCHEMA_VERSION}{ext or ".db"}'
         layout.addWidget(QLabel('Snapshot de origem (.manifest.json ou .db):'))
@@ -196,9 +203,31 @@ class SnapshotDialog(QDialog):
         if self.review is None or self.config.is_read_only():
             return
         info = self.review
+        allowed_drives = self.config.get_allowed_drive_letters()
+        local_roots = self.config.get_resolved_scan_paths(persist=False)
         mapping = []
         for root in info['roots']:
-            new = QFileDialog.getExistingDirectory(self, f'Onde está nesta máquina a pasta: {root}?', '')
+            auto_target = resolve_relocated_path(root, drive_letters=allowed_drives)
+            if not auto_target and len(info['roots']) == 1 and len(local_roots) == 1 and os.path.isdir(local_roots[0]):
+                auto_target = local_roots[0]
+            if auto_target and os.path.isdir(auto_target):
+                use_auto = QMessageBox.question(
+                    self,
+                    'Pasta local detectada automaticamente',
+                    f'Raiz original do snapshot:\n{root}\n\n'
+                    f'Pasta equivalente detectada nesta máquina:\n{auto_target}\n\n'
+                    'Deseja usar esta pasta detectada automaticamente?\n'
+                    '(Escolha "No" para selecionar outra pasta manualmente.)',
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if use_auto == QMessageBox.StandardButton.Cancel:
+                    return
+                if use_auto == QMessageBox.StandardButton.Yes:
+                    mapping.append((root, auto_target))
+                    continue
+            start_dir = auto_target if (auto_target and os.path.isdir(auto_target)) else (local_roots[0] if local_roots else '')
+            new = QFileDialog.getExistingDirectory(self, f'Onde está nesta máquina a pasta: {root}?', start_dir)
             if not new:
                 return
             mapping.append((root, new))

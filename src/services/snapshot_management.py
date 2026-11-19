@@ -187,12 +187,22 @@ def prepare_adoption(db, info, mapping):
                     raise ValueError(f'Pasta de destino indisponível: {new}')
                 if ntpath.normcase(old) != ntpath.normcase(new):
                     rebase_local_paths(conn, old, new)
-            # Todo item local precisa estar coberto pelo mapeamento confirmado.
+            # Remover registros residuais fora das raízes mapeadas (ex.: pastas de sandbox/teste)
             roots = [ntpath.normcase(ntpath.normpath(new)) for _, new in mapping]
-            for (path,) in conn.execute("SELECT path FROM files WHERE source='local'"):
+            outside_ids = []
+            for file_id, path in conn.execute("SELECT file_id, path FROM files WHERE source='local'"):
                 normalized = ntpath.normcase(ntpath.normpath(path or ''))
                 if not any(normalized == root or normalized.startswith(root + '\\') for root in roots):
-                    raise ValueError('Há caminhos locais fora das raízes mapeadas. Adoção cancelada.')
+                    outside_ids.append(file_id)
+            if outside_ids:
+                with conn:
+                    conn.executemany("DELETE FROM files WHERE file_id=?", [(fid,) for fid in outside_ids])
+                    conn.executemany("DELETE FROM search_index WHERE file_id=?", [(fid,) for fid in outside_ids])
+                    if conn.execute("SELECT 1 FROM sqlite_master WHERE name='drive_link_validation'").fetchone():
+                        conn.executemany(
+                            "DELETE FROM drive_link_validation WHERE local_file_id=?",
+                            [(fid,) for fid in outside_ids],
+                        )
             conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
             conn.execute('PRAGMA journal_mode=DELETE')
         finally:

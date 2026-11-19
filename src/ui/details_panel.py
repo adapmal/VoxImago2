@@ -270,6 +270,17 @@ class FileDetailsPanel(QFrame):
             'mimeType') not in ['application/vnd.google-apps.folder', 'folder'] else "N/A")
 
         raw_path = file_item.get('path', file_item.get('webViewLink', 'N/A'))
+        if (
+            file_item.get('source') == 'local'
+            and file_item.get('mimeType') not in ('application/vnd.google-apps.folder', 'folder')
+            and isinstance(raw_path, str)
+            and raw_path != 'N/A'
+            and not os.path.exists(raw_path)
+        ):
+            from src.services.path_reconciler import resolve_and_heal_local_path
+            healed_path = resolve_and_heal_local_path(file_item)
+            if healed_path:
+                raw_path = healed_path
         display_path = raw_path.replace('\\', '/') if raw_path and isinstance(raw_path, str) else raw_path
         self.path_label.setText(display_path)
 
@@ -443,25 +454,31 @@ class FileDetailsPanel(QFrame):
         self.thumbnail_label.setPixmap(ThumbnailManager.get_generic_thumbnail(
             file_item.get('mimeType'), size=(300, 300)))
 
-        local_path = file_item.get('path')
-        if local_path and os.path.exists(local_path):
-            try:
-                cached = None
-                if ThumbnailCache.is_thumbnail_cached(file_item):
-                    cached = ThumbnailCache.get_existing_thumbnail_cache_path(file_item)
-                else:
+        if not file_item:
+            return
+
+        try:
+            cached = None
+            # 1. Se a miniatura já está no cache (usada pela grade, seja de arquivo local ou do Drive)
+            if ThumbnailCache.is_thumbnail_cached(file_item):
+                cached = ThumbnailCache.get_existing_thumbnail_cache_path(file_item)
+
+            # 2. Se não está em cache, gerar a partir do caminho físico local (suportando arquivos movidos na fila)
+            if not cached or not os.path.exists(cached):
+                local_path = file_item.get('physical_path') or file_item.get('orig_path') or file_item.get('path')
+                if local_path and os.path.exists(local_path):
                     cached = ThumbnailManager.generate_local_thumbnail(file_item, size=(300, 300))
-                    
-                if cached:
-                    pixmap = QPixmap(cached)
-                    if not pixmap.isNull():
-                        self.thumbnail_label.setPixmap(pixmap.scaled(
-                            self.thumbnail_label.size(),
-                            Qt.AspectRatioMode.KeepAspectRatio,
-                            Qt.TransformationMode.SmoothTransformation
-                        ))
-            except Exception:
-                pass
+
+            if cached and os.path.exists(cached):
+                pixmap = QPixmap(cached)
+                if not pixmap.isNull():
+                    self.thumbnail_label.setPixmap(pixmap.scaled(
+                        self.thumbnail_label.size(),
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation
+                    ))
+        except Exception:
+            pass
 
     def _refresh_suggestions_view(self):
         if getattr(self, '_is_batch_mode', False) and getattr(self, 'current_files_list', None):

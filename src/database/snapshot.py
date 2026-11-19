@@ -260,17 +260,51 @@ def rebase_local_paths(connection, source_root, target_root):
     if not source or not target or source == target:
         return 0
 
+    connection.create_function("py_lower", 1, lambda s: s.lower() if s else s)
     connection.execute('BEGIN IMMEDIATE')
     try:
         rows = connection.execute(
-            "SELECT file_id,path,parentId FROM files WHERE source='local'"
+            "SELECT file_id,path,parentId,description,webContentLink "
+            "FROM files WHERE source='local'"
         ).fetchall()
-        updates = []
-        id_mapping = {}
-        for file_id, path, parent_id in rows:
+
+        # Deduplicar registros que diferem apenas por caixa (maiusculas/minusculas)
+        # antes do remapeamento, preservando o registro mais rico em metadados.
+        by_canonical = {}
+        duplicates_to_remove = []
+        for row in rows:
+            file_id, path, parent_id, desc, web_link = row
             if not _path_is_under(path, source):
                 continue
+            canon_key = ntpath.normcase(ntpath.normpath(file_id))
+            score = (
+                1 if (desc and str(desc).strip()) else 0,
+                1 if (web_link and str(web_link).strip()) else 0,
+                1 if file_id == canon_key else 0,
+            )
+            if canon_key in by_canonical:
+                prev_score, prev_row = by_canonical[canon_key]
+                if score > prev_score:
+                    duplicates_to_remove.append(prev_row[0])
+                    by_canonical[canon_key] = (score, row)
+                else:
+                    duplicates_to_remove.append(file_id)
+            else:
+                by_canonical[canon_key] = (score, row)
 
+        if duplicates_to_remove:
+            connection.executemany(
+                "DELETE FROM files WHERE file_id=?",
+                [(fid,) for fid in duplicates_to_remove],
+            )
+            connection.executemany(
+                "DELETE FROM search_index WHERE file_id=?",
+                [(fid,) for fid in duplicates_to_remove],
+            )
+
+        updates = []
+        id_mapping = {}
+        for _score, (file_id, path, parent_id, _desc, _web) in by_canonical.values():
             def rebased(value):
                 if not _path_is_under(value, source):
                     return value
@@ -300,10 +334,10 @@ def rebase_local_paths(connection, source_root, target_root):
         source_length = len(source)
         connection.execute(
             "UPDATE search_index "
-            "SET file_id = ? || substr(file_id, ?) "
+            "SET file_id = ? || py_lower(replace(substr(file_id, ?), '/', '\\')) "
             "WHERE source='local' AND ("
-            "lower(file_id)=lower(?) OR ("
-            "lower(substr(file_id,1,?))=lower(?) "
+            "py_lower(replace(file_id, '/', '\\'))=py_lower(?) OR ("
+            "py_lower(replace(substr(file_id,1,?), '/', '\\'))=py_lower(?) "
             "AND substr(file_id,?,1) IN (?, ?)))",
             (
                 target, source_length + 1, source,
@@ -314,6 +348,11 @@ def rebase_local_paths(connection, source_root, target_root):
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='drive_link_validation'"
         ).fetchone()
         if table_exists:
+            if duplicates_to_remove:
+                connection.executemany(
+                    "DELETE FROM drive_link_validation WHERE local_file_id=?",
+                    [(fid,) for fid in duplicates_to_remove],
+                )
             connection.executemany(
                 "UPDATE drive_link_validation SET local_file_id=? WHERE local_file_id=?",
                 [(new, old) for old, new in id_mapping.items()],

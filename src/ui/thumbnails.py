@@ -16,6 +16,9 @@ from PyQt6.QtCore import QObject
 import os
 import hashlib
 import mimetypes
+mimetypes.add_type('video/mp2t', '.mts')
+mimetypes.add_type('video/mp2t', '.m2ts')
+mimetypes.add_type('video/mp2t', '.ts')
 import logging
 import requests
 import threading
@@ -178,6 +181,7 @@ class FileListDelegate(QStyledItemDelegate):
             local_path = file_item.get('physical_path') or file_item.get('orig_path') or file_item.get('path') or ''
             extension = os.path.splitext(local_path)[1].lower() if local_path else ''
             supported_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v',
+                                    '.3gp', '.mts', '.m2ts', '.ts', '.mpg', '.mpeg', '.vob',
                                     '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp',
                                     '.raw', '.cr2', '.nef', '.arw', '.dng', '.orf', '.rw2', '.pef', '.srw', '.raf',
                                     '.pdf', '.heic', '.heif'}
@@ -283,7 +287,7 @@ class FileListDelegate(QStyledItemDelegate):
 class ThumbnailManager:
 
     def generate_local_thumbnail(file_item, size=(256, 256)):
-        local_path = file_item.get('path', '')
+        local_path = file_item.get('physical_path') or file_item.get('orig_path') or file_item.get('path', '')
         extension = os.path.splitext(
             local_path)[1].lower() if local_path else ''
 
@@ -294,7 +298,8 @@ class ThumbnailManager:
             return ThumbnailCache.get_existing_thumbnail_cache_path(file_item)
 
         video_extensions = {'.mp4', '.avi', '.mov',
-                            '.mkv', '.wmv', '.flv', '.webm', '.m4v'}
+                            '.mkv', '.wmv', '.flv', '.webm', '.m4v',
+                            '.3gp', '.mts', '.m2ts', '.ts', '.mpg', '.mpeg', '.vob'}
         image_extensions = {'.jpg', '.jpeg', '.png',
                             '.gif', '.bmp', '.tiff', '.webp', '.heic', '.heif'}
         raw_extensions = {'.raw', '.cr2', '.nef', '.arw',
@@ -360,7 +365,8 @@ class ThumbnailManager:
             is_video = (mime.startswith('video/')
                         or (guessed and guessed.startswith('video/')))
             video_exts = {'.mp4', '.mov', '.avi',
-                          '.mkv', '.wmv', '.flv', '.webm', '.m4v'}
+                          '.mkv', '.wmv', '.flv', '.webm', '.m4v',
+                          '.3gp', '.mts', '.m2ts', '.ts', '.mpg', '.mpeg', '.vob'}
             if not is_video and os.path.splitext(local_path)[1].lower() not in video_exts:
                 logging.debug(
                     f"[THUMB][VIDEO][IGNORADO] Não é vídeo: {local_path} (mime: {mime}, guessed: {guessed})")
@@ -391,7 +397,15 @@ class ThumbnailManager:
                         f"[THUMB][VIDEO][ERRO] Não foi possível abrir o vídeo: {local_path}")
                     return None
                 ret, frame = cap.read()
-                if not ret:
+                # Se o primeiro frame falhou ou for totalmente escuro (comum em fade-in/MTS), avançar alguns frames
+                if not ret or frame is None or frame.size == 0 or frame.mean() < 8.0:
+                    for _step in range(15):
+                        r_next, f_next = cap.read()
+                        if r_next and f_next is not None and f_next.size > 0:
+                            ret, frame = r_next, f_next
+                            if frame.mean() >= 8.0:
+                                break
+                if not ret or frame is None or frame.size == 0:
                     logging.debug(
                         f"[THUMB][VIDEO][WARN] Frame inicial não lido, tentando 500ms...")
                     cap.set(cv2.CAP_PROP_POS_MSEC, 500)

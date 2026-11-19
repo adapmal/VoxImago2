@@ -333,11 +333,12 @@ class list_update:
             return
 
         app.indexer.ensure_conn()
-        norm_folder = os.path.normpath(folder_path)
-        norm_folder_slashes = norm_folder.replace('\\', '/')
+        norm_folder = os.path.normcase(os.path.normpath(folder_path))
+        raw_norm_folder = os.path.normpath(folder_path)
+        norm_folder_slashes = raw_norm_folder.replace('\\', '/')
         possible_parents = (
+            raw_norm_folder,
             norm_folder,
-            norm_folder.lower(),
             norm_folder_slashes,
             norm_folder_slashes.lower()
         )
@@ -357,14 +358,19 @@ class list_update:
         actual_names = set()
 
         from src.utils.utils import extrair_ano_banco_imagens
+        from src.services.path_reconciler import (
+            find_relocated_record_for_disk_entry,
+            migrate_thumbnail_cache_file,
+            resolve_and_heal_local_path,
+        )
         from datetime import datetime, timezone
 
         for name, is_dir, modified, size in valid_entries:
-            entry_path = os.path.normpath(os.path.join(norm_folder, name))
+            entry_path = os.path.normcase(os.path.normpath(os.path.join(norm_folder, name)))
             actual_names.add(name.lower())
 
             db_row = db_by_name.get(name.lower())
-            db_id_differs = bool(db_row and os.path.normcase(os.path.normpath(db_row[0])) != os.path.normcase(entry_path))
+            db_id_differs = bool(db_row and db_row[0] != entry_path)
 
             # Check if file is new or modified or moved
             if not db_row or db_row[4] != modified or db_row[5] != size or db_id_differs:
@@ -382,12 +388,39 @@ class list_update:
                 thumb_path = db_row[8] if (db_row and db_row[8]) else ''
                 web_link = db_row[9] if (db_row and db_row[9]) else None
                 rotation = int(db_row[10] or 0) if db_row else 0
+                starred = 0
+
+                if not db_row and not is_dir:
+                    relocated = find_relocated_record_for_disk_entry(
+                        app.indexer.cursor, name, size, entry_path
+                    )
+                    if relocated:
+                        (
+                            old_fid, old_p, old_desc, old_tlink, old_tpath,
+                            old_wlink, old_star, old_rot, old_mtime, old_sz
+                        ) = relocated
+                        desc = old_desc or ''
+                        thumb_link = old_tlink or ''
+                        thumb_path = old_tpath or ''
+                        web_link = old_wlink or None
+                        starred = int(old_star or 0)
+                        rotation = int(old_rot or 0)
+                        migrate_thumbnail_cache_file(
+                            old_p or old_fid,
+                            old_mtime or 0,
+                            old_sz or 0,
+                            os.path.normcase(entry_path),
+                            modified,
+                            size,
+                            rotation,
+                        )
+                        ids_to_delete.append(old_fid)
 
                 item = {
                     'id': entry_path,
                     'name': name,
                     'path': entry_path,
-                    'mimeType': 'folder' if is_dir else 'image/jpeg',
+                    'mimeType': 'folder' if is_dir else ('video/mp2t' if os.path.splitext(name)[1].lower() in ('.mts', '.m2ts', '.ts') else 'image/jpeg'),
                     'source': 'local',
                     'description': desc,
                     'thumbnailLink': thumb_link,
@@ -397,6 +430,7 @@ class list_update:
                     'createdTime': data_final,
                     'parentId': norm_folder,
                     'webContentLink': web_link,
+                    'starred': starred,
                     'thumbnailRotation': rotation,
                 }
 
@@ -407,6 +441,21 @@ class list_update:
 
         for db_name, db_row in db_by_name.items():
             if db_name not in actual_names:
+                # Se for um arquivo que saiu desta pasta, tentar curar/realocar para a nova pasta antes de apagar
+                if db_row[3] != 'folder':
+                    healed = resolve_and_heal_local_path(
+                        {
+                            'file_id': db_row[0],
+                            'id': db_row[0],
+                            'name': db_row[1],
+                            'path': db_row[2],
+                            'size': db_row[5],
+                        },
+                        indexer=app.indexer,
+                    )
+                    if healed:
+                        app.search_engine.clear_cache()
+                        continue
                 ids_to_delete.append(db_row[0])
 
         if items_to_save:

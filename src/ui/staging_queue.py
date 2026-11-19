@@ -1047,6 +1047,20 @@ class StagingQueueDialog(QDialog):
                 except Exception as e_db:
                     logging.debug(f"Erro ao buscar link no banco: {e_db}")
 
+            if not local_size and fpath and not os.path.isfile(fpath):
+                from src.services.path_reconciler import resolve_and_heal_local_path
+                from src.database.database import to_canonical_id
+                healed_p = resolve_and_heal_local_path(
+                    {'file_id': fid, 'id': fid, 'name': item.file_name, 'path': fpath, 'source': 'local'},
+                    indexer=self.db_indexer,
+                )
+                if healed_p and os.path.isfile(healed_p):
+                    fpath = healed_p
+                    fid = to_canonical_id(healed_p)
+                    item.path = healed_p
+                    item.file_id = fid
+                    item.file_name = os.path.basename(healed_p)
+
             if not local_size and fpath and os.path.isfile(fpath):
                 try:
                     local_size = os.path.getsize(fpath)
@@ -1135,6 +1149,35 @@ class StagingQueueDialog(QDialog):
                             logging.warning(
                                 "Correspondencia Drive recusada: nome repetido ou tamanho divergente."
                             )
+                    # Fallback seguro: se o arquivo foi movido localmente e a pasta no Drive ainda é a anterior (ou vice-versa),
+                    # buscar no Drive pelo nome exato e validar unicidade estrita pelo tamanho em bytes (local_size).
+                    current_drive = self.config_mgr.get_current_drive_id()
+                    kwargs_fb = {'supportsAllDrives': True, 'includeItemsFromAllDrives': True}
+                    if current_drive:
+                        kwargs_fb['corpora'] = 'drive'
+                        kwargs_fb['driveId'] = current_drive
+                    else:
+                        kwargs_fb['corpora'] = 'allDrives'
+                    q_fb = f"name = '{clean_name}' and trashed = false"
+                    res_fb = self.drive_service.files().list(
+                        q=q_fb, fields='files(id, name, webViewLink, size)', **kwargs_fb
+                    ).execute()
+                    matched_fb = select_unique_drive_candidate_by_size(
+                        res_fb.get('files', []), local_size
+                    )
+                    if matched_fb:
+                        matched_id = matched_fb['id']
+                        wlink = matched_fb.get('webViewLink')
+                        if wlink and self.db_indexer:
+                            try:
+                                self.db_indexer.cursor.execute(
+                                    "UPDATE files SET webContentLink = ? WHERE file_id = ? OR path = ?",
+                                    (wlink, fid, fpath),
+                                )
+                                self.db_indexer.conn.commit()
+                            except Exception:
+                                pass
+                        return matched_id
                 except Exception as e:
                     logging.error(f"Falha ao buscar ID do Drive para {item.file_name}: {e}")
                     return None
@@ -1155,6 +1198,24 @@ class StagingQueueDialog(QDialog):
         if item.action_type in ('add_tags', 'remove_tags', 'set_description'):
             lookup_id = item.file_id or item.path
             from src.database.database import to_canonical_id
+            if lookup_id and ('/' in lookup_id or '\\' in lookup_id or lookup_id[1:3] == ':\\'):
+                if not os.path.exists(lookup_id):
+                    from src.services.path_reconciler import resolve_and_heal_local_path
+                    healed_p = resolve_and_heal_local_path(
+                        {
+                            'file_id': lookup_id,
+                            'id': lookup_id,
+                            'name': item.file_name,
+                            'path': item.path or lookup_id,
+                            'source': 'local',
+                        },
+                        indexer=self.db_indexer,
+                    )
+                    if healed_p and os.path.exists(healed_p):
+                        lookup_id = healed_p
+                        item.path = healed_p
+                        item.file_id = to_canonical_id(healed_p)
+                        item.file_name = os.path.basename(healed_p)
             canon_id = to_canonical_id(lookup_id)
             
             # Buscar a descrição VIVA mais recente do banco SQLite no momento da execução (F11)
@@ -1210,6 +1271,10 @@ class StagingQueueDialog(QDialog):
                     except Exception as e:
                         logging.error(f"Erro na API Drive ao atualizar desc {drive_file_id}: {e}")
                         raise e
+                elif canon_id and not os.path.exists(canon_id):
+                    raise RuntimeError(
+                        f"Arquivo local não encontrado em '{canon_id}' e não pôde ser confirmado no Google Drive."
+                    )
 
         elif item.action_type == 'rename':
             new_name = item.new_value
@@ -1495,7 +1560,18 @@ class StagingQueueDialog(QDialog):
                 combined = list(self.queue.items)
                 known = {item.operation_id for item in combined}
                 count = 0
+                # Verificar quais operation_ids já constam na tabela execution para gerar novo ID limpo ao importar
+                exec_ids = set()
+                try:
+                    with self.queue.store.connect() as conn_check_c:
+                        exec_ids = {r[0] for r in conn_check_c.execute('SELECT id FROM execution')}
+                except Exception:
+                    exec_ids = set()
+
                 for item in imported:
+                    if item.operation_id in exec_ids:
+                        import uuid
+                        item.operation_id = uuid.uuid4().hex
                     if item.operation_id in known:
                         continue
                     if item.action_type == 'delete':
