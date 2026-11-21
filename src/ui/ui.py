@@ -12,13 +12,13 @@ from src.services.local_scan import LocalScan
 from src.drive.processing import start_drive_folder_processing
 
 from PyQt6.QtWidgets import (
-    QMainWindow, QWidget, QLabel, QMessageBox, QDialog, QDialogButtonBox, QProgressBar, QSplitter, QVBoxLayout, QProgressDialog, QListView, QSystemTrayIcon, QMenu,
+    QMainWindow, QWidget, QLabel, QMessageBox, QDialog, QDialogButtonBox, QProgressBar, QPushButton, QSplitter, QVBoxLayout, QProgressDialog, QListView, QSystemTrayIcon, QMenu,
     QAbstractItemView, QApplication
 )
 
 from PyQt6.QtGui import QIcon, QAction
 from src.ui.details_panel import FileDetailsPanel
-from PyQt6.QtCore import Qt, QTimer, QStringListModel, QDate, QThread, pyqtSignal, QThreadPool, QRunnable, QMetaObject, QSize, QItemSelectionModel
+from PyQt6.QtCore import Qt, QTimer, QStringListModel, QDate, QThread, pyqtSignal, QThreadPool, QRunnable, QMetaObject, QSize, QItemSelectionModel, QPoint
 from src.ui.list_view import FileListView
 from src.database.database import FileIndexer
 from src.database.search import SearchEngine
@@ -95,6 +95,7 @@ class DriveFileGalleryApp(QMainWindow):
         self.drive_check_thread.started.connect(self.drive_check_worker.run)
 
         def on_check_done(has_updates, info_text):
+            self._set_bottom_drive_status_badge(has_updates, info_text)
             if hasattr(self, 'main_bar') and self.main_bar:
                 self.main_bar.set_drive_updates_available(has_updates, info_text)
             if self.drive_check_thread:
@@ -108,6 +109,16 @@ class DriveFileGalleryApp(QMainWindow):
 
         self.drive_check_worker.check_finished.connect(on_check_done)
         self.drive_check_thread.start()
+
+    def _open_hash_deduplicator(self, initial_folders=None):
+        from src.ui.hash_dedup_dialog import HashDedupDialog
+        dlg = HashDedupDialog(
+            self,
+            indexer=self.indexer,
+            drive_service=self.service,
+            initial_folders=initial_folders,
+        )
+        dlg.exec()
 
     def _start_path_reconciliation(self):
         if self.maintenance_running or self.queue_execution_running or self.drive_sync_running:
@@ -478,6 +489,8 @@ class DriveFileGalleryApp(QMainWindow):
             self._reindex_local_files)
         self.main_bar.action_reconcile_paths.triggered.connect(
             self._start_path_reconciliation)
+        self.main_bar.action_deduplicate_hash.triggered.connect(
+            self._open_hash_deduplicator)
         self.main_bar.action_clear_cache.triggered.connect(
             self.clear_thumbnail_cache)
         self.main_bar.action_advanced_settings.triggered.connect(
@@ -528,12 +541,18 @@ class DriveFileGalleryApp(QMainWindow):
         self.folder_tree = FolderTreeWidget(parent=self)
         self.folder_tree.folderSelected.connect(self.on_folder_tree_selected)
         self.folder_tree.filesDroppedOnFolder.connect(self.on_files_dropped_on_folder)
+        self.folder_tree.compareFolderHashRequested.connect(
+            lambda folder_path: self._open_hash_deduplicator(initial_folders=[folder_path])
+        )
 
+        self._prev_move_items, self._prev_delete_items = self._staging_action_snapshots()
+        self._suppress_staging_reload = False
         self.main_bar.staging_queue.queueChanged.connect(self._on_staging_queue_changed)
 
         self.details_panel = FileDetailsPanel(self)
         
         self.file_list_view.deleteRequested.connect(self.details_panel._delete_file_action)
+        self.file_list_view.selectFolderRequested.connect(self.select_folder_for_file)
 
         self.splitter.addWidget(self.folder_tree)
         self.splitter.addWidget(self.file_list_view)
@@ -552,6 +571,10 @@ class DriveFileGalleryApp(QMainWindow):
         main_layout.addWidget(self.loading_label)
 
         self.status_bar = self.statusBar()
+        self.drive_status_badge = QLabel("", self)
+        self.drive_status_badge.setVisible(False)
+        self.status_bar.addPermanentWidget(self.drive_status_badge)
+
         self.progress_bar = QProgressBar(self)
         self.progress_bar.setMinimumWidth(280)
         self.progress_bar.setMaximumWidth(420)
@@ -559,6 +582,16 @@ class DriveFileGalleryApp(QMainWindow):
         self.progress_bar.setVisible(False)
         # Widget permanente: mensagens temporarias da QStatusBar nao o ocultam.
         self.status_bar.addPermanentWidget(self.progress_bar)
+
+        self.sync_cancel_btn = QPushButton("⏹️ Parar", self)
+        self.sync_cancel_btn.setToolTip("Interromper a sincronização atual mantendo o log da última sincronia completa.")
+        self.sync_cancel_btn.setStyleSheet(
+            "background-color: #DC3545; color: white; font-weight: bold; padding: 2px 8px; border-radius: 4px;"
+        )
+        self.sync_cancel_btn.setVisible(False)
+        self.sync_cancel_btn.clicked.connect(self._cancel_incremental_sync)
+        self.status_bar.addPermanentWidget(self.sync_cancel_btn)
+        self._set_bottom_drive_status_badge(False)
 
         self.all_loaded_label = QLabel("Todos os arquivos foram carregados.")
         self.all_loaded_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -836,7 +869,7 @@ class DriveFileGalleryApp(QMainWindow):
         ext = os.path.splitext(filename)[1].lower()
 
         image_extencions = {'.jpg', '.jpeg', '.png',
-                            '.gif', '.bmp', '.webp', '.svg', '.ico', '.tiff'}
+                            '.gif', '.bmp', '.webp', '.svg', '.ico', '.tif', '.tiff'}
         video_extensions = {'.mp4', '.avi', '.mov', '.wmv',
                             '.flv', '.mkv', '.webm', '.m4v', '.3gp',
                             '.mts', '.m2ts', '.ts', '.mpg', '.mpeg', '.vob'}
@@ -1014,26 +1047,36 @@ class DriveFileGalleryApp(QMainWindow):
         self.update_drive_sync_progress(
             -1, "🔄 Verificando atualizações no Google Drive..."
         )
-        
+        if hasattr(self, 'sync_cancel_btn') and self.sync_cancel_btn:
+            self.sync_cancel_btn.setEnabled(True)
+            self.sync_cancel_btn.setVisible(True)
+
         from src.drive.incremental_sync import IncrementalSyncWorker
         from src.utils.config_manager import ConfigManager
-        
-        # Se for acionado manualmente pelo usuário, olhar os últimos 7 dias para garantir tudo
-        window_days = 30 if force_manual else None
-        
+
+        # Tanto a sincronia manual quanto a automática usam o último log local (com margem de tolerância).
         self.inc_sync_thread = QThread()
-        self.inc_sync_worker = IncrementalSyncWorker(self.service, ConfigManager(), self.search_engine.indexer, force_window_days=window_days)
+        self.inc_sync_worker = IncrementalSyncWorker(
+            self.service, ConfigManager(), self.search_engine.indexer, force_window_days=None
+        )
         self.inc_sync_worker.moveToThread(self.inc_sync_thread)
-        
+
         self.inc_sync_thread.started.connect(self.inc_sync_worker.run)
-        
-        def on_inc_finished(count):
+
+        def cleanup_inc_thread():
             if self.inc_sync_thread:
                 self.inc_sync_thread.quit()
                 self.inc_sync_thread.wait(2000)
                 self.inc_sync_thread.deleteLater()
                 self.inc_sync_thread = None
             self.progress_bar.setVisible(False)
+            if hasattr(self, 'sync_cancel_btn') and self.sync_cancel_btn:
+                self.sync_cancel_btn.setVisible(False)
+                self.sync_cancel_btn.setEnabled(True)
+
+        def on_inc_finished(count):
+            cleanup_inc_thread()
+            self._set_bottom_drive_status_badge(False)
             if hasattr(self, 'main_bar') and self.main_bar:
                 self.main_bar.set_drive_updates_available(False)
             # Se for sync automático de segundo plano e não houve arquivos alterados, não perturba a tela
@@ -1047,19 +1090,25 @@ class DriveFileGalleryApp(QMainWindow):
             else:
                 self.status_bar.showMessage("🔄 Sincronização: Tudo atualizado (Drive e pastas locais).", 4000)
             self._run_deferred_incremental_sync()
-        
+
+        def on_inc_cancelled(processed_count):
+            cleanup_inc_thread()
+            if processed_count > 0:
+                self._force_refresh_after_sync()
+            self.status_bar.showMessage(
+                f"⏹️ Sincronização interrompida ({processed_count:,} processado(s)); próximo sync continuará do último log salvo.",
+                6000,
+            )
+            self._run_deferred_incremental_sync()
+
         def on_inc_failed(err):
-            if self.inc_sync_thread:
-                self.inc_sync_thread.quit()
-                self.inc_sync_thread.wait(2000)
-                self.inc_sync_thread.deleteLater()
-                self.inc_sync_thread = None
-            self.progress_bar.setVisible(False)
+            cleanup_inc_thread()
             logging.error(f"Sincronização incremental falhou: {err}")
             self.status_bar.showMessage(f"⚠️ Erro no sync em segundo plano: {err}", 4000)
             self._run_deferred_incremental_sync()
-            
+
         self.inc_sync_worker.sync_finished.connect(on_inc_finished)
+        self.inc_sync_worker.sync_cancelled.connect(on_inc_cancelled)
         self.inc_sync_worker.sync_failed.connect(on_inc_failed)
         self.inc_sync_worker.sync_warning.connect(
             lambda message: self.status_bar.showMessage(
@@ -1290,6 +1339,7 @@ class DriveFileGalleryApp(QMainWindow):
         self.is_authenticated = is_authenticated
         self.main_bar.login_button.setVisible(not is_authenticated)
         self.main_bar.logout_button.setVisible(is_authenticated)
+        self._set_bottom_drive_status_badge(False)
 
     def on_scroll(self, value):
         scroll_bar = self.file_list_view.verticalScrollBar()
@@ -1587,6 +1637,7 @@ class DriveFileGalleryApp(QMainWindow):
 
             self.main_bar.reset_profile()
             self.main_bar.set_drive_updates_available(False)
+            self._set_bottom_drive_status_badge(False)
             if hasattr(self, 'drive_badge_timer'):
                 self.drive_badge_timer.stop()
 
@@ -1674,6 +1725,7 @@ class DriveFileGalleryApp(QMainWindow):
         print("✅ Drive sync finalizado - flag liberada")
         if hasattr(self, 'main_bar') and self.main_bar:
             self.main_bar.set_drive_updates_available(False)
+        self._set_bottom_drive_status_badge(False)
 
         if self.drive_sync_running:
             print("⚠️ AVISO: Flag ainda está True após liberação!")
@@ -1718,70 +1770,77 @@ class DriveFileGalleryApp(QMainWindow):
             100, lambda: self._force_refresh_after_sync(prev_selected_id))
         self._run_deferred_incremental_sync()
 
+    def _reload_keeping_scroll(self, prev_selected_id=None, restore_delay_ms=150):
+        # 1. Capturar âncora de scroll e seleção antes de limpar
+        anchor_id = prev_selected_id
+        selected_indexes = self.file_list_view.selectedIndexes()
+        if not anchor_id and selected_indexes:
+            curr_item = self.file_list_model.data(selected_indexes[0], Qt.ItemDataRole.UserRole)
+            if curr_item:
+                anchor_id = curr_item.get('id') or curr_item.get('path')
+
+        if not anchor_id:
+            top_idx = self.file_list_view.indexAt(QPoint(24, 24))
+            if top_idx.isValid():
+                top_item = self.file_list_model.data(top_idx, Qt.ItemDataRole.UserRole)
+                if top_item:
+                    anchor_id = top_item.get('id') or top_item.get('path')
+
+        scroll_bar = self.file_list_view.verticalScrollBar()
+        saved_scroll_value = scroll_bar.value()
+
+        # Determinar quantos lotes já estavam carregados na tela
+        loaded_count = self.file_list_model.rowCount()
+        batches_to_load = max(1, (loaded_count + self.page_size - 1) // self.page_size) if loaded_count > 0 else 1
+
+        self.current_page = 0
+        self.all_files_loaded = False
+        list_update.clear_display(self)
+
+        # Recarregar proporcionalmente para manter a posição de trabalho
+        for _ in range(batches_to_load):
+            if self.all_files_loaded:
+                break
+            list_update.load_next_batch(self)
+
+        if saved_scroll_value > 0:
+            max_scroll = scroll_bar.maximum()
+            scroll_bar.setValue(min(saved_scroll_value, max_scroll))
+
+        # 2. Restaurar posição de rolagem e seleção
+        had_selection = bool(selected_indexes or prev_selected_id)
+
+        def _restore_position():
+            restored = False
+            if anchor_id:
+                target_idx = self._find_model_index_by_id(anchor_id)
+                if target_idx and target_idx.isValid():
+                    if had_selection:
+                        sel_model = self.file_list_view.selectionModel()
+                        if sel_model:
+                            sel_model.select(
+                                target_idx,
+                                QItemSelectionModel.SelectionFlag.ClearAndSelect | QItemSelectionModel.SelectionFlag.Rows
+                            )
+                        self.file_list_view.setCurrentIndex(target_idx)
+                        self._refresh_details_by_id(anchor_id)
+                    self.file_list_view.scrollTo(target_idx, QAbstractItemView.ScrollHint.PositionAtCenter)
+                    restored = True
+
+            if not restored and saved_scroll_value > 0:
+                max_scroll = self.file_list_view.verticalScrollBar().maximum()
+                self.file_list_view.verticalScrollBar().setValue(min(saved_scroll_value, max_scroll))
+
+        QTimer.singleShot(restore_delay_ms, _restore_position)
+
     def _force_refresh_after_sync(self, prev_selected_id=None):
         try:
-            from PyQt6.QtCore import QPoint
-            from PyQt6.QtCore import QItemSelectionModel
             if hasattr(self, 'search_engine'):
                 self.search_engine.clear_cache()
             if hasattr(self, 'indexer'):
                 self.indexer.clear_query_cache()
 
-            # 1. Capturar âncora de scroll e seleção antes de limpar
-            anchor_id = prev_selected_id
-            selected_indexes = self.file_list_view.selectedIndexes()
-            if not anchor_id and selected_indexes:
-                curr_item = self.file_list_model.data(selected_indexes[0], Qt.ItemDataRole.UserRole)
-                if curr_item:
-                    anchor_id = curr_item.get('id') or curr_item.get('path')
-
-            if not anchor_id:
-                top_idx = self.file_list_view.indexAt(QPoint(24, 24))
-                if top_idx.isValid():
-                    top_item = self.file_list_model.data(top_idx, Qt.ItemDataRole.UserRole)
-                    if top_item:
-                        anchor_id = top_item.get('id') or top_item.get('path')
-
-            scroll_bar = self.file_list_view.verticalScrollBar()
-            saved_scroll_value = scroll_bar.value()
-
-            # Determinar quantos lotes já estavam carregados na tela
-            loaded_count = self.file_list_model.rowCount()
-            batches_to_load = max(1, (loaded_count + self.page_size - 1) // self.page_size) if loaded_count > 0 else 1
-
-            self.current_page = 0
-            self.all_files_loaded = False
-            list_update.clear_display(self)
-
-            # Recarregar proporcionalmente para manter a posição de trabalho
-            for _ in range(batches_to_load):
-                if self.all_files_loaded:
-                    break
-                list_update.load_next_batch(self)
-
-            # 2. Restaurar posição de rolagem e seleção
-            def _restore_position():
-                restored = False
-                if anchor_id:
-                    target_idx = self._find_model_index_by_id(anchor_id)
-                    if target_idx and target_idx.isValid():
-                        if selected_indexes or prev_selected_id:
-                            sel_model = self.file_list_view.selectionModel()
-                            if sel_model:
-                                sel_model.select(
-                                    target_idx,
-                                    QItemSelectionModel.SelectionFlag.ClearAndSelect | QItemSelectionModel.SelectionFlag.Rows
-                                )
-                            self.file_list_view.setCurrentIndex(target_idx)
-                            self._refresh_details_by_id(anchor_id)
-                        self.file_list_view.scrollTo(target_idx, QAbstractItemView.ScrollHint.PositionAtCenter)
-                        restored = True
-
-                if not restored and saved_scroll_value > 0:
-                    max_scroll = self.file_list_view.verticalScrollBar().maximum()
-                    self.file_list_view.verticalScrollBar().setValue(min(saved_scroll_value, max_scroll))
-
-            QTimer.singleShot(150, _restore_position)
+            self._reload_keeping_scroll(prev_selected_id=prev_selected_id, restore_delay_ms=150)
 
             # 3. Atualizar também a árvore de diretórios e varredura de pastas no disco
             if hasattr(self, 'folder_tree') and self.folder_tree:
@@ -1950,6 +2009,45 @@ class DriveFileGalleryApp(QMainWindow):
         if auth_error:
             self.update_ui_for_auth_state(False)
         self._run_deferred_incremental_sync()
+
+    def _cancel_incremental_sync(self):
+        if hasattr(self, 'inc_sync_worker') and self.inc_sync_worker:
+            self.inc_sync_worker.cancel()
+        if hasattr(self, 'sync_cancel_btn') and self.sync_cancel_btn:
+            self.sync_cancel_btn.setEnabled(False)
+        if hasattr(self, 'status_bar') and self.status_bar:
+            self.status_bar.showMessage("⏹️ Interrompendo sincronização...", 3000)
+
+    def _set_bottom_drive_status_badge(self, has_updates: bool, detail_text: str = ""):
+        if not hasattr(self, 'drive_status_badge') or not self.drive_status_badge:
+            return
+        if not self.is_authenticated:
+            self.drive_status_badge.setVisible(False)
+            return
+        from datetime import datetime
+        last_ts = self.config_mgr.get('last_sync_timestamp')
+        ts_info = (
+            datetime.fromtimestamp(int(last_ts)).strftime('%d/%m %H:%M:%S')
+            if last_ts else 'nunca'
+        )
+        if has_updates:
+            self.drive_status_badge.setText("🟡 Atualizações no Drive")
+            self.drive_status_badge.setStyleSheet(
+                "background-color: #FFF8E1; color: #B7791F; border: 1px solid #F6E05E; "
+                "border-radius: 10px; padding: 2px 8px; font-weight: bold; font-size: 11px;"
+            )
+            self.drive_status_badge.setToolTip(
+                (detail_text + "\n" if detail_text else "")
+                + f"Última sincronia completa: {ts_info}"
+            )
+        else:
+            self.drive_status_badge.setText("🟢 Drive atualizado")
+            self.drive_status_badge.setStyleSheet(
+                "background-color: #E8F5E9; color: #2E7D32; border: 1px solid #A5D6A7; "
+                "border-radius: 10px; padding: 2px 8px; font-weight: bold; font-size: 11px;"
+            )
+            self.drive_status_badge.setToolTip(f"Última sincronia completa: {ts_info}")
+        self.drive_status_badge.setVisible(True)
 
     def update_drive_sync_progress(self, value, msg):
         self.progress_bar.setVisible(True)
@@ -2128,8 +2226,21 @@ class DriveFileGalleryApp(QMainWindow):
             self.file_list_model.addFiles(files_to_add)
 
     def on_folder_tree_selected(self, folder_path):
-        target_filter = folder_path if (folder_path and folder_path != self.folder_tree.root_dir) else None
-        if getattr(self, 'current_folder_path_filter', None) == target_filter and self.file_list_model.rowCount() > 0 and not self.is_loading:
+        root_dir = getattr(getattr(self, 'folder_tree', None), 'root_dir', None)
+        is_root = bool(
+            folder_path and root_dir
+            and os.path.normcase(os.path.normpath(folder_path)) == os.path.normcase(os.path.normpath(root_dir))
+        )
+        target_filter = os.path.normpath(folder_path) if (folder_path and not is_root) else None
+        curr_filter = getattr(self, 'current_folder_path_filter', None)
+        same_filter = (
+            (curr_filter is None and target_filter is None)
+            or (
+                curr_filter is not None and target_filter is not None
+                and os.path.normcase(os.path.normpath(curr_filter)) == os.path.normcase(os.path.normpath(target_filter))
+            )
+        )
+        if same_filter and self.file_list_model.rowCount() > 0 and not self.is_loading:
             return
 
         self.current_folder_path_filter = target_filter
@@ -2144,6 +2255,76 @@ class DriveFileGalleryApp(QMainWindow):
                 self.status_bar.showMessage(f"📁 Modo Pasta: {os.path.basename(target_filter)} (Busca recursiva em subpastas ativada)", 3500)
             else:
                 self.status_bar.showMessage("🌐 Modo Global: Busca em Todo o Acervo ativada.", 3500)
+
+    def select_folder_for_file(self, file_item):
+        """Seleciona na árvore e filtra a busca pela pasta que contém o arquivo clicado."""
+        if not file_item:
+            return
+
+        fid = file_item.get('file_id') or file_item.get('id')
+        fname = file_item.get('name') or ''
+        fpath = file_item.get('path') or ''
+        is_dir = file_item.get('mimeType') in ('application/vnd.google-apps.folder', 'folder', 'directory')
+        virtual_path = bool(file_item.get('is_staged_move'))
+
+        if not file_item.get('is_staged_move') and hasattr(self, 'main_bar') and hasattr(self.main_bar, 'staging_queue'):
+            norm_f = os.path.normcase(os.path.normpath(fpath)) if fpath else ''
+            for it in self.main_bar.staging_queue.items:
+                if it.action_type == 'move' and it.new_value:
+                    it_p = os.path.normcase(os.path.normpath(it.path)) if it.path else ''
+                    if (fid and it.file_id == fid) or (norm_f and it_p == norm_f):
+                        fpath = it.new_value
+                        virtual_path = True
+                        break
+
+        if not virtual_path and fpath and not os.path.exists(fpath) and (file_item.get('source') or 'local') == 'local':
+            try:
+                from src.services.path_reconciler import resolve_and_heal_local_path
+                healed = resolve_and_heal_local_path(file_item)
+                if healed:
+                    fpath = healed
+            except Exception:
+                pass
+
+        if not virtual_path and (not fpath or not os.path.exists(fpath)) and hasattr(self, 'indexer') and self.indexer:
+            try:
+                self.indexer.ensure_conn()
+                rows = []
+                if fid:
+                    rows = self.indexer.cursor.execute(
+                        "SELECT path FROM files WHERE source='local' AND file_id=? AND path IS NOT NULL LIMIT 2",
+                        (fid,),
+                    ).fetchall()
+                if not rows and fname:
+                    rows = self.indexer.cursor.execute(
+                        "SELECT path FROM files WHERE source='local' AND name=? AND path IS NOT NULL LIMIT 2",
+                        (fname,),
+                    ).fetchall()
+                if len(rows) == 1 and rows[0][0]:
+                    fpath = rows[0][0]
+            except Exception:
+                pass
+
+        if not fpath:
+            if hasattr(self, 'status_bar') and self.status_bar:
+                self.status_bar.showMessage("Pasta local não encontrada para este arquivo.", 4000)
+            return
+
+        norm_fpath = os.path.normpath(fpath)
+        folder_path = norm_fpath if (is_dir or os.path.isdir(norm_fpath)) else os.path.normpath(os.path.dirname(norm_fpath))
+        if not folder_path or not os.path.isdir(folder_path):
+            if hasattr(self, 'status_bar') and self.status_bar:
+                self.status_bar.showMessage(f"Pasta local não encontrada: {folder_path}", 4000)
+            return
+
+        selected_in_tree = False
+        if hasattr(self, 'folder_tree') and self.folder_tree:
+            selected_in_tree = bool(self.folder_tree.select_and_expand_folder(folder_path))
+            if not selected_in_tree:
+                self.folder_tree._update_header_for_folder(folder_path)
+                self.on_folder_tree_selected(folder_path)
+        else:
+            self.on_folder_tree_selected(folder_path)
 
     def on_files_dropped_on_folder(self, dropped_items, target_folder_path):
         if not self.main_bar.staging_queue.can_edit():
@@ -2253,68 +2434,74 @@ class DriveFileGalleryApp(QMainWindow):
                     self.status_bar.showMessage("Movimentação cancelada pelo usuário.", 3000)
                 return
 
-        # Processar itens não-conflitantes
-        for it in valid_items_to_process:
-            fid = it['fid']
-            src_path = it['src_path']
-            fname = it['fname']
-            db_orig_path = it['db_orig_path']
-            dst_path = it['dst_path']
+        self._suppress_staging_reload = True
+        try:
+            # Processar itens não-conflitantes
+            for it in valid_items_to_process:
+                fid = it['fid']
+                src_path = it['src_path']
+                fname = it['fname']
+                db_orig_path = it['db_orig_path']
+                dst_path = it['dst_path']
 
-            for q_it in list(queue.items):
-                if (q_it.file_id == fid or (q_it.path and os.path.normpath(q_it.path).lower() == src_path.lower())) and q_it.action_type == 'move':
-                    queue.remove_item(q_it)
+                for q_it in list(queue.items):
+                    if (q_it.file_id == fid or (q_it.path and os.path.normpath(q_it.path).lower() == src_path.lower())) and q_it.action_type == 'move':
+                        queue.remove_item(q_it)
 
-            if it['is_revert']:
-                reverted_count += 1
-            else:
-                st_item = StagingItem(fid, fname, db_orig_path, 'move', old_value=db_orig_path, new_value=dst_path)
-                queue.add_item(st_item)
-                staged_count += 1
-
-        # Processar itens conflitantes de acordo com a escolha do usuário
-        if conflicts:
-            if conflict_action == "create_subfolder":
-                sub_dir = os.path.normpath(os.path.join(target_folder_path, conflict_subfolder))
-                for it in conflicts:
-                    fid = it['fid']
-                    src_path = it['src_path']
-                    fname = it['fname']
-                    db_orig_path = it['db_orig_path']
-                    sub_dst_path = os.path.normpath(os.path.join(sub_dir, fname))
-
-                    for q_it in list(queue.items):
-                        if (q_it.file_id == fid or (q_it.path and os.path.normpath(q_it.path).lower() == src_path.lower())) and q_it.action_type == 'move':
-                            queue.remove_item(q_it)
-
-                    st_item = StagingItem(fid, fname, db_orig_path, 'move', old_value=db_orig_path, new_value=sub_dst_path)
+                if it['is_revert']:
+                    reverted_count += 1
+                else:
+                    st_item = StagingItem(fid, fname, db_orig_path, 'move', old_value=db_orig_path, new_value=dst_path)
                     queue.add_item(st_item)
                     staged_count += 1
 
-            elif conflict_action == "rename":
-                for it in conflicts:
-                    fid = it['fid']
-                    src_path = it['src_path']
-                    fname = it['fname']
-                    db_orig_path = it['db_orig_path']
-                    dst_path = it['dst_path']
+            # Processar itens conflitantes de acordo com a escolha do usuário
+            if conflicts:
+                if conflict_action == "create_subfolder":
+                    sub_dir = os.path.normpath(os.path.join(target_folder_path, conflict_subfolder))
+                    for it in conflicts:
+                        fid = it['fid']
+                        src_path = it['src_path']
+                        fname = it['fname']
+                        db_orig_path = it['db_orig_path']
+                        sub_dst_path = os.path.normpath(os.path.join(sub_dir, fname))
 
-                    base, ext = os.path.splitext(dst_path)
-                    counter = 1
-                    while True:
-                        candidate = f"{base}_{counter}{ext}"
-                        if not os.path.exists(candidate) and not any(q_it.new_value and os.path.normpath(q_it.new_value).lower() == os.path.normpath(candidate).lower() for q_it in queue.items):
-                            dst_path = candidate
-                            break
-                        counter += 1
+                        for q_it in list(queue.items):
+                            if (q_it.file_id == fid or (q_it.path and os.path.normpath(q_it.path).lower() == src_path.lower())) and q_it.action_type == 'move':
+                                queue.remove_item(q_it)
 
-                    for q_it in list(queue.items):
-                        if (q_it.file_id == fid or (q_it.path and os.path.normpath(q_it.path).lower() == src_path.lower())) and q_it.action_type == 'move':
-                            queue.remove_item(q_it)
+                        st_item = StagingItem(fid, fname, db_orig_path, 'move', old_value=db_orig_path, new_value=sub_dst_path)
+                        queue.add_item(st_item)
+                        staged_count += 1
 
-                    st_item = StagingItem(fid, os.path.basename(dst_path), db_orig_path, 'move', old_value=db_orig_path, new_value=dst_path)
-                    queue.add_item(st_item)
-                    staged_count += 1
+                elif conflict_action == "rename":
+                    for it in conflicts:
+                        fid = it['fid']
+                        src_path = it['src_path']
+                        fname = it['fname']
+                        db_orig_path = it['db_orig_path']
+                        dst_path = it['dst_path']
+
+                        base, ext = os.path.splitext(dst_path)
+                        counter = 1
+                        while True:
+                            candidate = f"{base}_{counter}{ext}"
+                            if not os.path.exists(candidate) and not any(q_it.new_value and os.path.normpath(q_it.new_value).lower() == os.path.normpath(candidate).lower() for q_it in queue.items):
+                                dst_path = candidate
+                                break
+                            counter += 1
+
+                        for q_it in list(queue.items):
+                            if (q_it.file_id == fid or (q_it.path and os.path.normpath(q_it.path).lower() == src_path.lower())) and q_it.action_type == 'move':
+                                queue.remove_item(q_it)
+
+                        st_item = StagingItem(fid, os.path.basename(dst_path), db_orig_path, 'move', old_value=db_orig_path, new_value=dst_path)
+                        queue.add_item(st_item)
+                        staged_count += 1
+        finally:
+            self._suppress_staging_reload = False
+
+        self._prev_move_items, self._prev_delete_items = self._staging_action_snapshots()
 
         folder_name = os.path.basename(target_folder_path)
         if hasattr(self, 'status_bar') and self.status_bar:
@@ -2323,27 +2510,38 @@ class DriveFileGalleryApp(QMainWindow):
             elif reverted_count > 0:
                 self.status_bar.showMessage(f"↩️ {reverted_count} arquivo(s) retornado(s) à pasta original.", 4000)
 
-        # Atualizar grid para refletir as alterações virtuais
-        self.current_page = 0
-        self.all_files_loaded = False
-        list_update.clear_display(self)
-        list_update.load_next_batch(self)
+        # Atualizar grid mantendo lotes carregados e posição de rolagem
+        self._reload_keeping_scroll(restore_delay_ms=50)
+
+    def _staging_action_snapshots(self):
+        items = getattr(getattr(getattr(self, 'main_bar', None), 'staging_queue', None), 'items', [])
+        moves = [f"{it.file_id}_{it.action_type}_{it.new_value}" for it in items if it.action_type == 'move']
+        deletes = [f"{it.file_id}_{it.path}" for it in items if it.action_type == 'delete']
+        return moves, deletes
 
     def _on_staging_queue_changed(self, count):
         try:
-            # Apenas atualiza a grade se houver alteração em itens de 'move' ou 'delete'
-            # Alterações de tags/descrição NÃO devem recarregar a grade nem fechar o painel de detalhes!
-            current_move_items = [f"{it.file_id}_{it.action_type}_{it.new_value}" for it in self.main_bar.staging_queue.items if it.action_type in ('move', 'delete')]
+            # Exclusões e alterações de tags atualizam apenas o visual/opacidade no lugar,
+            # preservando página, seleção e posição de rolagem do usuário.
+            # Apenas movimentações virtuais ('move') precisam recarregar a lista da pasta.
+            current_move_items, current_delete_items = self._staging_action_snapshots()
             if not hasattr(self, '_prev_move_items'):
                 self._prev_move_items = []
-                
+            if not hasattr(self, '_prev_delete_items'):
+                self._prev_delete_items = []
+
             if current_move_items != self._prev_move_items:
                 self._prev_move_items = list(current_move_items)
-                if getattr(self, 'current_folder_path_filter', None):
-                    self.current_page = 0
-                    self.all_files_loaded = False
-                    list_update.clear_display(self)
-                    list_update.load_next_batch(self)
+                self._prev_delete_items = list(current_delete_items)
+                if (
+                    not getattr(self, '_suppress_staging_reload', False)
+                    and getattr(self, 'current_folder_path_filter', None)
+                ):
+                    self._reload_keeping_scroll(restore_delay_ms=50)
+            elif current_delete_items != self._prev_delete_items:
+                self._prev_delete_items = list(current_delete_items)
+                if hasattr(self, 'file_list_view') and self.file_list_view:
+                    self.file_list_view.viewport().update()
         except Exception as e:
             print(f"[UI] Erro ao tratar mudança na fila de staging: {e}")
 

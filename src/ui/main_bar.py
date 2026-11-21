@@ -135,25 +135,13 @@ class MainBar(QFrame):
         self.unified_layout.addWidget(self.staging_btn)
         self.unified_layout.addSpacing(5)
 
-        self.drive_updates_badge = QPushButton("🟡 Atualizações no Drive")
-        self.drive_updates_badge.setFixedHeight(30)
-        self.drive_updates_badge.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.drive_updates_badge.setStyleSheet(
-            "background-color: #FFF8E1; color: #B7791F; border: 1px solid #F6E05E; border-radius: 14px; padding: 3px 10px; font-weight: bold; font-size: 11px;")
-        self.drive_updates_badge.setToolTip(
-            "Existem alterações recentes no Google Drive ainda não sincronizadas.\nClique aqui ou em '🔄 Sincronizar' para atualizar.")
-        self.drive_updates_badge.clicked.connect(self.sync_now_requested.emit)
-        self.drive_updates_badge.setVisible(False)
-        self.unified_layout.addWidget(self.drive_updates_badge)
-        self.unified_layout.addSpacing(4)
-
         self.sync_now_btn = QPushButton("🔄 Sincronizar")
         self.sync_now_btn.setFixedHeight(34)
         self.sync_now_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.sync_now_btn.setStyleSheet(
             "background-color: #E3F2FD; color: #1565C0; border: 1px solid #BBDEFB; border-radius: 4px; padding: 4px 10px; font-weight: bold; font-size: 12px;")
-        self.sync_now_btn.setToolTip("Forçar sincronização incremental com o Google Drive agora.")
-        self.sync_now_btn.clicked.connect(self.sync_now_requested.emit)
+        self.sync_now_btn.setToolTip("Sincronizar alterações do Google Drive a partir do último registro local.")
+        self.sync_now_btn.clicked.connect(lambda: self.sync_now_requested.emit())
         self.unified_layout.addWidget(self.sync_now_btn)
         self.unified_layout.addSpacing(5)
 
@@ -177,6 +165,9 @@ class MainBar(QFrame):
         self.action_reconcile_paths = QAction("🧭 Reconciliar caminhos de arquivos movidos", self)
         self.action_reconcile_paths.setToolTip(
             "Localiza no disco arquivos que foram movidos de pasta e atualiza seus endereços no banco, preservando todas as tags.")
+        self.action_deduplicate_hash = QAction("🧹 Deduplicar Fotos por Hash", self)
+        self.action_deduplicate_hash.setToolTip(
+            "Localiza fotos duplicadas por hash MD5, funde tags e nomes diferentes e move excedentes para Banco_Apagado.")
         self.action_clear_cache = QAction("🧹 Limpar Cache", self)
         self.action_clear_cache.setToolTip(
             "Remove arquivos temporários e dados em cache para liberar espaço e corrigir possíveis erros.")
@@ -233,6 +224,7 @@ class MainBar(QFrame):
         # Submenu Diagnóstico
         self.menu_diag = QMenu("🩺 Diagnóstico", self.tools_menu)
         self.menu_diag.addAction(self.action_reconcile_paths)
+        self.menu_diag.addAction(self.action_deduplicate_hash)
         self.menu_diag.addAction(self.action_reindex)
         self.tools_menu.addMenu(self.menu_diag)
 
@@ -457,17 +449,17 @@ class MainBar(QFrame):
         win._staging_dialog.activateWindow()
 
     def set_drive_updates_available(self, has_updates: bool, detail_text: str = ""):
-        self.drive_updates_badge.setVisible(bool(has_updates))
         if has_updates:
             tip = detail_text or (
-                "Existem alterações recentes no Google Drive ainda não sincronizadas.\n"
-                "Clique aqui ou em '🔄 Sincronizar' para atualizar."
+                "Existem alterações no Google Drive aguardando sincronização.\n"
+                "Clique aqui para atualizar a partir do último log."
             )
-            self.drive_updates_badge.setToolTip(tip)
+            self.sync_now_btn.setToolTip(tip)
             self.sync_now_btn.setStyleSheet(
                 "background-color: #FFF8E1; color: #B7791F; border: 1.5px solid #F6AD55; border-radius: 4px; padding: 4px 10px; font-weight: bold; font-size: 12px;"
             )
         else:
+            self.sync_now_btn.setToolTip("Sincronizar alterações do Google Drive a partir do último registro local.")
             self.sync_now_btn.setStyleSheet(
                 "background-color: #E3F2FD; color: #1565C0; border: 1px solid #BBDEFB; border-radius: 4px; padding: 4px 10px; font-weight: bold; font-size: 12px;"
             )

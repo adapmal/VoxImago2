@@ -19,6 +19,8 @@ import mimetypes
 mimetypes.add_type('video/mp2t', '.mts')
 mimetypes.add_type('video/mp2t', '.m2ts')
 mimetypes.add_type('video/mp2t', '.ts')
+mimetypes.add_type('image/tiff', '.tif')
+mimetypes.add_type('image/tiff', '.tiff')
 import logging
 import requests
 import threading
@@ -33,6 +35,36 @@ THUMBNAIL_CACHE_DIR = 'assets/thumbnail_cache'
 _media_lock = threading.Lock()
 _thumbnail_failure_lock = threading.Lock()
 _thumbnail_failure_counts = {}
+
+
+def _numeric_thumbnail(image, base_size):
+    """Converte grayscale numérico respeitando profundidade/faixa, só no preview."""
+    import numpy as np
+    from PIL import Image
+    mode = image.mode
+    gray = image.convert('F')
+    gray.thumbnail((base_size, base_size), Image.Resampling.LANCZOS)
+    values = np.asarray(gray, dtype=np.float32)
+    finite = values[np.isfinite(values)]
+    if not finite.size:
+        return Image.new('RGB', gray.size)
+    lo, hi = float(finite.min()), float(finite.max())
+    if mode.startswith('I;16'):
+        low, high = 0.0, 65535.0
+    elif mode == 'F' and 0 <= lo and hi <= 1:
+        low, high = 0.0, 1.0
+    elif 0 <= lo and hi <= 255:
+        low, high = 0.0, 255.0
+    elif mode == 'I' and 0 <= lo and hi <= 65535:
+        low, high = 0.0, 65535.0
+    else:
+        low, high = lo, hi
+    if high == low:
+        scaled = np.full(values.shape, 255.0 if high > 0 else 0.0)
+    else:
+        scaled = (values - low) * (255.0 / (high - low))
+    scaled = np.where(np.isfinite(values), scaled, 0)
+    return Image.fromarray(np.clip(np.rint(scaled), 0, 255).astype(np.uint8)).convert('RGB')
 
 
 def _rotation_degrees(file_item):
@@ -182,7 +214,7 @@ class FileListDelegate(QStyledItemDelegate):
             extension = os.path.splitext(local_path)[1].lower() if local_path else ''
             supported_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v',
                                     '.3gp', '.mts', '.m2ts', '.ts', '.mpg', '.mpeg', '.vob',
-                                    '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp',
+                                    '.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tif', '.tiff', '.webp',
                                     '.raw', '.cr2', '.nef', '.arw', '.dng', '.orf', '.rw2', '.pef', '.srw', '.raf',
                                     '.pdf', '.heic', '.heif'}
 
@@ -301,7 +333,7 @@ class ThumbnailManager:
                             '.mkv', '.wmv', '.flv', '.webm', '.m4v',
                             '.3gp', '.mts', '.m2ts', '.ts', '.mpg', '.mpeg', '.vob'}
         image_extensions = {'.jpg', '.jpeg', '.png',
-                            '.gif', '.bmp', '.tiff', '.webp', '.heic', '.heif'}
+                            '.gif', '.bmp', '.tif', '.tiff', '.webp', '.heic', '.heif'}
         raw_extensions = {'.raw', '.cr2', '.nef', '.arw',
                           '.dng', '.orf', '.rw2', '.pef', '.srw', '.raf'}
         pdf_extensions = {'.pdf'}
@@ -354,7 +386,7 @@ class ThumbnailManager:
                 return None
             _, ext = os.path.splitext(local_path)
             ext = ext.lower()
-            image_exts = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tiff', '.webp',
+            image_exts = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.tif', '.tiff', '.webp',
                           '.heic', '.arw', '.cr2', '.nef', '.dng', '.raf', '.orf', '.srw'}
             if ext == '.lnk' or ext in image_exts:
                 logging.debug(
@@ -514,8 +546,13 @@ class ThumbnailManager:
                 from PIL import Image, ImageOps
                 with _media_lock:
                     with Image.open(local_path) as pil_source:
-                        pil_img = ImageOps.exif_transpose(pil_source)
-                        if pil_img.mode not in ('RGB', 'RGBA'):
+                        try:
+                            pil_img = ImageOps.exif_transpose(pil_source)
+                        except Exception:
+                            pil_img = pil_source
+                        if pil_img.mode.startswith('I;16') or pil_img.mode in ('I', 'F'):
+                            pil_img = _numeric_thumbnail(pil_img, base_size)
+                        elif pil_img.mode not in ('RGB', 'RGBA'):
                             pil_img = pil_img.convert('RGBA' if 'A' in pil_img.getbands() else 'RGB')
                         pil_img.thumbnail((base_size, base_size), Image.LANCZOS)
                         cache_path = ThumbnailCache.get_thumbnail_cache_path(
@@ -689,6 +726,7 @@ class ThumbnailManager:
         raw_mimes = [
             'image/x-raw', 'image/arw', 'image/cr2', 'image/nef', 'image/dng', 'image/raf', 'image/orf', 'image/srw'
         ]
+        mime_type = mime_type or ''
         if mime_type in raw_mimes:
             icon_file = 'raw.png'
         elif mime_type.startswith('image/'):
@@ -719,8 +757,11 @@ class ThumbnailCache:
             path = file_item.get('physical_path') or file_item.get('orig_path') or file_item.get('path') or ''
             mtime = str(file_item.get('modifiedTime', ''))
             size = str(file_item.get('size', ''))
+            # Renovação seletiva: TIFFs antigos podem estar pretos por escala incorreta.
+            # Preserva a preferência de rotação e todas as outras chaves de cache.
+            renderer = '|tiff-tones-v2' if os.path.splitext(path)[1].lower() in ('.tif', '.tiff') else ''
             key = hashlib.sha1(
-                f"{path}|{mtime}|{size}|rotation={rotation}".encode()
+                f"{path}|{mtime}|{size}|rotation={rotation}{renderer}".encode()
             ).hexdigest()
         else:
             file_id = file_item.get('id', '')

@@ -71,7 +71,7 @@ class AutoTagger:
 
         # Sugerir orientação da imagem (Horizontal / Vertical)
         local_path = file_item.get('path')
-        if local_path and os.path.exists(local_path) and ext in ['.jpg', '.jpeg', '.png', '.webp', '.heic']:
+        if local_path and os.path.exists(local_path) and ext in ['.jpg', '.jpeg', '.png', '.webp', '.heic', '.tif', '.tiff']:
             try:
                 from PIL import Image
                 with Image.open(local_path) as img:

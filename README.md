@@ -204,6 +204,138 @@ operações recuperadas incertas. O limite é de 100.000 operações e 64 MB, va
 tanto na entrada quanto na persistência. Estes arquivos contêm nomes/caminhos e
 tags e devem permanecer na pasta local da instalação.
 
+### Deduplicação por hash — análise e revisão antes de movimentar
+
+Em **Diagnóstico > Deduplicar Fotos por Hash**, o padrão é **comparar pastas
+selecionadas entre si**. Adicione duas ou mais pastas, sem definir origem ou
+referência; as subpastas também participam. Pastas sobrepostas são percorridas
+uma única vez e cada ID só participa uma vez. Outras pastas `Organizar` ficam
+fora desse modo. Permanecem disponíveis os escopos
+`Organizar × acervo`, `pastas escolhidas × acervo` e `acervo × acervo`.
+O conjunto de comparação nunca amplia sozinho a autorização de movimentação.
+
+A análise consulta os checksums e descrições **do Drive** e confere os caminhos
+do catálogo por uma hierarquia sem ambiguidades. Não abre os originais locais,
+não baixa mídias para calcular hashes e não usa busca global por nome/tamanho
+para decidir qual ID mover. Confere tamanho + MD5 e SHA-256 quando disponível;
+arquivos sem checksum, vínculos divergentes, caminhos ambíguos e arquivos não
+indexados localmente não são movidos. Aguarde o cliente InSync/Drive concluir
+suas alterações antes de analisar. Isso identifica cópias de conteúdo binário,
+não fotos apenas visualmente parecidas. O relatório de ignorados fica em
+`data/dedup/last_scan_skipped.json`.
+
+No modo de pastas selecionadas, a consulta carrega metadados completos apenas
+dessas árvores. Para localizar as pastas com segurança, lista também IDs, nomes
+e tipos dos filhos diretos dos ancestrais; não percorre outras árvores.
+Não há cache persistente: cada análise consulta novamente esse escopo.
+Modos que comparam com todo o acervo ainda consultam todo o Drive Compartilhado.
+
+Os grupos começam **marcados**, mas nada é movido sem confirmação final.
+Desmarque individualmente ou em lote o que não quiser executar.
+A tabela usa somente thumbnails já em cache; mudar o escopo invalida a revisão.
+O painel de inspeção também usa somente miniaturas em cache, sem gerar novas
+abrindo originais automaticamente. EXIF é lido em segundo plano, com apenas uma
+leitura por painel e a seleção mais recente aguardando; resultados antigos são
+descartados. Arquivos marcados pelo Windows como offline/recall não são abertos
+para EXIF. Espaço/duplo clique continuam sendo pedidos explícitos de abertura.
+Durante a execução, o painel de inspeção fica bloqueado e o executor recebe uma
+cópia independente do plano confirmado, incluindo quem fica e as tags manuais.
+O ano preferido é determinado pelo grupo inteiro: ano no nome de qualquer
+cópia (1997 até o ano atual), depois data EXIF disponível nos metadados e,
+por último, menor pasta anual raiz válida. A busca continua sem baixar originais:
+usa a data de imagem fornecida pelo Drive, não uma nova varredura de EXIF local.
+Nos campos já disponíveis no item, tenta a primeira data válida na ordem
+DateTimeOriginal, exif_date_taken, DateTimeDigitized, DateTime e imageMediaMetadata.time.
+Datas mascaradas, calendários/horários inválidos e anos fora de 1900–2100 não
+impedem a tentativa da fonte seguinte.
+Anos conflitantes nos nomes só são resolvidos se o EXIF apontar unicamente para
+um deles; conflitos não resolvidos ficam desmarcados e bloqueados para revisão.
+Depois da preferência anual, os desempates são: fora de Organizar, menor
+profundidade, mais tags, caminho mais curto, criação mais antiga no Drive e
+ordem alfabética do caminho.
+
+Se nenhuma cópia analisada estiver no ano identificado, fica o nome mais longo
+(sem extensão), com os demais critérios como desempate. A revisão mostra o
+destino `Banco de Imagens/ANO/Organizar/nome`. Após confirmar as tags, a execução
+realoca esse preservado no mesmo Drive e confirma o resultado antes de arquivar
+os duplicados. Pastas ausentes são criadas; pastas ambíguas ou nomes ocupados
+bloqueiam o grupo, sem sobrescrita nem renomeação automática do preservado.
+Preservados protegidos pelo escopo não são movidos; o grupo pede revisão.
+O diário permite reconciliar uma realocação confirmada com o índice local,
+preservando rotação e dados do registro, sem repetir o movimento na nuvem.
+
+Cada grupo exibe no máximo 12 cartões de duplicados por página, com botões
+Anteriores/Próximas e navegação por setas entre páginas. Todas as cópias continuam
+na análise e na execução: a paginação é somente visual. A consulta de miniaturas
+também é limitada às cópias em inspeção/página, reaproveitando caches já encontrados
+no grupo. Quando a rotação da cópia doadora difere, a diferença angular é aplicada
+somente ao QPixmap em memória, tanto na coluna de miniaturas quanto no inspetor;
+o original e o cache doador não são modificados. Shift usa a mesma âncora entre
+cartões e teclado; o foco por célula respeita a página atual de cópias da linha.
+O botão de inversão alterna o arquivo preservado entre os membros do grupo e
+marca o grupo para execução. Nenhuma escolha autoriza mover arquivos fora do escopo.
+
+Dê duplo clique na coluna **Tags Finais** para editar o texto que será gravado.
+A edição manual substitui a união automática (permite remover tags e nomes);
+separadores são normalizados e repetições são removidas. Uma descrição vazia
+é permitida e destacada na confirmação. Se alguma descrição no Drive mudou
+desde a análise, o grupo manual é bloqueado para nova revisão, sem sobrescrevê-la.
+A edição é preservada ao inverter quem fica. **Restaurar tags automáticas**
+descarta a edição dos grupos selecionados e volta à união automática.
+
+A execução exige fila vazia, produção, permissão de escrita e backup local do
+catálogo. Coordena-se com a sincronização/varredura para evitar concorrência na
+mesma instalação. Reconsulta IDs, conteúdo, pais, permissões e descrições atuais;
+une tags e todos os nomes diferentes antes dos movimentos, sem truncar texto.
+Nomes que contêm separadores de tags exigem revisão manual. Escritas usam
+`If-Match` com o ETag remoto. Quando a API v3 não fornece ETag, a execução
+consulta a representação v2 do mesmo ID, confere versão e metadados e usa
+`files.patch` v2 com o ETag dessa representação. Não reutiliza ETags entre
+versões da API e não faz escrita desprotegida. Se a v2 também não fornecer
+ETag ou as leituras divergirem, bloqueia o grupo. Evite edições
+simultâneas por outras máquinas: não há transação única entre vários arquivos
+do Google Drive e o SQLite.
+
+O destino deve estar sob `_TestesBanco/Banco_Apagado` no outro Drive configurado.
+Toda a subpasta escolhida é respeitada. Pastas homônimas ambíguas bloqueiam o
+processamento; colisões de arquivos recebem sufixo por ID, sem sobrescrita.
+Não há fallback de movimentação pelo disco local.
+
+Miniaturas TIFF numéricas respeitam o tipo/faixa dos pixels (inclusive float
+normalizado). Apenas as chaves de cache de TIFF local foram versionadas para
+substituir miniaturas antigas incorretas quando forem geradas novamente; o
+cache antigo não é apagado e as preferências de rotação são preservadas.
+
+O diário durável `data/dedup/journal.db` registra pedidos antes de mover e
+confirmações antes de limpar o índice local. Os relatórios JSON ficam nessa
+pasta; após movimentos, tenta-se enviar uma cópia ao destino via API. Falha no
+envio não apaga o relatório local. **Conferir operações interrompidas** consulta
+o resultado remoto e conclui apenas a limpeza local de movimentos confirmados;
+não repete movimentos incertos. Casos ainda não confirmados permanecem
+bloqueados para revisão manual. Depois de mover, aguarde o cliente sincronizar:
+uma varredura local antecipada pode exibir temporariamente caminhos antigos.
+
+A revisão do deduplicador é salva automaticamente em
+`data/dedup/review_plan.json` (ao lado do banco em instalações com outro caminho).
+Ela é retomada ao reabrir o painel/aplicativo, incluindo seleção, escopo e tags
+manuais; não é publicada no Drive nem executada automaticamente. O arquivo é
+substituído atomicamente, com escrita em segundo plano. Antes de executar,
+salva-se também um marcador dos grupos em andamento: após uma queda, esses
+grupos voltam bloqueados para conferência, sem repetir movimentos às cegas.
+
+Após executar, saem da revisão apenas os grupos concluídos e as cópias cujo
+movimento e atualização local foram confirmados. Falhas, cancelamentos e grupos
+não executados permanecem. Use **Conferir operações interrompidas** e **Refazer
+busca** para reavaliar os bloqueados. **Limpar revisão** apaga somente a lista
+salva e suas edições, nunca os arquivos do acervo. Alterar escopo/destino mantém
+a revisão visível, mas exige refazer a busca antes de executar. Uma busca que
+falhar/cancelar não apaga a revisão anterior.
+
+O fundo vermelho identifica grupos cujo preservado precisa mudar para
+`ANO\Organizar`, porque nenhuma cópia está na pasta anual inferida. O destino
+aparece na célula do preservado. Cancelamento é informado separadamente de
+falhas; as etapas já concluídas não são desfeitas e o relatório fica local.
+
 ### Logs
 O log ativo fica em `logs/voximago.log`. Ele é arquivado ao atingir 25 MB
 ou na mudança do dia; os arquivos anteriores ficam comprimidos em

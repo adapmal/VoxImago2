@@ -11,10 +11,11 @@ from PyQt6.QtWidgets import (
     QFrame, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QFormLayout, QScrollArea, QMessageBox, QGroupBox, QLineEdit, QProgressBar, QApplication
 )
-from PyQt6.QtGui import QFont, QImage, QPainter, QPixmap
-from PyQt6.QtCore import Qt, QTimer, QObject, QEvent
+from PyQt6.QtGui import QFont, QImage, QPainter, QPixmap, QTransform
+from PyQt6.QtCore import Qt, QTimer, QObject, QEvent, QRunnable, QThreadPool, pyqtSignal, pyqtSlot
 
 from src.utils.utils import format_size
+from src.utils.exif_utils import extract_exif_summary
 from src.ui.thumbnails import ThumbnailCache, ThumbnailManager
 from src.drive.auto_tagger import AutoTagger
 from src.ui.staging_queue import StagingQueue, StagingItem
@@ -23,6 +24,25 @@ from src.utils.config_manager import ConfigManager
 from src.utils.path_validation import validate_path_component
 from src.ui.vocab_panel import VocabManager
 from src.ui.tag_chips import TagChipsWidget
+
+
+class _ExifSignals(QObject):
+    finished = pyqtSignal(int, object)
+
+
+class _ExifTask(QRunnable):
+    def __init__(self, generation, path):
+        super().__init__()
+        self.generation, self.path = generation, path
+        self.signals = _ExifSignals()
+
+    def run(self):
+        try:
+            result = extract_exif_summary(self.path)
+        except Exception:
+            logging.debug('Não foi possível ler EXIF local.', exc_info=True)
+            result = (None, None)
+        self.signals.finished.emit(self.generation, result)
 
 
 class _BatchTagFocusGuard(QObject):
@@ -75,6 +95,9 @@ class FileDetailsPanel(QFrame):
         self.staging_queue = StagingQueue()
         self.config_mgr = ConfigManager()
         self._batch_worker = None
+        self._exif_generation = 0
+        self._exif_task = None
+        self._pending_exif = None
 
         self.main_layout = QVBoxLayout(self)
         self.main_layout.setContentsMargins(10, 10, 10, 10)
@@ -118,43 +141,21 @@ class FileDetailsPanel(QFrame):
 
         self.content_layout.addLayout(actions_layout)
 
-        self.separator = QFrame()
-        self.separator.setFrameShape(QFrame.Shape.HLine)
-        self.separator.setFrameShadow(QFrame.Shadow.Sunken)
-        self.content_layout.addWidget(self.separator)
-
-        self.form_layout = QFormLayout()
-        self.form_layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-
-        self.name_edit = QLineEdit()
-        self.name_edit.setPlaceholderText("Nome do arquivo...")
-        self.name_edit.textEdited.connect(self._on_name_edited)
-        self.form_layout.addRow(QLabel("<b>Nome:</b>"), self.name_edit)
-
-        self.source_label = QLabel("N/A")
-        self.size_label = QLabel("N/A")
-        self.path_label = QLabel("N/A")
-        self.path_label.setWordWrap(True)
-        self.created_label = QLabel("N/A")
-
-        self.form_layout.addRow(QLabel("<b>Fonte:</b>"), self.source_label)
-        self.form_layout.addRow(QLabel("<b>Tamanho:</b>"), self.size_label)
-        self.form_layout.addRow(QLabel("<b>Caminho:</b>"), self.path_label)
-        self.form_layout.addRow(QLabel("<b>Criação:</b>"), self.created_label)
-
         vocab_mgr = VocabManager()
         all_tags = []
         for tags in vocab_mgr.categories.values():
             all_tags.extend(tags)
-        
-        # Componente de Chips/Pills visuais estilo Gmail + Barra de Ações de Tags
-        tags_container_widget = QWidget()
-        tags_vbox = QVBoxLayout(tags_container_widget)
+
+        # Tags logo abaixo do preview da imagem
+        self.tags_section_widget = QWidget()
+        tags_vbox = QVBoxLayout(self.tags_section_widget)
         tags_vbox.setContentsMargins(0, 0, 0, 0)
-        tags_vbox.setSpacing(3)
+        tags_vbox.setSpacing(4)
 
         tags_top_bar = QHBoxLayout()
         tags_top_bar.setContentsMargins(0, 0, 0, 0)
+        tags_header_lbl = QLabel("<b>Tags:</b>")
+        tags_top_bar.addWidget(tags_header_lbl)
         tags_top_bar.addStretch()
 
         self.btn_toggle_edit = QPushButton("✏️ Editar")
@@ -183,8 +184,51 @@ class FileDetailsPanel(QFrame):
         self.tag_chips_widget = TagChipsWidget(all_tags, self)
         self.tag_chips_widget.tagsChanged.connect(self._on_tags_changed)
         tags_vbox.addWidget(self.tag_chips_widget)
+        self.content_layout.addWidget(self.tags_section_widget)
 
-        self.form_layout.addRow(QLabel("<b>Tags:</b>"), tags_container_widget)
+        # EXIF logo abaixo das tags (visível apenas quando houver Date Taken e/ou GPS)
+        self.exif_container = QWidget()
+        exif_outer = QVBoxLayout(self.exif_container)
+        exif_outer.setContentsMargins(0, 2, 0, 2)
+        exif_outer.setSpacing(3)
+        exif_outer.addWidget(QLabel("<b>EXIF:</b>"))
+        self.exif_form_layout = QFormLayout()
+        self.exif_form_layout.setContentsMargins(8, 0, 0, 0)
+        self.exif_form_layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        self.exif_date_label = QLabel("")
+        self.exif_date_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.exif_gps_label = QLabel("")
+        self.exif_gps_label.setOpenExternalLinks(True)
+        self.exif_gps_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        self.exif_form_layout.addRow(QLabel("<b>Date Taken:</b>"), self.exif_date_label)
+        self.exif_form_layout.addRow(QLabel("<b>GPS:</b>"), self.exif_gps_label)
+        exif_outer.addLayout(self.exif_form_layout)
+        self.exif_container.setVisible(False)
+        self.content_layout.addWidget(self.exif_container)
+
+        self.separator = QFrame()
+        self.separator.setFrameShape(QFrame.Shape.HLine)
+        self.separator.setFrameShadow(QFrame.Shadow.Sunken)
+        self.content_layout.addWidget(self.separator)
+
+        self.form_layout = QFormLayout()
+        self.form_layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("Nome do arquivo...")
+        self.name_edit.textEdited.connect(self._on_name_edited)
+        self.form_layout.addRow(QLabel("<b>Nome:</b>"), self.name_edit)
+
+        self.source_label = QLabel("N/A")
+        self.size_label = QLabel("N/A")
+        self.path_label = QLabel("N/A")
+        self.path_label.setWordWrap(True)
+        self.created_label = QLabel("N/A")
+
+        self.form_layout.addRow(QLabel("<b>Fonte:</b>"), self.source_label)
+        self.form_layout.addRow(QLabel("<b>Tamanho:</b>"), self.size_label)
+        self.form_layout.addRow(QLabel("<b>Caminho:</b>"), self.path_label)
+        self.form_layout.addRow(QLabel("<b>Criação:</b>"), self.created_label)
 
         self.open_drive_button = QPushButton("☁️ Abrir no Drive")
         self.open_drive_button.setVisible(False)
@@ -225,6 +269,7 @@ class FileDetailsPanel(QFrame):
         self.current_file_item = None
         self.current_files_list = []
         self._is_batch_mode = False
+        self._inspection_only = False
         self.parent_app = parent
         self.current_suggestions = []
         self._is_updating = False
@@ -232,7 +277,14 @@ class FileDetailsPanel(QFrame):
         self.config_mgr.modeChanged.connect(lambda k, v: self._apply_permission_mode())
         self.hide()
 
+    def set_inspection_only(self, enabled: bool):
+        """Modo somente visualização (ex.: janela de comparação por hash) sem alterar a fila."""
+        self._inspection_only = bool(enabled)
+        self._apply_permission_mode()
+
     def _toggle_tag_edit_mode(self):
+        if self._inspection_only:
+            return
         self.tag_chips_widget.toggle_mode()
         if self.tag_chips_widget._is_text_mode:
             self.btn_toggle_edit.setText("🏷️ Bolinhas")
@@ -242,6 +294,19 @@ class FileDetailsPanel(QFrame):
             self.btn_toggle_edit.setToolTip("Alternar para modo texto puro")
 
     def _apply_permission_mode(self):
+        if self._inspection_only:
+            self.name_edit.setReadOnly(True)
+            self.name_edit.setStyleSheet("")
+            self.btn_rotate.setVisible(False)
+            self.btn_delete.setVisible(False)
+            self.btn_toggle_edit.setVisible(False)
+            self.tag_chips_widget.set_read_only(True)
+            self.suggestions_group.setVisible(False)
+            return
+        self.btn_rotate.setVisible(True)
+        self.btn_delete.setVisible(True)
+        self.btn_toggle_edit.setVisible(True)
+        self.tag_chips_widget.set_read_only(False)
         # No modo Somente Leitura, todas as edições são permitidas na interface
         # para acumular na Fila de Revisão (Staging Queue). Apenas a execução no Drive é bloqueada.
         self.name_edit.setReadOnly(False)
@@ -271,7 +336,8 @@ class FileDetailsPanel(QFrame):
 
         raw_path = file_item.get('path', file_item.get('webViewLink', 'N/A'))
         if (
-            file_item.get('source') == 'local'
+            not self._inspection_only
+            and file_item.get('source') == 'local'
             and file_item.get('mimeType') not in ('application/vnd.google-apps.folder', 'folder')
             and isinstance(raw_path, str)
             and raw_path != 'N/A'
@@ -321,8 +387,10 @@ class FileDetailsPanel(QFrame):
 
         # Carregar tags usando intenção explícita (Branco = salvas no banco, Verde = adicionadas na fila, Vermelho = removidas na fila)
         self.tag_chips_widget.set_tags(orig_db_desc, staged_added, staged_removed)
+        self._update_exif_section(
+            raw_path if file_item.get('mimeType') not in ('application/vnd.google-apps.folder', 'folder') else None
+        )
         self._apply_permission_mode()
-
 
         self.open_drive_button.setVisible(True)
 
@@ -331,7 +399,10 @@ class FileDetailsPanel(QFrame):
         else:
             self.open_folder_button.setVisible(False)
 
-        self._update_suggested_tags(file_item)
+        if not self._inspection_only:
+            self._update_suggested_tags(file_item)
+        else:
+            self.suggestions_group.setVisible(False)
         self._load_thumbnail(file_item)
 
         # Checar se já está na fila de deleção
@@ -357,6 +428,7 @@ class FileDetailsPanel(QFrame):
         return self.staging_queue.effective_description(file_item)
 
     def update_details_batch(self, files_list):
+        self._invalidate_exif()
         if hasattr(self, 'tag_chips_widget') and self.tag_chips_widget and getattr(self.tag_chips_widget, '_is_text_mode', False):
             self.tag_chips_widget.set_mode('chips')
         self._is_updating = True
@@ -421,6 +493,7 @@ class FileDetailsPanel(QFrame):
         self.open_drive_button.setVisible(False)
         self.open_folder_button.setVisible(False)
         
+        self.exif_container.setVisible(False)
         self._update_suggested_tags_batch(files_list)
         
         # Ocultar miniatura no modo lote
@@ -432,12 +505,57 @@ class FileDetailsPanel(QFrame):
         self.show()
 
     def clear_details(self):
+        self._invalidate_exif()
         self._is_updating = True
         self.current_file_item = None
         self.current_files_list = []
         self._is_batch_mode = False
+        self.exif_container.setVisible(False)
         self.hide()
         self._is_updating = False
+
+    def _update_exif_section(self, file_path: str | None):
+        self._invalidate_exif()
+        if file_path:
+            self._pending_exif = (self._exif_generation, os.path.abspath(file_path))
+            self._start_pending_exif()
+
+    def _invalidate_exif(self):
+        self._exif_generation += 1
+        self._pending_exif = None
+        self.exif_container.setVisible(False)
+
+    def _start_pending_exif(self):
+        # No máximo uma leitura ativa e a seleção mais recente aguardando.
+        if self._exif_task is None and self._pending_exif is not None:
+            self._exif_task = _ExifTask(*self._pending_exif)
+            self._pending_exif = None
+            self._exif_task.signals.finished.connect(self._on_exif_finished)
+            QThreadPool.globalInstance().start(self._exif_task)
+
+    @pyqtSlot(int, object)
+    def _on_exif_finished(self, generation, result):
+        self._exif_task = None
+        if generation == self._exif_generation:
+            self._apply_exif_result(*result)
+        self._start_pending_exif()
+
+    def _apply_exif_result(self, date_taken, gps_text):
+        if not date_taken and not gps_text:
+            self.exif_container.setVisible(False)
+            return
+        self.exif_date_label.setText(date_taken or "")
+        self.exif_form_layout.setRowVisible(0, bool(date_taken))
+        if gps_text:
+            self.exif_gps_label.setText(
+                f'<a href="https://www.google.com/maps?q={gps_text.replace(" ", "")}" '
+                f'style="color: #4EA1F3;">{gps_text}</a>'
+            )
+            self.exif_form_layout.setRowVisible(1, True)
+        else:
+            self.exif_gps_label.setText("")
+            self.exif_form_layout.setRowVisible(1, False)
+        self.exif_container.setVisible(True)
 
     def _fade_current_thumbnail(self):
         current_pixmap = self.thumbnail_label.pixmap()
@@ -459,12 +577,22 @@ class FileDetailsPanel(QFrame):
 
         try:
             cached = None
+            fallback_rotation = 0
             # 1. Se a miniatura já está no cache (usada pela grade, seja de arquivo local ou do Drive)
             if ThumbnailCache.is_thumbnail_cached(file_item):
                 cached = ThumbnailCache.get_existing_thumbnail_cache_path(file_item)
 
-            # 2. Se não está em cache, gerar a partir do caminho físico local (suportando arquivos movidos na fila)
             if not cached or not os.path.exists(cached):
+                for alt_key in ('thumbnailPath', 'fallback_thumbnail_path'):
+                    alt_path = file_item.get(alt_key)
+                    if alt_path and os.path.isfile(alt_path):
+                        cached = alt_path
+                        if alt_key == 'fallback_thumbnail_path':
+                            fallback_rotation = int(file_item.get('fallback_thumbnail_rotation', 0) or 0) % 360
+                        break
+
+            # 2. Se não está em cache, gerar a partir do caminho físico local (suportando arquivos movidos na fila)
+            if not self._inspection_only and (not cached or not os.path.exists(cached)):
                 local_path = file_item.get('physical_path') or file_item.get('orig_path') or file_item.get('path')
                 if local_path and os.path.exists(local_path):
                     cached = ThumbnailManager.generate_local_thumbnail(file_item, size=(300, 300))
@@ -472,6 +600,9 @@ class FileDetailsPanel(QFrame):
             if cached and os.path.exists(cached):
                 pixmap = QPixmap(cached)
                 if not pixmap.isNull():
+                    if fallback_rotation:
+                        pixmap = pixmap.transformed(QTransform().rotate(fallback_rotation),
+                                                   Qt.TransformationMode.SmoothTransformation)
                     self.thumbnail_label.setPixmap(pixmap.scaled(
                         self.thumbnail_label.size(),
                         Qt.AspectRatioMode.KeepAspectRatio,
@@ -584,7 +715,7 @@ class FileDetailsPanel(QFrame):
         self._refresh_suggestions_view()
 
     def _on_tags_changed(self, new_desc):
-        if self._is_updating:
+        if self._is_updating or self._inspection_only:
             return
         if not self.staging_queue.can_edit():
             return
@@ -693,7 +824,7 @@ class FileDetailsPanel(QFrame):
 
 
     def _on_name_edited(self, new_name):
-        if self._is_updating or not self.current_file_item:
+        if self._is_updating or self._inspection_only or not self.current_file_item:
             return
         fid = self.current_file_item.get('file_id') or self.current_file_item.get('id')
         fpath = self.current_file_item.get('path', '')
@@ -729,7 +860,7 @@ class FileDetailsPanel(QFrame):
 
     def _rotate_image_action(self):
         """Persiste um override de 90 graus sem alterar o arquivo original."""
-        if self.config_mgr.is_read_only():
+        if self._inspection_only or self.config_mgr.is_read_only():
             return
 
         files_to_process = (
@@ -825,6 +956,8 @@ class FileDetailsPanel(QFrame):
             self.btn_delete.setText("🗑️ Excluir Arquivo")
 
     def _delete_file_action(self):
+        if self._inspection_only:
+            return
         files_to_process = getattr(self, 'current_files_list', []) if getattr(self, '_is_batch_mode', False) else [self.current_file_item]
         is_any_added_to_queue = False
         

@@ -257,8 +257,18 @@ class TagChipsWidget(QFrame):
         self.vocab_suggestions = vocab_suggestions or []
         self._is_updating = False
         self._is_text_mode = False
+        self._read_only = False
 
         self._init_ui()
+
+    def set_read_only(self, read_only: bool):
+        """Modo somente visualização: exibe os chips mas bloqueia cliques/digitação."""
+        self._read_only = bool(read_only)
+        if self._read_only and self._is_text_mode:
+            self.set_mode('chips')
+        self.input_field.setVisible(not self._read_only)
+        self.input_field.setEnabled(not self._read_only)
+        self.text_editor.setReadOnly(self._read_only)
 
     def update_vocab_suggestions(self, vocab_suggestions):
         self.vocab_suggestions = vocab_suggestions or []
@@ -322,7 +332,7 @@ class TagChipsWidget(QFrame):
             self.set_mode('chips')
 
     def mousePressEvent(self, event):
-        if not self._is_text_mode:
+        if not self._is_text_mode and not self._read_only:
             self.input_field.setFocus()
         super().mousePressEvent(event)
 
@@ -491,6 +501,8 @@ class TagChipsWidget(QFrame):
 
     def _on_chip_clicked(self, chip):
         """Clique esquerdo: apaga ou restaura."""
+        if self._read_only:
+            return
         if chip.state == 'added':
             self.chips.remove(chip)
             self.flow_layout.removeWidget(chip)
@@ -504,6 +516,8 @@ class TagChipsWidget(QFrame):
 
     def _on_chip_edit_requested(self, chip):
         """Clique direito: retira o chip e coloca no campo para editar."""
+        if self._read_only:
+            return
         text = chip.text_value
         self._on_chip_clicked(chip)
         self.input_field.setText(text)

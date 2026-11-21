@@ -51,12 +51,17 @@ class SnapshotDialog(QDialog):
         intro.setWordWrap(True)
         layout.addWidget(intro)
         configured = self.config.get('shared_cache_path')
-        allowed_drives = self.config.get_allowed_drive_letters()
-        resolved_base = resolve_relocated_path(
-            configured,
-            drive_letters=allowed_drives,
-            allow_existing_parent=True,
-        ) or configured
+        raw_drives = self.config.get_allowed_drive_letters()
+        allowed_drives = list(raw_drives) if isinstance(raw_drives, (list, tuple, set)) else None
+        resolved_base = (
+            resolve_relocated_path(
+                configured,
+                drive_letters=allowed_drives,
+                allow_existing_parent=True,
+            )
+            if isinstance(configured, str) and configured
+            else None
+        ) or (configured if isinstance(configured, str) else '')
         root, ext = os.path.splitext(resolved_base)
         mode_suffix = '_sandbox' if self.config.is_sandbox() else ''
         default = f'{root}{mode_suffix}_v{SCHEMA_VERSION}{ext or ".db"}'

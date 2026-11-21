@@ -263,8 +263,11 @@ def rebase_local_paths(connection, source_root, target_root):
     connection.create_function("py_lower", 1, lambda s: s.lower() if s else s)
     connection.execute('BEGIN IMMEDIATE')
     try:
+        cols = {row[1] for row in connection.execute("PRAGMA table_info(files)")}
+        desc_expr = "description" if "description" in cols else "''"
+        web_expr = "webContentLink" if "webContentLink" in cols else "NULL"
         rows = connection.execute(
-            "SELECT file_id,path,parentId,description,webContentLink "
+            f"SELECT file_id,path,parentId,{desc_expr},{web_expr} "
             "FROM files WHERE source='local'"
         ).fetchall()
 

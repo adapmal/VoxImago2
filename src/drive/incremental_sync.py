@@ -12,8 +12,12 @@ from src.drive.match import (
 )
 from src.utils.path_validation import configured_operation_roots
 
+SYNC_OVERLAP_SECONDS = 180
+
+
 class IncrementalSyncWorker(QObject):
     sync_finished = pyqtSignal(int)  # number of updated files
+    sync_cancelled = pyqtSignal(int)  # number of items processed before stop
     sync_failed = pyqtSignal(str)
     sync_warning = pyqtSignal(str)
     # Valor negativo indica uma etapa de duracao indeterminada (consulta da API).
@@ -25,33 +29,40 @@ class IncrementalSyncWorker(QObject):
         self.config_mgr = config_mgr
         self.indexer = indexer
         self.force_window_days = force_window_days
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
 
     def run(self):
         local_indexer = None
+        processed_count = 0
         try:
+            sync_started_at = int(time.time())
             self.progress_update.emit(
                 -1, "Consultando alterações no Google Drive..."
             )
             from src.database.database import FileIndexer
             local_indexer = FileIndexer()
-            
+
             if self.config_mgr.get('snapshot_reconcile_pending'):
                 # Uma cópia antiga pode ter mudanças anteriores à janela manual.
-                last_sync = 1
+                effective_since = 1
             elif self.force_window_days:
-                last_sync = int(time.time() - self.force_window_days * 86400)
+                effective_since = int(sync_started_at - self.force_window_days * 86400)
             else:
                 last_sync = self.config_mgr.get('last_sync_timestamp')
                 if not last_sync:
-                    # Se não houver timestamp anterior, olhar os últimos 30 dias para pegar qualquer alteração recente
-                    last_sync = int(time.time() - 30 * 86400)
-                    self.config_mgr.set('last_sync_timestamp', last_sync)
+                    # Primeira execução sem log anterior: olha últimos 30 dias uma única vez
+                    effective_since = int(sync_started_at - 30 * 86400)
+                else:
+                    effective_since = max(1, int(last_sync) - SYNC_OVERLAP_SECONDS)
 
-            last_sync_dt = datetime.fromtimestamp(last_sync, timezone.utc)
+            last_sync_dt = datetime.fromtimestamp(effective_since, timezone.utc)
             formatted_time = last_sync_dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
-            
+
             q = f"modifiedTime > '{formatted_time}' and trashed = false"
-            
+
             kwargs = {
                 'q': q,
                 'pageSize': 1000,
@@ -59,7 +70,7 @@ class IncrementalSyncWorker(QObject):
                 'supportsAllDrives': True,
                 'fields': "nextPageToken, files(id, name, mimeType, description, size, md5Checksum, modifiedTime, createdTime, parents, thumbnailLink, webViewLink)",
             }
-            
+
             current_drive = self.config_mgr.get_current_drive_id()
             if current_drive:
                 kwargs['corpora'] = 'drive'
@@ -68,28 +79,36 @@ class IncrementalSyncWorker(QObject):
                 kwargs['corpora'] = 'allDrives'
 
             logging.info(f"🔄 Iniciando Sincronização Incremental (Drive: {current_drive}): {q}")
-            
+
             updated_files = []
             page_token = None
-            
+
             while True:
+                if self._cancelled:
+                    self.progress_update.emit(0, "Sincronização interrompida pelo usuário.")
+                    self.sync_cancelled.emit(0)
+                    return
                 if page_token:
                     kwargs['pageToken'] = page_token
                 response = self.service.files().list(**kwargs).execute()
+                if self._cancelled:
+                    self.progress_update.emit(0, "Sincronização interrompida pelo usuário.")
+                    self.sync_cancelled.emit(0)
+                    return
                 items = response.get('files', [])
                 updated_files.extend(items)
                 self.progress_update.emit(
                     -1,
                     f"Consultando o Drive: {len(updated_files):,} item(ns) localizado(s)...",
                 )
-                
+
                 page_token = response.get('nextPageToken')
                 if not page_token:
                     break
 
             if not updated_files:
                 logging.info("Nenhum arquivo novo ou modificado encontrado no Drive.")
-                self.config_mgr.set('last_sync_timestamp', int(time.time()))
+                self.config_mgr.set('last_sync_timestamp', sync_started_at)
                 self.config_mgr.set('snapshot_reconcile_pending', False)
                 self.progress_update.emit(100, "Google Drive já está atualizado.")
                 self.sync_finished.emit(0)
@@ -114,6 +133,16 @@ class IncrementalSyncWorker(QObject):
             match_outcomes = Counter()
 
             for position, file in enumerate(updated_files, start=1):
+                if self._cancelled:
+                    local_indexer.conn.commit()
+                    logging.info(
+                        "⏹️ Sincronização incremental interrompida pelo usuário após %d/%d item(ns).",
+                        processed_count,
+                        total_updated,
+                    )
+                    self.progress_update.emit(0, f"Sincronização interrompida ({processed_count:,}/{total_updated:,}).")
+                    self.sync_cancelled.emit(processed_count)
+                    return
                 fid = file.get('id')
                 fname = file.get('name')
                 desc = (file.get('description') or '').strip()
@@ -223,6 +252,7 @@ class IncrementalSyncWorker(QObject):
                         f"Sincronizando: {position:,}/{total_updated:,} "
                         f"arquivos ({percent}%)...",
                     )
+                processed_count = position
 
                 # Evita reter o unico lock de escrita do SQLite durante todo um
                 # inventario grande. O coordenador da interface ainda impede a
@@ -241,8 +271,8 @@ class IncrementalSyncWorker(QObject):
                 match_outcomes['no_match'],
             )
             
-            # Atualizar Timestamp
-            self.config_mgr.set('last_sync_timestamp', int(time.time()))
+            # Atualizar Timestamp somente ao concluir por completo
+            self.config_mgr.set('last_sync_timestamp', sync_started_at)
             self.config_mgr.set('snapshot_reconcile_pending', False)
 
             self.progress_update.emit(

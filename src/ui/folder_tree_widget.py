@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
     QMessageBox, QMenu, QStyledItemDelegate
 )
 from PyQt6.QtGui import QFileSystemModel, QDragEnterEvent, QDragMoveEvent, QDropEvent, QCursor, QColor, QPen, QFont
-from PyQt6.QtCore import pyqtSignal, Qt, QDir, QUrl, QModelIndex
+from PyQt6.QtCore import pyqtSignal, Qt, QDir, QUrl, QModelIndex, QTimer
 from src.utils.config_manager import ConfigManager
 from src.utils.path_validation import validate_path_component
 
@@ -219,6 +219,7 @@ class DropEnabledTreeView(QTreeView):
 class FolderTreeWidget(QWidget):
     folderSelected = pyqtSignal(str)  # Emitido com o caminho completo da pasta selecionada
     filesDroppedOnFolder = pyqtSignal(list, str)  # (items, target_folder_path)
+    compareFolderHashRequested = pyqtSignal(str)  # Abrir comparador de hash com esta pasta incluída
 
     def __init__(self, root_dir=None, parent=None):
         super().__init__(parent)
@@ -335,6 +336,11 @@ class FolderTreeWidget(QWidget):
         menu.addSeparator()
         action_sync_drive = menu.addAction("☁️ Sincronizar Tags desta Pasta com o Google Drive")
         action_sync_drive.triggered.connect(lambda: self.sync_folder_tags_with_drive(target_path))
+
+        action_compare_hash = menu.addAction("🧹 Comparar Pasta por Hash com Outras...")
+        action_compare_hash.triggered.connect(
+            lambda: self.compareFolderHashRequested.emit(os.path.normpath(target_path))
+        )
 
         menu.exec(self.tree_view.viewport().mapToGlobal(position))
 
@@ -598,6 +604,8 @@ class FolderTreeWidget(QWidget):
         self.folderSelected.emit("")
 
     def _on_selection_changed(self, selected, deselected):
+        if getattr(self, '_suppress_selection_signal', False):
+            return
         indexes = self.tree_view.selectedIndexes()
         if indexes and self.model.isDir(indexes[0]):
             folder_path = self.model.filePath(indexes[0])
@@ -625,27 +633,53 @@ class FolderTreeWidget(QWidget):
     def select_and_expand_folder(self, folder_path):
         """Expande os níveis intermediários e seleciona a pasta alvo na árvore."""
         if not folder_path or not os.path.exists(folder_path):
-            return
+            return False
 
         norm_p = os.path.normpath(folder_path)
         root_norm = os.path.normpath(self.root_dir)
+        root_cf = os.path.normcase(root_norm)
+        norm_cf = os.path.normcase(norm_p)
 
-        # Montar a cadeia de pastas pai a partir da raiz até o destino
-        parents = []
-        curr = norm_p
-        while curr and curr.lower() != root_norm.lower() and os.path.dirname(curr) != curr:
-            parents.append(curr)
+        if norm_cf == root_cf:
+            self.clear_folder_selection()
+            return True
+
+        if not norm_cf.startswith(root_cf + os.sep):
+            return False
+
+        # Montar a cadeia de pastas pai estritamente entre a raiz e o destino
+        ancestors = []
+        curr = os.path.dirname(norm_p)
+        while curr and os.path.normcase(curr) != root_cf and os.path.dirname(curr) != curr:
+            ancestors.append(curr)
             curr = os.path.dirname(curr)
 
         # Expandir de cima para baixo
-        for p in reversed(parents):
+        for p in reversed(ancestors):
             idx = self.model.index(p)
             if idx.isValid():
                 self.tree_view.expand(idx)
 
         target_idx = self.model.index(norm_p)
-        if target_idx.isValid():
+        if not target_idx.isValid():
+            return False
+
+        self._suppress_selection_signal = True
+        try:
             self.tree_view.setCurrentIndex(target_idx)
-            self.tree_view.scrollTo(target_idx, QAbstractItemView.ScrollHint.PositionAtCenter)
-            self._update_header_for_folder(norm_p)
-            self.folderSelected.emit(norm_p)
+        finally:
+            self._suppress_selection_signal = False
+
+        display_path = os.path.normpath(self.model.filePath(target_idx) or norm_p)
+        self.tree_view.scrollTo(target_idx, QAbstractItemView.ScrollHint.PositionAtCenter)
+        QTimer.singleShot(
+            120,
+            lambda idx=target_idx: (
+                self.tree_view.scrollTo(idx, QAbstractItemView.ScrollHint.PositionAtCenter)
+                if idx.isValid() and self.tree_view.currentIndex() == idx
+                else None
+            ),
+        )
+        self._update_header_for_folder(display_path)
+        self.folderSelected.emit(display_path)
+        return True
