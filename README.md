@@ -336,6 +336,49 @@ O fundo vermelho identifica grupos cujo preservado precisa mudar para
 aparece na célula do preservado. Cancelamento é informado separadamente de
 falhas; as etapas já concluídas não são desfeitas e o relatório fica local.
 
+### Incorporar Meu Drive mantendo atalhos
+
+Em **Ferramentas → Utilitários → Incorporar Meu Drive mantendo atalhos**, informe
+o link/ID de uma pasta específica do Meu Drive e de uma pasta de destino no
+Drive compartilhado Banco de Imagens. A conta conectada precisa conseguir ler
+a origem, criar atalhos nas pastas originais e mover os arquivos aos Drives
+configurados. Não há acesso automático às contas dos outros usuários.
+
+**Analisar pastas** pagina os metadados de todo o Banco de Imagens e percorre a
+origem recursivamente, sem baixar mídias e sem seguir atalhos existentes.
+Compara MD5 e tamanho, rejeitando divergências de SHA-256 quando disponível.
+Arquivos sem checksum verificável (incluindo documentos nativos Google) ficam
+bloqueados. A tabela é paginada em 100 linhas; duplo clique no alvo abre o Drive.
+
+Na execução confirmada, uma pasta com o nome da origem e suas subpastas é criada
+no destino. Arquivos novos são movidos com o mesmo ID e recebem atalhos em sua
+pasta original. Se já houver conteúdo igual no banco, o atalho aponta à cópia
+preservada e o original vai para `_TestesBanco/Banco_Apagado/APAGAR`. Entre
+várias cópias, escolhe a mais antiga por data de criação, com ID como desempate.
+Repetições dentro da importação usam o primeiro arquivo incorporado; se esse
+arquivo não for selecionado/concluído, os dependentes não serão arquivados.
+Colisões de nomes recebem sufixo por ID; pastas ambíguas de arquivamento bloqueiam.
+As descrições originais acompanham os arquivos; não se fundem tags na cópia
+preservada do banco. Não há exclusão definitiva nem alterações de permissões.
+
+**Os usuários precisam de acesso ao alvo: o atalho não concede esse acesso.**
+A movimentação para um Drive compartilhado muda a propriedade do arquivo e
+pode alterar permissões herdadas. Confirme os acessos antes de executar.
+
+Plano e etapas ficam em `data/shortcut_migration/journal.db`, ao lado do banco
+nas instalações com outro caminho. **Abrir / retomar revisão** recupera os
+planos após reiniciar. Criações têm marcadores remotos, movimentos são
+condicionais e verificados por releitura. Resposta incerta interrompe o lote;
+retomar confere as etapas já efetuadas. Uma criação incerta ainda não localizada
+permanece bloqueada, sem repetir cegamente. Cancelar preserva etapas concluídas;
+não existe rollback automático entre várias chamadas à API.
+
+Os hashes do banco são consultados novamente antes de executar uma revisão
+salva. Uma nova duplicata não prevista exige reanálise. Evite alterações
+simultâneas nos arquivos envolvidos. A ferramenta atua diretamente no Drive;
+InSync/Drive Desktop e o catálogo local podem levar mais tempo para refletir os
+novos caminhos. Esta funcionalidade não substitui a revisão do sincronizador.
+
 ### Logs
 O log ativo fica em `logs/voximago.log`. Ele é arquivado ao atingir 25 MB
 ou na mudança do dia; os arquivos anteriores ficam comprimidos em

@@ -120,6 +120,11 @@ class DriveFileGalleryApp(QMainWindow):
         )
         dlg.exec()
 
+    def _open_shortcut_migration(self):
+        from src.ui.shortcut_migration_dialog import ShortcutMigrationDialog
+        dlg = ShortcutMigrationDialog(self, indexer=self.indexer, drive_service=self.service)
+        dlg.exec()
+
     def _start_path_reconciliation(self):
         if self.maintenance_running or self.queue_execution_running or self.drive_sync_running:
             QMessageBox.information(
@@ -491,6 +496,7 @@ class DriveFileGalleryApp(QMainWindow):
             self._start_path_reconciliation)
         self.main_bar.action_deduplicate_hash.triggered.connect(
             self._open_hash_deduplicator)
+        self.main_bar.action_shortcut_migration.triggered.connect(self._open_shortcut_migration)
         self.main_bar.action_clear_cache.triggered.connect(
             self.clear_thumbnail_cache)
         self.main_bar.action_advanced_settings.triggered.connect(

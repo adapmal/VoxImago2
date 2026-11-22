@@ -166,6 +166,7 @@ class MainBar(QFrame):
         self.action_reconcile_paths.setToolTip(
             "Localiza no disco arquivos que foram movidos de pasta e atualiza seus endereços no banco, preservando todas as tags.")
         self.action_deduplicate_hash = QAction("🧹 Deduplicar Fotos por Hash", self)
+        self.action_shortcut_migration = QAction("Incorporar Meu Drive mantendo atalhos", self)
         self.action_deduplicate_hash.setToolTip(
             "Localiza fotos duplicadas por hash MD5, funde tags e nomes diferentes e move excedentes para Banco_Apagado.")
         self.action_clear_cache = QAction("🧹 Limpar Cache", self)
@@ -215,6 +216,7 @@ class MainBar(QFrame):
         self.menu_utils = QMenu("🛠️ Utilitários", self.tools_menu)
         self.menu_utils.addAction(self.action_scan_options)
         self.menu_utils.addAction(self.action_sync_drive)
+        self.menu_utils.addAction(self.action_shortcut_migration)
         self.menu_utils.addAction(self.action_clear_cache)
         self.menu_utils.addSeparator()
         self.action_advanced_settings = QAction("⚙️ Avançado / Sistema", self)

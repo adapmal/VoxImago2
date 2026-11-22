@@ -17,6 +17,7 @@ data/file_index.db
 data/file_index.db-*
 data/queue_autosave/
 data/dedup/
+data/shortcut_migration/
 data/catalog_backups/
 data/*.adoption.json
 data/voximago-instance.lock
