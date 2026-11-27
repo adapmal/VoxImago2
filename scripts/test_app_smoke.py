@@ -78,6 +78,29 @@ class AppSmokeTests(unittest.TestCase):
             self.assertTrue(window.indexer.search_index_is_consistent()[0])
             self.assertIsNotNone(window.details_panel)
 
+    def test_pending_folders_are_virtual_and_cancelling_keeps_real_folders(self):
+        with self._offline_window() as (window, temp):
+            root = temp / 'VirtualRoot'
+            root.mkdir()
+            tree = window.folder_tree
+            tree.set_root_directory(str(root))
+            queue = window.main_bar.staging_queue
+            with patch('src.ui.folder_tree_widget.QInputDialog.getText', return_value=('Nova', True)):
+                tree.create_new_folder(str(root))
+            target = root / 'Nova'
+            self.assertFalse(target.exists())
+            self.assertEqual(1, len(queue.items))
+            self.assertEqual(1, tree.pending_tree.topLevelItemCount())
+            with patch('src.ui.folder_tree_widget.QInputDialog.getText', return_value=('Filha', True)):
+                tree.create_new_folder(str(target))
+            self.assertFalse((target / 'Filha').exists())
+            self.assertEqual(2, len(queue.items))
+            # Uma pasta criada externamente não pertence à prévia; limpar não a apaga.
+            target.mkdir()
+            queue.clear(discard_placeholder=True)
+            self.assertTrue(target.exists())
+            self.assertEqual(0, tree.pending_tree.topLevelItemCount())
+
     def test_delete_queue_preserves_page_scroll_and_selection(self):
         with (
             self._offline_window() as (window, temp_dir),
@@ -223,6 +246,68 @@ class AppSmokeTests(unittest.TestCase):
                 os.path.normcase(os.path.normpath(str(dir_b))),
                 os.path.normcase(os.path.normpath(window.current_folder_path_filter or '')),
             )
+
+    def test_all_popups_enable_text_selection_except_thumbnails(self):
+        from PyQt6.QtGui import QPixmap
+        from PyQt6.QtWidgets import QDialog, QLabel, QMessageBox, QTableWidget, QVBoxLayout
+        from src.ui.popup_text_selection import install_popup_text_selection
+
+        install_popup_text_selection(self.app)
+
+        msg = QMessageBox(QMessageBox.Icon.Warning, 'Aviso', 'Erro detalhado 403 userRateLimitExceeded')
+        msg.setInformativeText('Detalhes adicionais copiáveis')
+        try:
+            msg.show()
+            self.app.processEvents()
+            expected = (
+                Qt.TextInteractionFlag.TextSelectableByMouse
+                | Qt.TextInteractionFlag.TextSelectableByKeyboard
+            )
+            self.assertEqual(expected, msg.textInteractionFlags() & expected)
+            text_labels = [l for l in msg.findChildren(QLabel) if l.objectName() != 'qt_msgboxex_icon_label' and l.text()]
+            self.assertTrue(text_labels)
+            for lbl in text_labels:
+                self.assertEqual(expected, lbl.textInteractionFlags() & expected)
+        finally:
+            msg.close()
+
+        dlg = QDialog()
+        layout = QVBoxLayout(dlg)
+        status_lbl = QLabel('Mensagem copiável de status')
+        tab_lbl = QLabel('Label com TabFocus preservado')
+        tab_lbl.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        strong_lbl = QLabel('Label com foco por Tab preservado')
+        strong_lbl.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        thumb_lbl = QLabel('Miniatura')
+        thumb_lbl.setObjectName('thumbnail_label')
+        pix_lbl = QLabel()
+        pix_lbl.setPixmap(QPixmap(16, 16))
+        tbl = QTableWidget(1, 1)
+        cell_lbl = QLabel('Célula de tabela não interceptada')
+        tbl.setCellWidget(0, 0, cell_lbl)
+        for w in (status_lbl, tab_lbl, strong_lbl, thumb_lbl, pix_lbl, tbl):
+            layout.addWidget(w)
+        try:
+            dlg.show()
+            self.app.processEvents()
+            self.assertTrue(bool(status_lbl.textInteractionFlags() & Qt.TextInteractionFlag.TextSelectableByMouse))
+            self.assertEqual(Qt.FocusPolicy.ClickFocus, status_lbl.focusPolicy())
+            self.assertTrue(bool(tab_lbl.textInteractionFlags() & Qt.TextInteractionFlag.TextSelectableByMouse))
+            self.assertEqual(Qt.FocusPolicy.StrongFocus, tab_lbl.focusPolicy())
+            self.assertTrue(bool(strong_lbl.textInteractionFlags() & Qt.TextInteractionFlag.TextSelectableByMouse))
+            self.assertEqual(Qt.FocusPolicy.StrongFocus, strong_lbl.focusPolicy())
+            self.assertFalse(bool(thumb_lbl.textInteractionFlags() & Qt.TextInteractionFlag.TextSelectableByMouse))
+            self.assertFalse(bool(pix_lbl.textInteractionFlags() & Qt.TextInteractionFlag.TextSelectableByMouse))
+            self.assertFalse(bool(cell_lbl.textInteractionFlags() & Qt.TextInteractionFlag.TextSelectableByMouse))
+
+            dynamic_lbl = QLabel('Mensagem dinâmica posterior')
+            layout.addWidget(dynamic_lbl)
+            dynamic_lbl.show()
+            self.app.processEvents()
+            self.assertTrue(bool(dynamic_lbl.textInteractionFlags() & Qt.TextInteractionFlag.TextSelectableByMouse))
+            self.assertEqual(Qt.FocusPolicy.ClickFocus, dynamic_lbl.focusPolicy())
+        finally:
+            dlg.close()
 
 
 if __name__ == '__main__':

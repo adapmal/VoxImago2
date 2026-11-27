@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
 
 from src.services.shortcut_migration import MigrationJournal, ShortcutMigrationWorker
 from src.utils.config_manager import ConfigManager
+from src.ui.review_table import ReviewTable
 
 
 class ShortcutMigrationDialog(QDialog):
@@ -41,14 +42,14 @@ class ShortcutMigrationDialog(QDialog):
         self.source = QLineEdit()
         self.destination = QLineEdit()
         self.source.setPlaceholderText('https://drive.google.com/drive/folders/...')
-        self.destination.setPlaceholderText('Pasta dentro do Drive compartilhado Banco de Imagens')
+        self.destination.setPlaceholderText('Link ou ID de pasta no Banco de Imagens (sugestão: ANO/Organizar)')
         form.addRow('Pasta de origem — Meu Drive:', self.source)
         form.addRow('Pasta de destino — Banco de Imagens:', self.destination)
         layout.addLayout(form)
         layout.addWidget(QLabel('Duplicatas → _TestesBanco / Banco_Apagado / APAGAR (sem exclusão definitiva).'))
         rules = QLabel(
             'O destino receberá uma pasta com o nome da origem e suas subpastas. Colisões '
-            'de nomes recebem sufixo por ID. Havendo várias cópias no banco, o alvo será a '
+            'de nomes recebem sufixo por ID, mostrado na prévia antes de aprovar. Havendo várias cópias no banco, o alvo será a '
             'mais antiga por data de criação (ID como desempate); confira o ID na tabela. '
             'As descrições dos arquivos são preservadas; a descrição da cópia já existente '
             'no banco não é modificada. Arquivos sem hash ficam bloqueados.')
@@ -68,8 +69,9 @@ class ShortcutMigrationDialog(QDialog):
         self.status = QLabel('Pronto para analisar. A análise não move arquivos nem cria atalhos.')
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(['Aplicar', 'Arquivo / caminho original', 'Ação', 'Alvo do atalho (ID)', 'Estado / aviso'])
+        self.table = ReviewTable(0, 6)
+        self.table.verticalHeader().setDefaultSectionSize(48)
+        self.table.setHorizontalHeaderLabels(['Aplicar', 'Arquivo / caminho original', 'Ação', 'Alvo do atalho (ID)', 'Destino / nome aprovado', 'Estado / aviso'])
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setColumnWidth(0, 55)
@@ -83,9 +85,16 @@ class ShortcutMigrationDialog(QDialog):
         self.page_label = QLabel()
         self.select_all = QPushButton('Marcar elegíveis')
         self.select_none = QPushButton('Desmarcar todos')
+        self.mark_selected = QPushButton('Marcar seleção')
+        self.unmark_selected = QPushButton('Desmarcar seleção')
         for widget in (self.previous, self.page_label, self.next, self.select_all, self.select_none):
             pages.addWidget(widget)
         layout.addLayout(pages)
+        selection_controls = QHBoxLayout()
+        selection_controls.addWidget(QLabel('Shift: intervalo · Ctrl: seleção múltipla · Espaço: alternar Aplicar (página atual)'))
+        selection_controls.addWidget(self.mark_selected)
+        selection_controls.addWidget(self.unmark_selected)
+        layout.addLayout(selection_controls)
         self.access = QCheckBox('Confirmei que os usuários da origem têm acesso aos arquivos no Banco de Imagens.')
         layout.addWidget(self.access)
         warning = QLabel('Atalhos não concedem acesso ao alvo. Mover ao Drive compartilhado muda a propriedade para a organização '
@@ -112,6 +121,8 @@ class ShortcutMigrationDialog(QDialog):
         self.next.clicked.connect(lambda: self._change_page(1))
         self.select_all.clicked.connect(lambda: self._select(True))
         self.select_none.clicked.connect(lambda: self._select(False))
+        self.mark_selected.clicked.connect(lambda: self.table.set_selected_checked(True))
+        self.unmark_selected.clicked.connect(lambda: self.table.set_selected_checked(False))
         self.access.toggled.connect(self._buttons)
         self.table.itemChanged.connect(self._checked)
         self.table.cellDoubleClicked.connect(self._open_target)
@@ -184,7 +195,8 @@ class ShortcutMigrationDialog(QDialog):
                           preparing='Em preparação', shortcut_confirmed='Atalho confirmado')
             target_label = (row.get('target_name') or row['source']['name']) + '\n' + row['target_id']
             values = [' / '.join(row['parts']), 'Duplicata → APAGAR' if row['action'] == 'duplicate' else 'Incorporar ao banco',
-                      target_label, row.get('error') or states.get(row.get('state'), 'Pendente')]
+                      target_label, ' / '.join(row.get('destination_parts', [])) or 'Reanalise para aprovar o destino',
+                      row.get('error') or states.get(row.get('state'), 'Pendente')]
             for col, value in enumerate(values, 1):
                 cell = QTableWidgetItem(value)
                 cell.setToolTip(value)
@@ -221,7 +233,8 @@ class ShortcutMigrationDialog(QDialog):
 
     def _buttons(self):
         for widget in (self.source, self.destination, self.analyze, self.history, self.resume,
-                       self.table, self.select_all, self.select_none, self.access, self.close_button):
+                       self.table, self.select_all, self.select_none, self.mark_selected, self.unmark_selected,
+                       self.access, self.close_button):
             widget.setEnabled(not self.busy)
         self.cancel.setEnabled(self.busy)
         count = len(self.plan['items']) if self.plan else 0

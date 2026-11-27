@@ -38,6 +38,8 @@ class list_update:
         desc_overlay = {}  # {file_id / path_lower: updated_description}
 
         for it in staging_queue.items:
+            if getattr(it, 'execution_state', 'pending') in ('local_applied', 'waiting_cloud'):
+                continue  # O catálogo já representa o efeito real; não recriar uma prévia antiga.
             fid_key = os.path.normcase(os.path.normpath(it.file_id)) if it.file_id else ''
             path_key = os.path.normcase(os.path.normpath(it.path)) if it.path else ''
 

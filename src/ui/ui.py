@@ -125,6 +125,26 @@ class DriveFileGalleryApp(QMainWindow):
         dlg = ShortcutMigrationDialog(self, indexer=self.indexer, drive_service=self.service)
         dlg.exec()
 
+    def _open_name_disambiguation(self):
+        from src.ui.name_disambiguation_dialog import NameDisambiguationDialog
+        dlg = NameDisambiguationDialog(self, indexer=self.indexer, drive_service=self.service)
+        dlg.exec()
+
+    def _open_shortcut_audit(self):
+        from src.ui.shortcut_audit_dialog import ShortcutAuditDialog
+        dlg = ShortcutAuditDialog(self, indexer=self.indexer, drive_service=self.service)
+        dlg.exec()
+
+    def _open_insync_suffix_repair(self):
+        from src.ui.insync_suffix_repair_dialog import InsyncSuffixRepairDialog
+        dlg = InsyncSuffixRepairDialog(self, indexer=self.indexer, drive_service=self.service)
+        dlg.exec()
+
+    def _open_raw_tag_sync(self):
+        from src.ui.raw_tag_sync_dialog import RawTagSyncDialog
+        dlg = RawTagSyncDialog(self, indexer=self.indexer, drive_service=self.service)
+        dlg.exec()
+
     def _start_path_reconciliation(self):
         if self.maintenance_running or self.queue_execution_running or self.drive_sync_running:
             QMessageBox.information(
@@ -208,6 +228,8 @@ class DriveFileGalleryApp(QMainWindow):
     def __init__(self):
         print('DEBUG: DriveFileGalleryApp.__init__ INICIO')
         super().__init__()
+        from src.ui.popup_text_selection import install_popup_text_selection
+        install_popup_text_selection()
         self.setWindowTitle("VoxImago - Galeria de Arquivos")
         self.setMinimumSize(1260, 660)
 
@@ -494,9 +516,15 @@ class DriveFileGalleryApp(QMainWindow):
             self._reindex_local_files)
         self.main_bar.action_reconcile_paths.triggered.connect(
             self._start_path_reconciliation)
+        self.main_bar.action_insync_suffix_repair.triggered.connect(
+            self._open_insync_suffix_repair)
+        self.main_bar.action_raw_tag_sync.triggered.connect(
+            self._open_raw_tag_sync)
         self.main_bar.action_deduplicate_hash.triggered.connect(
             self._open_hash_deduplicator)
         self.main_bar.action_shortcut_migration.triggered.connect(self._open_shortcut_migration)
+        self.main_bar.action_name_disambiguation.triggered.connect(self._open_name_disambiguation)
+        self.main_bar.action_shortcut_audit.triggered.connect(self._open_shortcut_audit)
         self.main_bar.action_clear_cache.triggered.connect(
             self.clear_thumbnail_cache)
         self.main_bar.action_advanced_settings.triggered.connect(
@@ -554,6 +582,11 @@ class DriveFileGalleryApp(QMainWindow):
         self._prev_move_items, self._prev_delete_items = self._staging_action_snapshots()
         self._suppress_staging_reload = False
         self.main_bar.staging_queue.queueChanged.connect(self._on_staging_queue_changed)
+        self.queue_confirmation_timer = QTimer(self)
+        self.queue_confirmation_timer.setInterval(60000)
+        self.queue_confirmation_timer.timeout.connect(self._check_queue_confirmations)
+        self.queue_confirmation_timer.start()
+        self._queue_confirmation_worker = None
 
         self.details_panel = FileDetailsPanel(self)
         
@@ -1155,6 +1188,50 @@ class DriveFileGalleryApp(QMainWindow):
             return False
         self.queue_execution_running = True
         return True
+
+    def _check_queue_confirmations(self):
+        """Somente reconcilia operações já aprovadas; nunca executa pendentes."""
+        queue = self.main_bar.staging_queue
+        if (self._queue_confirmation_worker or queue.busy or queue.load_error
+                or self.queue_execution_running or self.drive_sync_running or self.maintenance_running
+                or not self.service or self.config_mgr.is_read_only()):
+            return
+        if any(t and t.isRunning() for t in (self.inc_sync_thread, self.local_scan_thread, queue._autosave_worker)):
+            return
+        from src.services.contextual_queue import ACTIVE, ContextQueueWorker
+        pending = [i.operation_id for i in queue.items if i.execution_state in ACTIVE]
+        if not pending:
+            return
+        if not self.begin_maintenance_operation():
+            return
+        self._queue_confirmation_result = {}
+        offset = getattr(self, '_queue_confirmation_offset', 0) % len(pending)
+        selected = (pending[offset:] + pending[:offset])[:50]
+        self._queue_confirmation_offset = (offset + len(selected)) % len(pending)
+        self._queue_confirmation_worker = ContextQueueWorker(queue.store.path, queue.store.legacy_path,
+            self.indexer.db_name, self.service, selected=selected, check_only=True, parent=self)
+        self._queue_confirmation_worker.result.connect(lambda r: setattr(self, '_queue_confirmation_result', r))
+        self._queue_confirmation_worker.failed.connect(lambda message: logging.warning('Confirmação da fila: %s', message))
+        self._queue_confirmation_worker.finished.connect(self._queue_confirmations_finished)
+        self._queue_confirmation_worker.start()
+
+    def _queue_confirmations_finished(self):
+        from src.utils.staging_schema import StagingItem
+        queue = self.main_bar.staging_queue
+        try:
+            queue.items = [StagingItem.from_dict(r) for r in queue.store.load()]
+            queue._tag_index = None
+        except Exception as exc:
+            queue.load_error = str(exc)
+        self._queue_confirmation_worker.deleteLater()
+        self._queue_confirmation_worker = None
+        self.end_maintenance_operation()
+        queue.queueChanged.emit(queue.count())
+        result = self._queue_confirmation_result
+        if result.get('applied'):
+            self._force_refresh_after_sync()
+        if result.get('completed'):
+            self.status_bar.showMessage(f'Fila: {result["completed"]} operação(ões) confirmada(s) no Drive.', 8000)
 
     def end_queue_execution(self):
         self.queue_execution_running = False

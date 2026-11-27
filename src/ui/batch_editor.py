@@ -90,11 +90,25 @@ class BatchEditorDialog(QDialog):
             return
 
         queue = StagingQueue()
-        count = queue.add_batch_tags(self.selected_files, tags_to_add=tags_add, tags_to_remove=tags_remove)
+        win = self.parent().window() if self.parent() else None
+        db_path = win.indexer.db_name if (win and hasattr(win, 'indexer') and win.indexer) else None
+        count = queue.add_batch_tags(
+            self.selected_files,
+            tags_to_add=tags_add,
+            tags_to_remove=tags_remove,
+            db_path=db_path,
+        )
+
+        if count == 0:
+            QMessageBox.information(
+                self, "Nenhuma Alteração Necessária",
+                "Nenhum arquivo precisou ser alterado na Fila de Revisão (ou a edição foi cancelada)."
+            )
+            return
 
         QMessageBox.information(
             self, "Edição Agendada",
-            f"Adicionadas {count} alteração(ões) para {len(self.selected_files)} arquivo(s) na Fila de Revisão.\n\n"
+            f"Agendadas {count} alteração(ões) na Fila de Revisão (selecionados + eventuais pares RAW ↔ Cópia).\n\n"
             "Clique no ícone da Fila de Revisão (📋) para visualizar ou confirmar as alterações."
         )
         self.accept()

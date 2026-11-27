@@ -18,19 +18,21 @@ from urllib.parse import urlparse, parse_qs
 from PyQt6.QtCore import QObject, pyqtSignal
 from googleapiclient.errors import HttpError
 
+from src.services.drive_retry import execute_drive_read
 from src.services.hash_deduplicator import (
     DriveCatalog, FOLDER_MIME, META_FIELDS, DedupCancelled,
     escape_query, private_service,
 )
 from src.services.snapshot_management import assert_queue_empty
 from src.utils.config_manager import ConfigManager
+from src.services.name_safety import name_key, safe_windows_name
 
 SHORTCUT = 'application/vnd.google-apps.shortcut'
 FIELDS = META_FIELDS + ',shortcutDetails,appProperties,webViewLink'
 MARKER = 'voximagoMigrationKey'
 
 
-def folder_id(value):
+def folder_id(value, label='Pasta'):
     value = value.strip()
     if value.startswith('https://'):
         parsed = urlparse(value)
@@ -38,8 +40,10 @@ def folder_id(value):
             raise ValueError('Use um link de pasta do Google Drive ou seu ID.')
         match = re.search(r'/folders/([\w-]+)', parsed.path)
         value = match.group(1) if match else parse_qs(parsed.query).get('id', [''])[0]
-    if not re.fullmatch(r'[A-Za-z0-9_-]+', value) or value == 'root':
-        raise ValueError('Informe uma pasta específica, não a raiz inteira de Meu Drive.')
+    if value == 'root':
+        raise ValueError(f'{label}: informe uma pasta específica, não a raiz inteira de Meu Drive.')
+    if not re.fullmatch(r'[A-Za-z0-9_-]+', value):
+        raise ValueError(f'{label}: informe um link ou ID de pasta do Google Drive, não um caminho local.')
     return value
 
 
@@ -56,36 +60,56 @@ def same_content(a, b):
         and a['sha256Checksum'] != b['sha256Checksum']))
 
 
-def unchanged_file(before, after):
-    return all(before.get(k) == after.get(k) for k in
-               ('id', 'name', 'parents', 'driveId', 'size', 'md5Checksum',
-                'sha256Checksum', 'description', 'version', 'trashed'))
+_IDENTITY_FIELDS_NO_VERSION = (
+    'id', 'name', 'parents', 'driveId', 'size', 'md5Checksum',
+    'sha256Checksum', 'description', 'trashed',
+)
+
+
+def unchanged_file(before, after, *, check_version=True):
+    fields = (*_IDENTITY_FIELDS_NO_VERSION, 'version') if check_version else _IDENTITY_FIELDS_NO_VERSION
+    return all(before.get(k) == after.get(k) for k in fields)
 
 
 class MigrationAPI(DriveCatalog):
     def get(self, fid):
-        request = self.service.files().get(fileId=fid, supportsAllDrives=True, fields=FIELDS)
         headers = {}
-        if hasattr(request, 'add_response_callback'):
-            request.add_response_callback(lambda response: headers.update(response))
-        item = request.execute()
+
+        def make_request():
+            headers.clear()
+            request = self.service.files().get(fileId=fid, supportsAllDrives=True, fields=FIELDS)
+            if hasattr(request, 'add_response_callback'):
+                request.add_response_callback(lambda response: headers.update(response))
+            return request
+
+        item = execute_drive_read(
+            make_request,
+            cancelled=self.cancelled,
+            cancel_error=DedupCancelled,
+            on_wait=self.on_wait,
+        )
         item['_etag'] = headers.get('etag') or headers.get('ETag')
         return item
 
-    def listing(self, query, drive=None):
+    def listing(self, query, drive=None, fields=FIELDS):
         token, seen = None, set()
         while True:
             if self.cancelled():
                 raise DedupCancelled('Operação cancelada.')
             args = dict(q=query, pageSize=1000, supportsAllDrives=True,
                         includeItemsFromAllDrives=True,
-                        fields=f'nextPageToken,incompleteSearch,files({FIELDS})',
+                        fields=f'nextPageToken,incompleteSearch,files({fields})',
                         corpora='drive' if drive else 'user')
             if drive:
                 args['driveId'] = drive
             if token:
                 args['pageToken'] = token
-            page = self.service.files().list(**args).execute()
+            page = execute_drive_read(
+                lambda a=args: self.service.files().list(**a),
+                cancelled=self.cancelled,
+                cancel_error=DedupCancelled,
+                on_wait=self.on_wait,
+            )
             if page.get('incompleteSearch'):
                 raise ValueError('Inventário incompleto do Drive. Análise interrompida.')
             yield from page.get('files', [])
@@ -196,7 +220,10 @@ class ShortcutMigration:
         self.archive_drive = cfg.get('sandbox_drive_id')
         if not self.bank or not self.archive_drive or self.bank == self.archive_drive:
             raise ValueError('Configure os Drives distintos Banco de Imagens e _TestesBanco.')
-        self.api = MigrationAPI(private_service(service), self.bank, cancelled)
+        self.api = MigrationAPI(
+            private_service(service), self.bank, cancelled,
+            on_wait=lambda msg: self.progress(-1, msg),
+        )
         self._destination_names = {}
 
     def check_cancelled(self):
@@ -216,14 +243,21 @@ class ShortcutMigration:
     def _is_own_my_drive_root(self, source):
         if source.get('parents'):
             return False
-        own_root = self.api.service.files().get(fileId='root', fields='id').execute()
+        own_root = execute_drive_read(
+            lambda: self.api.service.files().get(fileId='root', fields='id'),
+            cancelled=self.cancelled,
+            cancel_error=DedupCancelled,
+            on_wait=self.api.on_wait,
+        )
         return bool(own_root.get('id') and own_root.get('id') == source['id'])
 
     def scan(self, source, destination):
-        source = self.folder(folder_id(source), writable=True)
+        source_id = folder_id(source, 'Origem')
+        destination_id = folder_id(destination, 'Destino')
+        source = self.folder(source_id, writable=True)
         if self._is_own_my_drive_root(source):
             raise ValueError('Escolha uma pasta dentro de Meu Drive, não sua raiz.')
-        destination = self.folder(folder_id(destination), self.bank, writable=True)
+        destination = self.folder(destination_id, self.bank, writable=True)
         self.folder(self.archive_drive, self.archive_drive, writable=True)
         plan = dict(id=uuid.uuid4().hex, source=source, destination=destination,
                     bank=self.bank, archive_drive=self.archive_drive, folders=[], items=[], skipped_shortcuts=0)
@@ -277,12 +311,70 @@ class ShortcutMigration:
                 plan['items'].append(row)
             stack.extend(reversed(subfolders))
             self.progress(-1, f'Origem: {len(visited):,} pastas; {len(plan["items"]):,} arquivos analisados...')
+        self.plan_names(plan)
         journal = MigrationJournal(self.db_name)
         try:
             journal.save_plan(plan)
         finally:
             journal.close()
         return plan
+
+    def plan_names(self, plan):
+        """Prévia somente leitura, inclusive pastas novas e conflitos dentro do lote."""
+        folders, inventories = {}, {}
+        def children(parent, drive):
+            key = (drive, parent)
+            if key not in inventories:
+                inventories[key] = self.api.children_of(parent, drive) if parent else []
+            return inventories[key]
+        occupied = {}
+        for entry in plan['folders']:
+            self.check_cancelled()
+            meta = entry['meta']
+            ancestor = folders.get((meta.get('parents') or [''])[0])
+            parent = plan['destination']['id'] if meta['id'] == plan['source']['id'] else ancestor['remote_id']
+            parent_key = parent or 'planned:' + meta['parents'][0]
+            siblings = children(parent, self.bank)
+            names = occupied.setdefault(parent_key, {name_key(x['name']) for x in siblings})
+            key = self.key('folder', meta['id'], parent) if parent else None
+            owned = [x for x in siblings if key and x.get('appProperties', {}).get(MARKER) == key]
+            if len(owned) > 1:
+                raise ValueError('Pasta de destino ambígua; revise antes de importar.')
+            name = owned[0]['name'] if owned else meta['name']
+            if not owned and name_key(name) in names:
+                name += ' [origem ' + meta['id'] + ']'
+            if ((not owned and name_key(name) in names) or not safe_windows_name(name)):
+                raise ValueError('Nome de pasta indisponível/incompatível: ' + name)
+            if owned and (owned[0].get('mimeType') != FOLDER_MIME or
+                          sum(name_key(x['name']) == name_key(name) for x in siblings) != 1):
+                raise ValueError('Pasta de destino ambígua: ' + name)
+            names.add(name_key(name))
+            entry.update(planned_name=name, remote_id=owned[0]['id'] if owned else None,
+                         destination_parts=(ancestor['destination_parts'] if ancestor else [plan['destination']['name']]) + [name])
+            folders[meta['id']] = entry
+        archive = self.archive_drive
+        for name in ('Banco_Apagado', 'APAGAR'):
+            matches = [x for x in children(archive, self.archive_drive) if name_key(x['name']) == name_key(name)] if archive else []
+            if len(matches) > 1 or matches and matches[0]['mimeType'] != FOLDER_MIME:
+                raise ValueError('Pasta de arquivo ambígua: ' + name)
+            archive = matches[0]['id'] if matches else None
+        for row in plan['items']:
+            folder = folders[row['source']['parents'][0]]
+            duplicate = row['action'] == 'duplicate'
+            parent = archive if duplicate else folder['remote_id']
+            drive = self.archive_drive if duplicate else self.bank
+            key = 'archive' if duplicate else (parent or 'planned:' + row['source']['parents'][0])
+            names = occupied.setdefault(key, {name_key(x['name']) for x in children(parent, drive)})
+            name = row['source']['name']
+            if name_key(name) in names:
+                stem, dot, ext = name.rpartition('.')
+                name = (stem if dot else name) + ' [' + row['source']['id'] + ']' + ('.' + ext if dot else '')
+            if name_key(name) in names or not safe_windows_name(name):
+                row['error'] = 'Nome final ocupado ou incompatível com Windows; revisão necessária.'
+            names.add(name_key(name))
+            row['destination_name'] = name
+            row['destination_parts'] = (['_TestesBanco', 'Banco_Apagado', 'APAGAR'] if duplicate else folder['destination_parts']) + [name]
+        plan['name_plan_version'] = 1
 
     @staticmethod
     def key(*parts):
@@ -334,7 +426,7 @@ class ShortcutMigration:
     def ensure_archive(self, journal):
         parent = self.archive_drive
         for name in ('Banco_Apagado', 'APAGAR'):
-            children = [v for v in self.api.children_of(parent, self.archive_drive) if v['name'] == name]
+            children = [v for v in self.api.children_of(parent, self.archive_drive) if name_key(v['name']) == name_key(name)]
             if len(children) > 1 or children and children[0]['mimeType'] != FOLDER_MIME:
                 raise ValueError('Pasta de arquivo ambígua: ' + name)
             if children:
@@ -345,16 +437,26 @@ class ShortcutMigration:
                 parent = obj['id']
         return parent
 
-    def mirrored_folder(self, journal, source_folder, parent):
+    def mirrored_folder(self, journal, source_folder, parent, planned_name=None):
         key = self.key('folder', source_folder['id'], parent)
         recorded = journal.object(key)
         if recorded:
-            return self.create_verified(journal, key, recorded[0], self.bank)
+            if recorded[0]['name'] != planned_name:
+                raise ValueError('Nome da pasta no diário diverge da prévia; revise a operação.')
+            confirmed = self.create_verified(journal, key, recorded[0], self.bank)
+            if any(x['id'] != confirmed['id'] and name_key(x['name']) == name_key(planned_name)
+                   for x in self.api.children_of(parent, self.bank)):
+                raise ValueError('Conflito novo no nome da pasta; interrompido para revisão.')
+            return confirmed
         children = self.api.children_of(parent, self.bank)
         owned = [x for x in children if x.get('appProperties', {}).get(MARKER) == key]
-        name = owned[0]['name'] if len(owned) == 1 else source_folder['name']
-        if not owned and any(x['name'].casefold() == name.casefold() for x in children):
-            name += ' [origem ' + source_folder['id'] + ']'
+        if not planned_name:
+            raise ValueError('Reanalise: esta revisão não possui nomes finais aprovados.')
+        name = planned_name
+        if len(owned) > 1 or owned and owned[0]['name'] != name:
+            raise ValueError('A pasta mudou desde a prévia; reanalise.')
+        if any(name_key(x['name']) == name_key(name) and (not owned or x['id'] != owned[0]['id']) for x in children):
+            raise ValueError('Nome de pasta planejado foi ocupado; reanalise.')
         return self.create_verified(journal, key, dict(name=name, parents=[parent], mimeType=FOLDER_MIME), self.bank)
 
     @staticmethod
@@ -399,13 +501,13 @@ class ShortcutMigration:
             if fresh['name'] != expected['name'] or (fresh.get('parents') or []) != (expected.get('parents') or []):
                 raise ValueError('Uma pasta da origem mudou desde a análise; faça nova análise.')
 
-    def destination_names(self, parent, drive):
+    def destination_names(self, parent, drive, refresh=False):
         # Uma leitura por pasta por execução, não uma listagem inteira de APAGAR
         # para cada duplicata. Retomar sempre começa com inventários novos.
         key = (drive, parent)
-        if key not in self._destination_names:
+        if refresh or key not in self._destination_names:
             self._destination_names[key] = {
-                item['name'].casefold() for item in self.api.children_of(parent, drive)
+                name_key(item['name']) for item in self.api.children_of(parent, drive)
             }
         return self._destination_names[key]
 
@@ -419,6 +521,8 @@ class ShortcutMigration:
                       uncertain_creates=[], journal=str(journal.path))
         try:
             plan = journal.load(job)
+            if plan.get('name_plan_version') != 1:
+                raise ValueError('Revisão antiga sem prévia de nomes finais. Faça uma nova análise antes de executar.')
             if plan['bank'] != self.bank or plan['archive_drive'] != self.archive_drive:
                 raise ValueError('Os Drives configurados mudaram desde a análise.')
             selected = set(selected)
@@ -442,7 +546,7 @@ class ShortcutMigration:
                 parent = (plan['destination']['id'] if meta['id'] == plan['source']['id']
                           else folders[meta['parents'][0]])
                 try:
-                    folders[meta['id']] = self.mirrored_folder(journal, meta, parent)['id']
+                    folders[meta['id']] = self.mirrored_folder(journal, meta, parent, f.get('planned_name'))['id']
                 except UncertainCreateError as exc:
                     result['errors'].append(f"{meta['name']}: {exc}")
                     result['uncertain_creates'].append(exc.object_key)
@@ -503,16 +607,10 @@ class ShortcutMigration:
                 raise ValueError('Permissão de movimentação indisponível.')
             self.folder(source_parent, writable=True)
             self.folder(dest_parent, dest_drive, writable=True)
-            names = self.destination_names(dest_parent, dest_drive)
+            names = self.destination_names(dest_parent, dest_drive, refresh=True)
             if not row.get('destination_name'):
-                name = original['name']
-                if name.casefold() in names:
-                    stem, dot, ext = name.rpartition('.')
-                    name = (stem if dot else name) + ' [' + original['id'] + ']' + ('.' + ext if dot else '')
-                if name.casefold() in names:
-                    raise ValueError('Nome de destino já ocupado; revisão necessária.')
-                row['destination_name'] = name
-            elif row['destination_name'].casefold() in names:
+                raise ValueError('Nome final não aprovado; reanalise.')
+            elif name_key(row['destination_name']) in names:
                 raise ValueError('Nome planejado foi ocupado desde a tentativa anterior; revisão necessária.')
         elif not row.get('destination_name') or fresh.get('name') != row['destination_name']:
             raise ValueError('Movimentação externa não registrada. Reanalise este arquivo.')
@@ -530,6 +628,8 @@ class ShortcutMigration:
             current = self.api.get(original['id'])
             if not unchanged_file(fresh, current):
                 raise ValueError('Arquivo mudou após a criação do atalho. Movimento bloqueado.')
+            if name_key(row['destination_name']) in self.destination_names(dest_parent, dest_drive, refresh=True):
+                raise ValueError('Nome ocupado após criar o atalho. Movimento bloqueado; revise o diário.')
             if row['action'] == 'duplicate':
                 again = self.api.get(target['id'])
                 if again.get('driveId') != self.bank or again.get('trashed') or not same_content(current, again):

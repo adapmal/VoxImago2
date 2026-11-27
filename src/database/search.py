@@ -11,6 +11,15 @@ import re
 import unicodedata
 import sqlite3
 import time
+import json
+import logging
+from src.services.name_history import (
+    build_drive_file_index,
+    historical_file_ids,
+    historical_file_ids_short,
+    history_path,
+    history_revision,
+)
 
 
 class SearchEngine:
@@ -21,22 +30,14 @@ class SearchEngine:
     def clear_cache(self):
         self._paged_cache.clear()
 
-    def parse_search_query(self, search_term):
+    @staticmethod
+    def _extract_inline_filters(search_term):
         filters = {}
-        terms = []
-        exclude_terms = []
-        or_groups = []
-        quoted = re.findall(r'"([^"]+)"', search_term)
-        for q in quoted:
-            terms.append(q)
-        search_term = re.sub(r'"[^"]+"', '', search_term)
         if 'is:starred' in search_term:
             filters['is_starred'] = True
             search_term = search_term.replace('is:starred', '')
-        match_before = re.search(
-            r'createdbefore:(\d{4}-\d{2}-\d{2})', search_term)
-        match_after = re.search(
-            r'createdafter:(\d{4}-\d{2}-\d{2})', search_term)
+        match_before = re.search(r'createdbefore:(\d{4}-\d{2}-\d{2})', search_term)
+        match_after = re.search(r'createdafter:(\d{4}-\d{2}-\d{2})', search_term)
         import datetime
         if match_before:
             filters['created_before'] = datetime.datetime.strptime(
@@ -46,13 +47,25 @@ class SearchEngine:
             filters['created_after'] = datetime.datetime.strptime(
                 match_after.group(1), '%Y-%m-%d')
             search_term = search_term.replace(match_after.group(0), '')
+        return search_term, filters
+
+    def parse_search_query(self, search_term):
+        filters = {}
+        terms = []
+        exclude_terms = []
+        or_groups = []
+        quoted = re.findall(r'"([^"]+)"', search_term)
+        for q in quoted:
+            terms.append(q)
+        search_term = re.sub(r'"[^"]+"', '', search_term)
+        search_term, filters = self._extract_inline_filters(search_term)
         symbol_tag_pattern = r'([<&#@][\w\d]+)'
         symbol_tags = re.findall(symbol_tag_pattern, search_term)
         for tag in symbol_tags:
             terms.append(tag)
         search_term = re.sub(symbol_tag_pattern, '', search_term)
-        exclude_terms += re.findall(r'-([\w<&#@][\w\d]+)', search_term)
-        search_term = re.sub(r'-([\w<&#@][\w\d]+)', '', search_term)
+        exclude_terms += re.findall(r'(?<!\S)-([\w<&#@][\w\d]+)', search_term)
+        search_term = re.sub(r'(?<!\S)-([\w<&#@][\w\d]+)', '', search_term)
         if ' or ' in search_term.lower():
             or_groups = [t.strip() for t in re.split(
                 r'(?i)\s+or\s+', search_term) if t.strip()]
@@ -64,6 +77,242 @@ class SearchEngine:
         terms = list(dict.fromkeys([t for t in terms if t]))
         exclude_terms = list(dict.fromkeys([t for t in exclude_terms if t]))
         return terms, exclude_terms, or_groups, filters
+
+    @staticmethod
+    def _find_grouping_close(text, open_idx):
+        depth = 0
+        in_quotes = False
+        n = len(text)
+        has_group_marker = False
+        j = open_idx
+        while j < n:
+            ch = text[j]
+            if ch == '"':
+                in_quotes = not in_quotes
+                has_group_marker = True
+            elif not in_quotes:
+                if ch == '(':
+                    depth += 1
+                    if j > open_idx:
+                        has_group_marker = True
+                elif ch == ')':
+                    depth -= 1
+                    if depth == 0:
+                        at_boundary = (j + 1 == n or text[j + 1].isspace() or text[j + 1] == ')')
+                        inner = text[open_idx + 1:j]
+                        if not at_boundary:
+                            return None
+                        if has_group_marker or any(c.isspace() for c in inner) or inner.startswith('-'):
+                            return j
+                        return None
+            j += 1
+        return None
+
+    @classmethod
+    def _tokenize_query(cls, text):
+        tokens = []
+        group_closes = set()
+        i, n = 0, len(text)
+        while i < n:
+            if text[i].isspace():
+                i += 1
+                continue
+            if i in group_closes:
+                group_closes.remove(i)
+                tokens.append(('RPAREN', ')'))
+                i += 1
+                continue
+            if text[i] == '(':
+                close_idx = cls._find_grouping_close(text, i)
+                if close_idx is not None:
+                    group_closes.add(close_idx)
+                    tokens.append(('LPAREN', '('))
+                    i += 1
+                    continue
+            if text[i] == '-' and i + 1 < n and (
+                    text[i + 1] in ('"', '(') or re.match(r'[\w<&#@]', text[i + 1])):
+                tokens.append(('MINUS', '-'))
+                i += 1
+                continue
+            if text[i] == '"':
+                end = text.find('"', i + 1)
+                if end == -1:
+                    inner = text[i + 1:].strip()
+                    i = n
+                else:
+                    inner = text[i + 1:end].strip()
+                    i = end + 1
+                if inner:
+                    tokens.append(('TERM', (inner, True)))
+                continue
+            start = i
+            while i < n and not text[i].isspace() and text[i] != '"' and not (text[i] == ')' and i in group_closes):
+                i += 1
+            word = text[start:i]
+            upper = word.upper()
+            if upper in ('OR', 'AND', 'NOT'):
+                tokens.append(('OP', upper))
+            elif word:
+                tokens.append(('TERM', (word, False)))
+        return tokens
+
+    @classmethod
+    def _parse_query_ast(cls, text):
+        tokens = cls._tokenize_query(text)
+        pos = [0]
+
+        def peek():
+            return tokens[pos[0]] if pos[0] < len(tokens) else None
+
+        def consume():
+            tok = tokens[pos[0]]
+            pos[0] += 1
+            return tok
+
+        def parse_primary():
+            tok = peek()
+            if not tok:
+                return None
+            if tok[0] == 'LPAREN':
+                consume()
+                inner = parse_or()
+                if peek() and peek()[0] == 'RPAREN':
+                    consume()
+                return inner
+            if tok[0] == 'TERM':
+                consume()
+                return ('TERM', tok[1][0], tok[1][1])
+            return None
+
+        def parse_not():
+            tok = peek()
+            if not tok:
+                return None
+            if tok[0] == 'MINUS' or tok == ('OP', 'NOT'):
+                consume()
+                child = parse_not()
+                return ('NOT', child) if child is not None else None
+            return parse_primary()
+
+        def parse_and():
+            while peek() and peek()[0] == 'OP' and peek()[1] in ('OR', 'AND'):
+                consume()
+            left = parse_not()
+            if left is None:
+                return None
+            while True:
+                tok = peek()
+                if not tok or tok[0] == 'RPAREN' or tok == ('OP', 'OR'):
+                    break
+                if tok == ('OP', 'AND'):
+                    consume()
+                rhs = parse_not()
+                if rhs is None:
+                    break
+                left = ('AND', left, rhs)
+            return left
+
+        def parse_or():
+            left = parse_and()
+            while peek() == ('OP', 'OR'):
+                consume()
+                rhs = parse_and()
+                if rhs is None:
+                    break
+                left = rhs if left is None else ('OR', left, rhs)
+            return left
+
+        ast = None
+        while pos[0] < len(tokens):
+            part = parse_or()
+            if part is not None:
+                ast = part if ast is None else ('AND', ast, part)
+            elif pos[0] < len(tokens):
+                pos[0] += 1
+        return ast
+
+    @staticmethod
+    def _fts_atom(term, quoted):
+        stripped = term.rstrip('*')
+        if (not quoted and len(stripped) >= 3 and re.fullmatch(r'\w+\*?', term)
+                and stripped.upper() not in ('AND', 'OR', 'NOT', 'NEAR')):
+            return term
+        return '"' + term.replace('"', '""') + '"'
+
+    def build_search_clause(self, search_term, source=None, explorer_special=False):
+        """Constrói SQL e parâmetros consistentes entre listagem paginada e contagem."""
+        norm_search_term = self.normalize_text(search_term)
+        remaining_text, extra_filters = self._extract_inline_filters(norm_search_term)
+        ast = self._parse_query_ast(remaining_text)
+        if ast is None and not extra_filters:
+            return None, [], extra_filters, True
+        if ast is None:
+            return None, [], extra_filters, False
+
+        sql_norm_name = "replace(replace(replace(replace(replace(replace(replace(replace(COALESCE(name_normalized, ''), '_', ' '), '-', ' '), '.', ' '), ',', ' '), '(', ' '), ')', ' '), '[', ' '), ']', ' ')"
+        sql_norm_desc = "replace(replace(replace(replace(replace(replace(replace(replace(COALESCE(description, ''), '_', ' '), '-', ' '), '.', ' '), ',', ' '), '(', ' '), ')', ' '), '[', ' '), ']', ' ')"
+        has_history = bool(getattr(self.indexer, 'db_name', None)) and history_path(self.indexer.db_name).exists()
+        drive_index_cache = [None]
+
+        def get_drive_index():
+            if drive_index_cache[0] is None:
+                drive_index_cache[0] = build_drive_file_index(self.indexer)
+            return drive_index_cache[0]
+
+        def eval_node(node):
+            kind = node[0]
+            if kind == 'AND':
+                l_sql, l_params = eval_node(node[1])
+                r_sql, r_params = eval_node(node[2])
+                return f'({l_sql} AND {r_sql})', l_params + r_params
+            if kind == 'OR':
+                l_sql, l_params = eval_node(node[1])
+                r_sql, r_params = eval_node(node[2])
+                return f'({l_sql} OR {r_sql})', l_params + r_params
+            if kind == 'NOT':
+                c_sql, c_params = eval_node(node[1])
+                return f'NOT ({c_sql})', c_params
+
+            _, val, quoted = node
+            clean_alpha = re.sub(r'^[<&#@]', '', val)
+            if len(clean_alpha) >= 3:
+                atom = self._fts_atom(val, quoted)
+                if explorer_special:
+                    cur_sql = "file_id IN (SELECT file_id FROM search_index WHERE (search_index MATCH ? OR normalized_name MATCH ? OR normalized_description MATCH ?) AND source = 'local')"
+                    cur_params = [atom, atom, atom]
+                elif source:
+                    cur_sql = "file_id IN (SELECT file_id FROM search_index WHERE (search_index MATCH ? OR normalized_name MATCH ? OR normalized_description MATCH ?) AND source = ?)"
+                    cur_params = [atom, atom, atom, source]
+                else:
+                    cur_sql = "file_id IN (SELECT file_id FROM search_index WHERE search_index MATCH ? OR normalized_name MATCH ? OR normalized_description MATCH ?)"
+                    cur_params = [atom, atom, atom]
+                aliases = []
+                if has_history:
+                    try:
+                        aliases = historical_file_ids(self.indexer, atom, drive_index=get_drive_index())
+                    except (sqlite3.Error, ValueError, OSError) as exc:
+                        logging.warning('Histórico de nomes indisponível na busca: %s', exc)
+            else:
+                cur_sql = f"(' ' || {sql_norm_name} || ' ' LIKE ? OR ' ' || {sql_norm_desc} || ' ' LIKE ?)"
+                cur_params = [f'% {val} %', f'% {val} %']
+                if explorer_special:
+                    cur_sql = f"({cur_sql} AND source = 'local')"
+                aliases = []
+                if has_history:
+                    try:
+                        aliases = historical_file_ids_short(self.indexer, val, drive_index=get_drive_index())
+                    except (sqlite3.Error, ValueError, OSError) as exc:
+                        logging.warning('Histórico de nomes indisponível na busca curta: %s', exc)
+
+            if aliases:
+                alias_sql = 'file_id IN (SELECT value FROM json_each(?))'
+                if explorer_special:
+                    alias_sql = f"({alias_sql} AND source = 'local')"
+                return f'({cur_sql} OR {alias_sql})', cur_params + [json.dumps(aliases)]
+            return cur_sql, cur_params
+
+        sql, params = eval_node(ast)
+        return sql, params, extra_filters, False
 
     def normalize_text(self, text):
         if not text:
@@ -100,7 +349,8 @@ class SearchEngine:
         if self.indexer.conn is None:
             return []
         cache_key = (source, page, page_size, search_term, sort_by,
-                     filter_type, folder_id, str(advanced_filters), explorer_special)
+                     filter_type, folder_id, str(advanced_filters), explorer_special,
+                     history_revision(self.indexer.db_name) if search_term else None)
         if cache_key in self._paged_cache:
             return self._paged_cache[cache_key]
         offset = page * page_size
@@ -119,86 +369,24 @@ class SearchEngine:
             norm_search_term = self.normalize_text(search_term)
             print(
                 f"Termo original: '{search_term}' -> Normalizado: '{norm_search_term}'")
-            terms, exclude_terms, or_groups, extra_filters = self.parse_search_query(
-                norm_search_term)
-
-            # Separar os termos de busca em fts_terms (para FTS5 MATCH, >= 3 letras)
-            # e like_terms (para filtro LIKE do SQL, < 3 letras)
-            def is_long_term(term):
-                clean_term = term.replace('"', '')
-                clean_term_alpha = re.sub(r'^[<&#@]', '', clean_term)
-                return len(clean_term_alpha) >= 3
-
-            def quote_if_short_or_symbol(term):
-                return f'"{term}"' if len(term) <= 4 or re.match(r'^[<&#@]', term) else term
-
-            raw_terms = or_groups if or_groups else terms
-            valid_raw_terms = [t.strip() for t in raw_terms if t and t.strip() and t.strip().upper() not in ['OR', 'AND'] and not t.startswith('-')]
-
-            fts_terms = []
-            like_terms = []
-
-            for t in valid_raw_terms:
-                if is_long_term(t):
-                    fts_terms.append(quote_if_short_or_symbol(t))
-                else:
-                    like_terms.append(t)
-
-            if not valid_raw_terms and not exclude_terms:
+            search_sql, search_params, extra_filters, empty_result = self.build_search_clause(
+                search_term, source=source, explorer_special=explorer_special)
+            if empty_result:
                 self._paged_cache[cache_key] = []
                 return []
-
-            file_ids_to_fetch = []
-            fts_query = ""
-
-            if fts_terms:
-                if or_groups:
-                    fts_query = ' OR '.join(fts_terms)
-                else:
-                    fts_query = ' '.join(fts_terms)
-                
-                long_exclude_terms = [et for et in exclude_terms if is_long_term(et)]
-                if long_exclude_terms:
-                    for et in long_exclude_terms:
-                        clean_et = et.replace('"', '')
-                        fts_query += f' NOT "{clean_et}"'
 
             where_parts = []
             filter_params = []
 
-            if fts_terms and fts_query.strip():
-                if explorer_special:
-                    where_parts.append("file_id IN (SELECT file_id FROM search_index WHERE (search_index MATCH ? OR normalized_name MATCH ? OR normalized_description MATCH ?) AND source = 'local')")
-                    filter_params.extend([fts_query, fts_query, fts_query])
-                elif source:
-                    where_parts.append("file_id IN (SELECT file_id FROM search_index WHERE (search_index MATCH ? OR normalized_name MATCH ? OR normalized_description MATCH ?) AND source = ?)")
-                    filter_params.extend([fts_query, fts_query, fts_query, source])
-                else:
-                    where_parts.append("file_id IN (SELECT file_id FROM search_index WHERE search_index MATCH ? OR normalized_name MATCH ? OR normalized_description MATCH ?)")
-                    filter_params.extend([fts_query, fts_query, fts_query])
+            if search_sql:
+                where_parts.append(search_sql)
+                filter_params.extend(search_params)
 
             if source:
                 where_parts.append("source = ?")
                 filter_params.append(source)
 
             where_parts.append("(path IS NOT NULL AND path != '')")
-
-            # Para termos de busca curtos (< 3 letras), fazemos correspondência de palavra inteira (whole word)
-            # substituindo delimitadores comuns por espaços, para evitar que "sé" case com "semana" ou "classe"
-            sql_norm_name = "replace(replace(replace(replace(replace(replace(replace(replace(name_normalized, '_', ' '), '-', ' '), '.', ' '), ',', ' '), '(', ' '), ')', ' '), '[', ' '), ']', ' ')"
-            sql_norm_desc = "replace(replace(replace(replace(replace(replace(replace(replace(description, '_', ' '), '-', ' '), '.', ' '), ',', ' '), '(', ' '), ')', ' '), '[', ' '), ']', ' ')"
-
-            for lt in like_terms:
-                where_parts.append(f"(' ' || {sql_norm_name} || ' ' LIKE ? OR ' ' || {sql_norm_desc} || ' ' LIKE ?)")
-                filter_params.append(f"% {lt} %")
-                filter_params.append(f"% {lt} %")
-
-            for et in exclude_terms:
-                clean_et = et.replace('"', '')
-                if not fts_terms or not is_long_term(et):
-                    where_parts.append(f"NOT (' ' || {sql_norm_name} || ' ' LIKE ? OR ' ' || {sql_norm_desc} || ' ' LIKE ?)")
-                    filter_params.append(f"% {clean_et} %")
-                    filter_params.append(f"% {clean_et} %")
 
             if extra_filters.get('is_starred'):
                 where_parts.append("starred = 1")

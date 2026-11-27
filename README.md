@@ -379,6 +379,116 @@ simultâneas nos arquivos envolvidos. A ferramenta atua diretamente no Drive;
 InSync/Drive Desktop e o catálogo local podem levar mais tempo para refletir os
 novos caminhos. Esta funcionalidade não substitui a revisão do sincronizador.
 
+### Fila contextual — aprovação, execução local e confirmação no Drive
+
+A fila agora distingue **pendente**, **bloqueado**, **resultado a conferir** e
+**aguardando Drive**. Preparar mover, renomear, excluir ou criar pasta não altera
+o disco. Pastas novas aparecem na seção **Pastas pendentes — ainda não criadas**;
+ela aceita arrastar arquivos e agendar subpastas. Limpar a fila nunca apaga uma
+pasta física (inclusive placeholders criados em versões anteriores).
+
+Após aprovação, nomes/pastas/lixeira são alterados no sistema de arquivos local;
+InSync ou Drive Desktop propaga o efeito. O VoxImago não envia esses movimentos
+pela API. Tags usam a API com releitura da descrição e escrita condicional:
+adição/remoção aplica diferenças ao texto atual; substituição bloqueia conflito.
+
+Cada arquivo recebe identidade interna persistente, separada do caminho. Depois
+de mover/renomear, as intenções pendentes e os caminhos dos filhos são atualizados
+na fila e no catálogo, mantendo miniaturas e rotação. Uma ação dependente espera
+a confirmação do estado remoto pelo ID. É possível aprovar apenas a renomeação
+antes do movimento; mover depois preserva o novo nome, salvo um nome de destino
+diferente explicitamente escolhido. Colisões não geram sufixos sem aprovação.
+
+**Conferir sincronização / operações interrompidas** faz releituras, não repete
+ações físicas. Há também conferência automática a cada minuto, em lotes de até
+50 itens, quando o aplicativo está livre. Dependentes liberados permanecem na
+fila para nova aprovação; a conferência não executa novas intenções. Cancelar
+interrompe entre operações, preservando etapas já efetuadas.
+
+O histórico append-only fica nas tabelas `context_*` de `data/staging_queue.db`,
+junto da fila, acessível em **Histórico de execução**. Resultados incertos não
+são repetidos: **Revisar tentativa incerta** exige confirmação humana e verifica
+disco/Drive antes de reconhecer efeito já ocorrido ou liberar nova tentativa.
+Não existe transação atômica entre disco, catálogo SQLite e nuvem, nem rollback
+automático. Falha entre etapas deixa evidência para reconciliação.
+
+Limitações deliberadas: execução requer conexão ao Drive, raiz local mapeada à
+raiz do Drive configurado e identidade não ambígua. Arquivo ausente não é buscado
+por nome no acervo inteiro. Operações entre unidades são bloqueadas para evitar
+cópias/hidratação inesperadas. Não se abre o conteúdo da mídia para mover;
+o provedor de arquivos online ainda pode impor suas próprias restrições.
+Arrastar do VoxImago para o Explorer não oferece mais URLs locais que permitiam
+mover fora da fila; operações manuais feitas diretamente no Explorer continuam
+externas ao controle do aplicativo. Deduplicador e incorporação por atalhos
+mantêm seus próprios fluxos de aprovação, separados desta fila.
+
+Filas JSON antigas continuam legíveis. Operações antigas com resultado incerto
+não ganham um ID novo ao importar, e pastas legadas que já existem exigem revisão.
+Não restaure uma cópia antiga sobre operações aplicadas ainda em confirmação.
+Antes de voltar ao checkpoint de código `06b95b1`, preserve também o banco da fila;
+voltar o código não desfaz operações no Drive ou no disco.
+
+### Desambiguar nomes no Drive e prevenir novas colisões
+
+Em **Ferramentas > Utilitários > Desambiguar nomes de arquivos no Drive**, use
+**Analisar Banco de Imagens**. A análise lê somente metadados e hashes, sem
+baixar mídias ou modificar o Drive. A revisão é persistente e paginada em 100
+linhas. Selecione com Shift/Ctrl; Espaço alterna Aplicar nas linhas selecionadas.
+Os botões de marcar todos abrangem todas as páginas. A execução exige aprovação
+explícita de todos os membros pendentes de cada grupo e fila de alterações vazia.
+
+- Compara nomes dentro do mesmo ID de pasta, incluindo diferenças de caixa e
+  equivalentes Unicode. Não remove parênteses legítimos dos nomes.
+- Para conteúdos distintos, propõe `_0`, `_1` etc. antes da extensão, ordenando
+  por criação no Drive e ID. Pula nomes já ocupados; não renumera itens que já
+  deixaram de conflitar.
+- Hash/tamanho repetidos bloqueiam o grupo para revisão no **Deduplicador por
+  Hash** existente. Não há exclusão automática, nem troca temporária de nome
+  para tentar forçar o cliente de sincronização.
+- Pastas, atalhos e arquivos sem hashes verificáveis são reportados e não são
+  renomeados automaticamente. Grupos parcialmente selecionados não executam.
+- Renomeia pelo ID, com ETag, revalidação da hierarquia, irmãos e conteúdo.
+  Descrições e bytes das mídias permanecem intactos. Mudanças concorrentes
+  interrompem a operação; não há trava global do Drive contra outro usuário.
+- Queda/timeout deixa a operação no diário. **Abrir / retomar revisão** permite
+  selecionar os itens e conferir o resultado antes de continuar. Uma tentativa
+  incerta que não possa ser confirmada NÃO é repetida automaticamente.
+- A confirmação é na nuvem, não nos clientes de sincronização. Aguarde os PCs
+  sincronizarem e atualize/reconcilie o catálogo. Timelines podem exigir religação.
+
+O diário fica em `data/name_disambiguation/journal.db`. Nomes e caminhos anteriores
+confirmados pela ferramenta ficam em `data/name_history/history.db`, separados
+do catálogo. A busca normal passa a consultar os nomes históricos, vinculando
+resultados somente pelo ID Drive existente no catálogo (não adivinha caminhos).
+O histórico não é um backup de mídia nem atualiza projetos Vegas/Premiere/After
+Effects. Nesta versão registra as renomeações desta ferramenta, não um histórico
+retroativo de todas as alterações externas.
+
+Use **Exportar histórico de nomes** para salvar um JSON na pasta compartilhada,
+e **Importar histórico de nomes** nas outras instalações. A distribuição é manual:
+não substitui snapshots/catálogos, não publica nada automaticamente na nuvem e
+não é incluída automaticamente no snapshot do banco principal. Guarde também
+esse histórico nos seus backups. Importação valida o formato, é transacional e
+nunca executa caminhos/operações descritos no arquivo.
+
+Na ferramenta **Incorporar Meu Drive**, a análise agora mostra o caminho e o
+nome final de cada arquivo, incluindo conflitos com pastas e dentro do lote.
+O sufixo por ID usado por essa ferramenta é escolhido na prévia, não silenciosamente
+na execução. Conflitos novos interrompem o item. Revisões antigas sem plano de
+nomes finais precisam de nova análise; o diário antigo é preservado. Os campos
+de origem/destino exigem link ou ID, não um caminho como `Teste\Fotos`.
+É possível usar `ANO/Organizar` como destino, mas isso não é imposto.
+
+Na fila contextual, **mover** verifica também MD5/tamanho de arquivos diretamente
+na pasta de destino, mesmo com outro nome, quando esses metadados estão disponíveis.
+Possíveis cópias bloqueiam a movimentação para revisão; não substituem nem excluem
+arquivos. A verificação de colisão é repetida antes do efeito local. Sem hash,
+permanece a proteção de nome/identidade, sem baixar o arquivo para calcular hash.
+
+Enquanto houver deduplicação/execução ativa, não reinicie o aplicativo para
+carregar estas mudanças. Os novos diálogos respeitam a exclusão de operações
+de manutenção da janela principal.
+
 ### Logs
 O log ativo fica em `logs/voximago.log`. Ele é arquivado ao atingir 25 MB
 ou na mudança do dia; os arquivos anteriores ficam comprimidos em

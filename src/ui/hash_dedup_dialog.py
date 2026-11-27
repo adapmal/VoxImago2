@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import logging
 from PyQt6.QtCore import Qt, QThread, QSize, QTimer, QEvent, pyqtSignal, QItemSelection, QItemSelectionModel, QPoint, QUrl
 from PyQt6.QtGui import QPixmap, QIcon, QDesktopServices, QTransform, QColor
 from PyQt6.QtWidgets import (
@@ -166,7 +167,7 @@ class HashDedupDialog(QDialog):
         super().__init__(parent)
         self.indexer = indexer
         self.drive_service = drive_service
-        self.db_path = indexer.db_name if indexer else os.path.join('data', 'file_index.db')
+        self.db_path = os.path.abspath(indexer.db_name if indexer else os.path.join('data', 'file_index.db'))
         self.groups: list[DuplicateGroup] = []
         self.scan_thread: QThread | None = None
         self.scan_worker: HashScanWorker | None = None
@@ -179,6 +180,9 @@ class HashDedupDialog(QDialog):
         self._review_restoring = False
         self._execution_in_flight = []
         self._save_future = None
+        self._closing_review = False
+        self._review_closed = False
+        self._close_error = ''
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(700)
@@ -198,7 +202,8 @@ class HashDedupDialog(QDialog):
         self._render_timer.timeout.connect(self._render_batch)
         self._hydrate_timer = QTimer(self)
         self._hydrate_timer.setSingleShot(True)
-        self._hydrate_timer.setInterval(16)
+        self._hydrate_timer.setTimerType(Qt.TimerType.PreciseTimer)
+        self._hydrate_timer.setInterval(12)
         self._hydrate_timer.timeout.connect(self._hydrate_visible_rows)
 
         self.setWindowTitle('🧹 Deduplicador de Fotos por Hash (MD5)')
@@ -376,7 +381,7 @@ class HashDedupDialog(QDialog):
         self.table.cellClicked.connect(self._on_table_cell_clicked)
         self.table.cellDoubleClicked.connect(self._on_table_cell_double_clicked)
         self.table.currentCellChanged.connect(self._on_current_cell_changed)
-        self.table.verticalScrollBar().valueChanged.connect(lambda _v: self._hydrate_timer.start())
+        self.table.verticalScrollBar().valueChanged.connect(self._schedule_hydration)
         review_layout.addWidget(self.table, 1)
 
         # Painel de detalhes acoplado à direita (reutiliza FileDetailsPanel em modo somente inspeção)
@@ -446,7 +451,9 @@ class HashDedupDialog(QDialog):
                     destination=self.dest_edit.text(), videos=self.chk_include_videos.isChecked(),
                     drive=ConfigManager().get('production_drive_id'))
 
-    def _save_review(self, *, wait=False):
+    def _save_review(self, *, wait=False, _final=False):
+        if self._review_closed or (self._closing_review and not _final):
+            return
         if self._review_load_failed or self._review_restoring:
             return
         self._save_timer.stop()
@@ -458,7 +465,7 @@ class HashDedupDialog(QDialog):
             self._save_check_timer.start()
 
     def _autosave_review(self):
-        if self._busy:
+        if self._busy or self._closing_review or self._review_closed:
             return  # O término da operação salva o novo estado coerente.
         try:
             self._save_review()
@@ -963,6 +970,8 @@ class HashDedupDialog(QDialog):
             d_item.setText(self._duplicates_fallback_text(grp))
 
     def _hydrate_visible_rows(self):
+        if self._closing_review or self._review_closed:
+            return
         total = min(len(self.groups), self.table.rowCount())
         if total <= 0:
             return
@@ -1059,6 +1068,8 @@ class HashDedupDialog(QDialog):
         self._refresh_details_inspector(row)
 
     def _render_batch(self):
+        if self._closing_review or self._review_closed:
+            return
         limit = min(len(self.groups), self._render_row + 300)
         self.table.setUpdatesEnabled(False)
         try:
@@ -1134,7 +1145,7 @@ class HashDedupDialog(QDialog):
         self._ensure_row_hydrated(row, force=changed_page)
         self._refresh_details_inspector(row)
         self._scroll_active_card_into_view(row, role, dup_idx)
-        self._hydrate_timer.start()
+        self._schedule_hydration()
 
     def _handle_table_arrow_key(self, key: int, modifiers) -> bool:
         if not self.groups:
@@ -1554,7 +1565,7 @@ class HashDedupDialog(QDialog):
             f'({files_to_move:,} arquivo(s) para mover — {format_size(reclaimable)})'
         )
         self.btn_execute.setEnabled(bool(checked_groups) and not self._plan_stale and not self._busy and not ConfigManager().is_read_only())
-        if not self._busy and not self._review_restoring:
+        if not self._busy and not self._review_restoring and not self._closing_review and not self._review_closed:
             self._save_timer.start()
 
     def _start_execute(self, checked=False, *, recover_only=False):
@@ -1719,36 +1730,81 @@ class HashDedupDialog(QDialog):
         self._retain_pending_results(result, uncertain=True)
         QMessageBox.critical(self, 'Erro na Execução', err)
 
+    def _schedule_hydration(self, *args):
+        if not self._closing_review and not self._review_closed:
+            self._hydrate_timer.start()
+
+    def showEvent(self, event):
+        self._review_closed = False
+        super().showEvent(event)
+        self._schedule_hydration()
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if self.groups:
-            self._hydrate_timer.start()
+            self._schedule_hydration()
 
     def reject(self):
         if not self._busy:
             super().reject()
 
-    def done(self, result):
-        if self._busy:
-            return
-        self.btn_close.setFocus()  # Confirma a edição em andamento antes do último salvamento.
+    def _stop_review_timers(self):
+        for timer in (self._save_timer, self._save_check_timer, self._render_timer, self._hydrate_timer):
+            timer.stop()
+
+    def _finish_review_close(self):
+        """Barreira idempotente de fechamento, inclusive antes de show().
+
+        Não processar eventos enquanto espera: nenhum callback pode agendar uma
+        escrita posterior ao estado final. Não encerrar o executor global, que
+        também atende outras janelas.
+        """
+        if self._review_closed:
+            return True
+        if self._closing_review or self._busy:
+            return False
+        if (self.scan_thread and self.scan_thread.isRunning()) or (
+                self.exec_thread and self.exec_thread.isRunning()):
+            if self.isVisible():
+                QMessageBox.information(self, 'Operação em andamento', 'Aguarde ou cancele a operação antes de fechar.')
+            return False
+        self._closing_review = True
+        self._close_error = ''
+        self._stop_review_timers()
+        error = None
         try:
-            self._save_review(wait=True)
+            self.btn_close.setFocus()  # Confirma a edição antes do snapshot final.
+            self._save_review(wait=True, _final=True)
         except Exception as exc:
-            QMessageBox.warning(self, 'Revisão não salva', f'Não foi possível salvar. A janela permanecerá aberta: {exc}')
-            return
-        self._save_timer.stop()
-        self._save_check_timer.stop()
-        super().done(result)
+            error = exc
+        finally:
+            # Mesmo se uma revisão inválida impedir nova gravação, ou se a
+            # serialização falhar, aguardar o trabalho anteriormente submetido.
+            try:
+                if self._save_future is not None:
+                    self._save_future.result()
+            except Exception as exc:
+                error = error or exc
+            self._stop_review_timers()
+            self._closing_review = False
+        if error is not None:
+            self._close_error = f'Não foi possível salvar. Fechamento cancelado; revisão mantida em memória: {error}'
+            self.status_label.setText(self._close_error)
+            logging.warning('Fechamento do deduplicador cancelado: %s', error)
+            if self.isVisible():
+                QMessageBox.warning(self, 'Revisão não salva', self._close_error)
+            return False
+        self._review_closed = True
+        return True
+
+    def done(self, result):
+        if self._finish_review_close():
+            super().done(result)
 
     def closeEvent(self, event):
-        if self._busy:
+        if not self._finish_review_close():
             event.ignore()
             return
-        if (self.scan_thread and self.scan_thread.isRunning()) or (
-            self.exec_thread and self.exec_thread.isRunning()
-        ):
-            QMessageBox.information(self, 'Operação em andamento', 'Aguarde ou cancele a operação antes de fechar.')
-            event.ignore()
-            return
+        # Qt pode não chamar done() quando a janela nunca foi exibida. A
+        # barreira acima já finalizou a persistência, em qualquer visibilidade.
         super().closeEvent(event)

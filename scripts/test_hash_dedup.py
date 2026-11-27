@@ -638,6 +638,96 @@ class HashDedupTests(unittest.TestCase):
         chosen3, _ = select_keeper_and_duplicates([c_org, c_out], [ROOT])
         self.assertEqual(c_out['path'], chosen3['path'])
 
+    def test_same_name_copy_number_priority_after_year_organizar_and_depth(self):
+        from src.services.hash_deduplicator import split_copy_name
+
+        self.assertEqual(('foto.jpg', (0, ())), split_copy_name('foto.jpg'))
+        self.assertEqual(('foto.jpg', (1, (2,))), split_copy_name('foto (2).JPG'))
+        self.assertEqual(('foto.jpg', (1, (10,))), split_copy_name('foto (10).jpg'))
+        self.assertEqual(('foto.jpg', (2, (1, 1))), split_copy_name('foto (1) (1).jpg'))
+        self.assertEqual(('missas', (1, (2,))), split_copy_name('Missas (2)'))
+        self.assertEqual(('natal (2020).jpg', (0, ())), split_copy_name('Natal (2020).jpg'))
+        self.assertEqual(('natal (2020).jpg', (1, (2,))), split_copy_name('Natal (2020) (2).jpg'))
+        self.assertEqual(('a(s) 11.02.28.jpg', (0, ())), split_copy_name('a(s) 11.02.28.jpg'))
+
+        # Mesmo ano-raiz, mesmo não-Organizar e mesma profundidade, e mesmo nome-base:
+        # sem (n) vence mesmo tendo menos tags, caminho mais longo e data mais recente.
+        c_clean = dict(
+            path=ROOT + r'\2010\EventoComNomeMuitoLongo\foto.jpg',
+            name='foto.jpg',
+            description='',
+            drive_created='2025-01-01T00:00:00Z',
+        )
+        c_copy2 = dict(
+            path=ROOT + r'\2010\A\foto (2).jpg',
+            name='foto (2).jpg',
+            description='a, b, c',
+            drive_created='2010-01-01T00:00:00Z',
+        )
+        c_copy10 = dict(
+            path=ROOT + r'\2010\B\foto (10).jpg',
+            name='foto (10).jpg',
+            description='a, b, c, d',
+            drive_created='2009-01-01T00:00:00Z',
+        )
+        chosen, dups = select_keeper_and_duplicates([c_copy10, c_copy2, c_clean], [ROOT])
+        self.assertEqual(c_clean['path'], chosen['path'])
+        self.assertEqual([c_copy2['path'], c_copy10['path']], [d['path'] for d in dups])
+
+        # Entre apenas cópias (n) no mesmo nível, menor número vence inclusive contra sufixo encadeado (1) (1).
+        c_single1 = dict(path=ROOT + r'\2010\A\foto (1).jpg', name='foto (1).jpg', description='')
+        c_chain = dict(path=ROOT + r'\2010\B\foto (1) (1).jpg', name='foto (1) (1).jpg', description='tag')
+        chosen_n, _ = select_keeper_and_duplicates([c_chain, c_copy2, c_single1], [ROOT])
+        self.assertEqual(c_single1['path'], chosen_n['path'])
+
+        # Pasta raiz mais antiga continua vencendo.
+        c_older_copy = dict(path=ROOT + r'\2009\Evento\foto (2).jpg', name='foto (2).jpg', description='')
+        c_newer_clean = dict(path=ROOT + r'\2010\Evento\foto.jpg', name='foto.jpg', description='a, b')
+        chosen_year, _ = select_keeper_and_duplicates([c_newer_clean, c_older_copy], [ROOT])
+        self.assertEqual(c_older_copy['path'], chosen_year['path'])
+
+        # Não-Organizar continua vencendo Organizar mesmo que a cópia fora de Organizar tenha (2).
+        c_non_org_copy = dict(path=ROOT + r'\2010\Evento\foto (2).jpg', name='foto (2).jpg', description='')
+        c_org_clean = dict(path=ROOT + r'\2010\Organizar\foto.jpg', name='foto.jpg', description='tag')
+        chosen_org, _ = select_keeper_and_duplicates([c_org_clean, c_non_org_copy], [ROOT])
+        self.assertEqual(c_non_org_copy['path'], chosen_org['path'])
+
+        # Menor profundidade continua vencendo subpasta mais funda mesmo tendo (2).
+        c_shallow_copy = dict(path=ROOT + r'\2010\Evento\foto (2).jpg', name='foto (2).jpg', description='')
+        c_deep_clean = dict(path=ROOT + r'\2010\Evento\Sub\foto.jpg', name='foto.jpg', description='tag1, tag2')
+        chosen_depth, _ = select_keeper_and_duplicates([c_deep_clean, c_shallow_copy], [ROOT])
+        self.assertEqual(c_shallow_copy['path'], chosen_depth['path'])
+
+        # Nomes-base distintos no mesmo nível comparam por mais tags antes do caminho/data.
+        c_tagged_copy = dict(path=ROOT + r'\2010\Evento\Casamento Maria (2).jpg', name='Casamento Maria (2).jpg', description='t1, t2')
+        c_untagged_other = dict(path=ROOT + r'\2010\A\IMG_001.jpg', name='IMG_001.jpg', description='')
+        chosen_diff, _ = select_keeper_and_duplicates([c_untagged_other, c_tagged_copy], [ROOT])
+        self.assertEqual(c_tagged_copy['path'], chosen_diff['path'])
+
+    def test_scan_selected_folders_prefers_name_without_copy_number(self):
+        self.drive.folder('y2010', '2010', 'src', 'src')
+        self.drive.folder('y2010_ev_long', 'EventoComNomeLongo', 'y2010', 'src')
+        self.drive.folder('y2010_ev_short', 'A', 'y2010', 'src')
+        self.drive.photo('orig_id', 'festa.jpg', 'y2010_ev_long', 'tag1')
+        self.drive.photo('copy_id', 'festa (2).jpg', 'y2010_ev_short', 'tag1, tag2, tag3')
+        idx = FileIndexer(str(self.db))
+        p_orig = ROOT + r'\2010\EventoComNomeLongo\festa.jpg'
+        p_copy = ROOT + r'\2010\A\festa (2).jpg'
+        idx.save_files_in_batch([
+            dict(id=p_orig, path=p_orig, name='festa.jpg', source='local', size=123, mimeType='image/jpeg',
+                 description='', modifiedTime=1, createdTime=1, parentId=os.path.dirname(p_orig),
+                 webContentLink='https://drive.google.com/file/d/orig_id/view'),
+            dict(id=p_copy, path=p_copy, name='festa (2).jpg', source='local', size=123, mimeType='image/jpeg',
+                 description='', modifiedTime=1, createdTime=1, parentId=os.path.dirname(p_copy),
+                 webContentLink='https://drive.google.com/file/d/copy_id/view'),
+        ], source='local')
+        idx.close()
+
+        groups = self.scan(MODE_SELECTED_FOLDERS, [ROOT + r'\2010\EventoComNomeLongo', ROOT + r'\2010\A'], [])
+        grp = [g for g in groups if {g.keeper['drive_id'], *(d['drive_id'] for d in g.duplicates)} == {'orig_id', 'copy_id'}][0]
+        self.assertEqual('orig_id', grp.keeper['drive_id'])
+        self.assertEqual(['copy_id'], [d['drive_id'] for d in grp.duplicates])
+
 
 class HashDedupDialogTests(unittest.TestCase):
     @classmethod

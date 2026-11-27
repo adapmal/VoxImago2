@@ -226,18 +226,14 @@ class FileListView(QListView):
             return
 
         mime_data = QMimeData()
-        urls = []
         file_items = []
         for index in indexes:
             file_item = index.data(Qt.ItemDataRole.UserRole)
             if file_item:
                 file_items.append(file_item)
-                if file_item.get('source') == 'local' and file_item.get('path'):
-                    urls.append(QUrl.fromLocalFile(file_item['path']))
-                elif file_item.get('source') == 'drive' and file_item.get('webViewLink'):
-                    urls.append(QUrl(file_item['webViewLink']))
 
-        mime_data.setUrls(urls)
+        # Operações de arrastar ficam dentro do VoxImago. URLs de arquivos locais
+        # permitiam ao Explorer mover fisicamente a seleção sem passar pela fila.
         try:
             import json
             mime_data.setData("application/x-voximago-file-items", json.dumps(file_items).encode('utf-8'))

@@ -1,5 +1,8 @@
 """Persistência e progresso parcial: apenas bancos temporários e Drive simulado."""
 import json
+import shutil
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -10,6 +13,7 @@ from PyQt6.QtWidgets import QApplication, QMessageBox
 from scripts import test_dedup_pagination as ui_fixture
 from scripts import test_hash_dedup as fixture
 from src.services.dedup_review import load_review, review_path, save_review
+from src.utils.queue_store import atomic_json
 from src.services.hash_deduplicator import DuplicateGroup, HashDedupExecuteWorker, DedupCancelled
 from src.services import hash_deduplicator as dedup
 from src.ui.hash_dedup_dialog import HashDedupDialog, _InstanceRowButton
@@ -30,6 +34,148 @@ class ReviewTests(unittest.TestCase):
     def finish_render(self):
         while self.dialog._render_timer.isActive():
             self.app.processEvents()
+
+    def assert_review_stopped(self):
+        self.assertTrue(self.dialog._review_closed)
+        for timer in (self.dialog._save_timer, self.dialog._save_check_timer,
+                      self.dialog._render_timer, self.dialog._hydrate_timer):
+            self.assertFalse(timer.isActive())
+        if self.dialog._save_future is not None:
+            self.assertTrue(self.dialog._save_future.done())
+
+    def test_hidden_close_saves_latest_edits_and_blocks_late_callbacks(self):
+        self.assertFalse(self.dialog.isVisible())
+        group = self.group()
+        group.checked = False
+        group.edited_description = 'edição final, Pará'
+        self.dialog.groups = [group]
+        self.dialog.dest_edit.setText(r'X:\NovoDestino')
+        self.assertTrue(self.dialog._save_timer.isActive())
+        with patch('src.ui.hash_dedup_dialog.save_review', wraps=save_review) as writes:
+            self.assertTrue(self.dialog.close())
+            self.dialog.done(0)
+            self.dialog._autosave_review()
+            self.dialog._update_summary()
+            self.dialog._schedule_hydration()
+            self.assertEqual(1, writes.call_count)
+        self.assert_review_stopped()
+        restored = load_review(self.dialog.db_path)
+        self.assertEqual('edição final, Pará', restored['groups'][0].edited_description)
+        self.assertFalse(restored['groups'][0].checked)
+        self.assertEqual(r'X:\NovoDestino', restored['settings']['destination'])
+        self.assertTrue(restored['stale'])
+
+    def test_visible_close_is_idempotent_and_same_instance_can_reopen(self):
+        self.dialog.groups = [self.group()]
+        self.dialog.show()
+        with patch('src.ui.hash_dedup_dialog.save_review', wraps=save_review) as writes:
+            self.assertTrue(self.dialog.close())
+            self.dialog.done(0)
+            self.assertEqual(1, writes.call_count)
+        self.assert_review_stopped()
+        self.dialog.show()
+        self.dialog.dest_edit.setText(r'X:\Reaberta')
+        self.assertTrue(self.dialog.close())
+        self.assertEqual(r'X:\Reaberta', load_review(self.dialog.db_path)['settings']['destination'])
+        self.assert_review_stopped()
+
+    def test_hidden_close_drains_slow_writer_and_never_recreates_deleted_directory(self):
+        started = threading.Event()
+        writes = []
+        def slow_write(path, payload):
+            started.set()
+            time.sleep(0.05)
+            atomic_json(path, payload)
+            writes.append(payload['settings']['destination'])
+        self.dialog.groups = [self.group()]
+        with patch('src.services.dedup_review.atomic_json', side_effect=slow_write):
+            self.dialog._save_review()
+            self.assertTrue(started.wait(2))
+            self.assertFalse(self.dialog._save_future.done())
+            self.dialog.dest_edit.setText(r'X:\UltimaEdicao')
+            self.assertTrue(self.dialog.close())
+            self.assert_review_stopped()
+            self.assertEqual(2, len(writes))
+            self.assertEqual(r'X:\UltimaEdicao', writes[-1])
+            directory = review_path(self.dialog.db_path).parent
+            shutil.rmtree(directory)  # Apenas o diretório temporário deste teste.
+            QTest.qWait(750)  # Além do debounce de 700 ms, com event loop ativo.
+            self.assertFalse(directory.exists())
+            self.assertEqual(2, len(writes))
+
+    def test_close_drains_prior_future_even_when_new_saves_are_forbidden(self):
+        for flag in ('_review_load_failed', '_review_restoring'):
+            with self.subTest(flag=flag):
+                self.dialog.show()
+                self.dialog.hide()
+                started = threading.Event()
+                def slow_write(path, payload):
+                    started.set()
+                    time.sleep(0.05)
+                    atomic_json(path, payload)
+                with patch('src.services.dedup_review.atomic_json', side_effect=slow_write) as writes:
+                    self.dialog._save_review()
+                    self.assertTrue(started.wait(2))
+                    setattr(self.dialog, flag, True)
+                    try:
+                        self.assertTrue(self.dialog.close())
+                        self.assert_review_stopped()
+                        self.assertEqual(1, writes.call_count)
+                    finally:
+                        setattr(self.dialog, flag, False)
+
+    def test_hidden_save_failure_refuses_close_without_modal_and_can_retry(self):
+        self.dialog.groups = [self.group()]
+        self.dialog._save_review(wait=True)
+        path = review_path(self.dialog.db_path)
+        previous = path.read_bytes()
+        self.dialog.dest_edit.setText(r'X:\NaoPerder')
+        with patch('src.services.dedup_review.atomic_json', side_effect=OSError('disco cheio')), \
+                patch('src.ui.hash_dedup_dialog.QMessageBox.warning') as warning:
+            self.assertFalse(self.dialog.close())
+            warning.assert_not_called()
+        self.assertFalse(self.dialog._review_closed)
+        self.assertIn('disco cheio', self.dialog._close_error)
+        self.assertEqual(previous, path.read_bytes())
+        self.assertTrue(self.dialog._save_future.done())
+        self.assertTrue(self.dialog.close())
+        self.assertEqual(r'X:\NaoPerder', load_review(self.dialog.db_path)['settings']['destination'])
+        self.assert_review_stopped()
+
+    def test_visible_save_failure_keeps_window_open_and_reports_error(self):
+        self.dialog.show()
+        with patch('src.services.dedup_review.atomic_json', side_effect=OSError('disco cheio')), \
+                patch('src.ui.hash_dedup_dialog.QMessageBox.warning') as warning:
+            self.assertFalse(self.dialog.close())
+            warning.assert_called_once()
+        self.assertTrue(self.dialog.isVisible())
+        self.assertFalse(self.dialog._review_closed)
+        self.assertTrue(self.dialog.close())
+        self.assert_review_stopped()
+
+    def test_final_serialization_failure_still_drains_prior_writer(self):
+        started = threading.Event()
+        def slow_write(path, payload):
+            started.set()
+            time.sleep(0.05)
+            atomic_json(path, payload)
+        with patch('src.services.dedup_review.atomic_json', side_effect=slow_write):
+            self.dialog._save_review()
+            self.assertTrue(started.wait(2))
+            with patch('src.ui.hash_dedup_dialog.save_review', side_effect=ValueError('serialização')):
+                self.assertFalse(self.dialog.close())
+            self.assertTrue(self.dialog._save_future.done())
+        self.assertTrue(self.dialog.close())
+        self.assert_review_stopped()
+
+    def test_direct_accept_drains_save_before_finished_signal(self):
+        self.dialog.groups = [self.group()]
+        observed = []
+        self.dialog.finished.connect(lambda result: observed.append(
+            (result, self.dialog._review_closed, self.dialog._save_future.done())))
+        self.dialog.accept()
+        self.assertEqual([(1, True, True)], observed)
+        self.assert_review_stopped()
 
     def reopen(self):
         self.dialog.close()

@@ -609,26 +609,30 @@ class FileIndexer:
 
     def count_files(self, source, search_term=None, filter_type=None, folder_id=None, advanced_filters=None):
         self.ensure_conn()
+        from src.services.name_history import history_revision
         cache_key = (source, search_term, filter_type,
-                     folder_id, str(advanced_filters))
+                     folder_id, str(advanced_filters), history_revision(self.db_name) if search_term else None)
         if cache_key in self._count_cache:
             return self._count_cache[cache_key]
         params = []
         where_clauses = []
-        file_ids = None
         if search_term:
-            quoted_search_term = search_term.strip().replace('"', '""')
-            query_term = f'"{quoted_search_term}*"'
-            query = "SELECT DISTINCT file_id FROM search_index WHERE search_index MATCH ?"
-            self.cursor.execute(query, (query_term,))
-            file_ids = [row[0] for row in self.cursor.fetchall()]
-            if not file_ids:
+            search_sql, search_params, extra_filters, empty_result = SearchEngine(self).build_search_clause(
+                search_term, source=source)
+            if empty_result:
                 self._count_cache[cache_key] = 0
                 return 0
-        if file_ids is not None:
-            placeholders = ','.join('?' for _ in file_ids)
-            where_clauses.append(f"file_id IN ({placeholders})")
-            params.extend(file_ids)
+            if search_sql:
+                where_clauses.append(search_sql)
+                params.extend(search_params)
+            if extra_filters.get('is_starred'):
+                where_clauses.append("starred = 1")
+            if extra_filters.get('created_before'):
+                where_clauses.append("createdTime <= ?")
+                params.append(int(time.mktime(extra_filters['created_before'].timetuple())))
+            if extra_filters.get('created_after'):
+                where_clauses.append("createdTime >= ?")
+                params.append(int(time.mktime(extra_filters['created_after'].timetuple())))
         if source:
             where_clauses.append("source=?")
             params.append(source)

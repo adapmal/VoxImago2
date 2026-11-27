@@ -16,6 +16,11 @@ MAX_QUEUE_FILE_BYTES = 64 * 1024 * 1024
 MAX_QUEUE_TEXT_LENGTH = 1024 * 1024
 
 
+def physical_item_path(item):
+    """A prévia de movimento não muda a origem física de novas intenções."""
+    return item.get('physical_path') or item.get('orig_path') or item.get('path') or ''
+
+
 class StagingItem:
     def __init__(self, file_id, file_name, path, action_type, old_value="", new_value=""):
         self.file_id = file_id
@@ -26,12 +31,15 @@ class StagingItem:
         self.new_value = new_value
         self.timestamp = time.time()
         self.operation_id = uuid.uuid4().hex
+        self.asset_id = ''
+        self.execution_state = 'pending'
+        self.execution_message = ''
 
     def to_dict(self):
         # A lista e os nomes dos campos permanecem compativeis com as versoes
         # anteriores. Versoes antigas simplesmente ignoram ``schema_version``.
         return {
-            'schema_version': 1,
+            'schema_version': 2,
             'file_id': self.file_id,
             'file_name': self.file_name,
             'path': self.path,
@@ -40,6 +48,9 @@ class StagingItem:
             'new_value': self.new_value,
             'timestamp': self.timestamp,
             'operation_id': self.operation_id,
+            'asset_id': self.asset_id,
+            'execution_state': self.execution_state,
+            'execution_message': self.execution_message,
         }
 
     @classmethod
@@ -71,6 +82,13 @@ class StagingItem:
         if not isinstance(operation_id, str) or not operation_id or len(operation_id) > 128:
             raise ValueError('Identificador de operação inválido.')
         item.operation_id = operation_id
+        for field, default in (('asset_id', ''), ('execution_state', 'pending'), ('execution_message', '')):
+            value = data.get(field, default)
+            if not isinstance(value, str) or len(value) > MAX_QUEUE_TEXT_LENGTH:
+                raise ValueError(f'Campo {field} inválido.')
+            setattr(item, field, value)
+        if item.execution_state not in ('pending', 'blocked', 'applying', 'local_applied', 'waiting_cloud', 'uncertain'):
+            raise ValueError('Estado de execução inválido.')
         item.validate()
         return item
 

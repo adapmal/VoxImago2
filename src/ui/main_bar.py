@@ -165,8 +165,19 @@ class MainBar(QFrame):
         self.action_reconcile_paths = QAction("🧭 Reconciliar caminhos de arquivos movidos", self)
         self.action_reconcile_paths.setToolTip(
             "Localiza no disco arquivos que foram movidos de pasta e atualiza seus endereços no banco, preservando todas as tags.")
+        self.action_insync_suffix_repair = QAction("🔁 Corrigir sufixos (n) do InSync", self)
+        self.action_insync_suffix_repair.setToolTip(
+            "Corrige arquivos locais presos com sufixo (2)/(3) do InSync quando o Drive possui apenas 1 cópia idêntica sem o sufixo.")
+        self.action_raw_tag_sync = QAction("📷 Sincronizar Tags RAW ↔ Cópias (JPG/PNG)", self)
+        self.action_raw_tag_sync.setToolTip(
+            "Encontra duplas/grupos entre arquivos RAW e suas cópias (JPG/PNG/HEIC) e soma as tags nos dois sentidos.")
         self.action_deduplicate_hash = QAction("🧹 Deduplicar Fotos por Hash", self)
         self.action_shortcut_migration = QAction("Incorporar Meu Drive mantendo atalhos", self)
+        self.action_name_disambiguation = QAction("Desambiguar nomes de arquivos no Drive", self)
+        self.action_shortcut_audit = QAction("🧹 Pente-fino de atalhos no Drive", self)
+        self.action_shortcut_audit.setToolTip(
+            "Localiza atalhos no Banco de Imagens, transfere tags ausentes ao arquivo real e move o atalho à Lixeira."
+        )
         self.action_deduplicate_hash.setToolTip(
             "Localiza fotos duplicadas por hash MD5, funde tags e nomes diferentes e move excedentes para Banco_Apagado.")
         self.action_clear_cache = QAction("🧹 Limpar Cache", self)
@@ -217,6 +228,8 @@ class MainBar(QFrame):
         self.menu_utils.addAction(self.action_scan_options)
         self.menu_utils.addAction(self.action_sync_drive)
         self.menu_utils.addAction(self.action_shortcut_migration)
+        self.menu_utils.addAction(self.action_name_disambiguation)
+        self.menu_utils.addAction(self.action_shortcut_audit)
         self.menu_utils.addAction(self.action_clear_cache)
         self.menu_utils.addSeparator()
         self.action_advanced_settings = QAction("⚙️ Avançado / Sistema", self)
@@ -226,6 +239,8 @@ class MainBar(QFrame):
         # Submenu Diagnóstico
         self.menu_diag = QMenu("🩺 Diagnóstico", self.tools_menu)
         self.menu_diag.addAction(self.action_reconcile_paths)
+        self.menu_diag.addAction(self.action_insync_suffix_repair)
+        self.menu_diag.addAction(self.action_raw_tag_sync)
         self.menu_diag.addAction(self.action_deduplicate_hash)
         self.menu_diag.addAction(self.action_reindex)
         self.tools_menu.addMenu(self.menu_diag)
@@ -446,6 +461,7 @@ class MainBar(QFrame):
                     win._force_refresh_after_sync()
             win._staging_dialog.executionCompleted.connect(on_queue_done)
 
+        win._staging_dialog.drive_service = getattr(win, 'service', None)
         win._staging_dialog.show()
         win._staging_dialog.raise_()
         win._staging_dialog.activateWindow()

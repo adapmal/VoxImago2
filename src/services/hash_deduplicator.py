@@ -23,6 +23,7 @@ from src.drive.match import extract_drive_file_id
 from src.utils.config_manager import ConfigManager
 from src.utils.path_validation import validate_path_component
 from src.utils.queue_store import atomic_json
+from src.services.drive_retry import execute_drive_read
 from src.services.snapshot_management import assert_queue_empty, local_backup
 
 PHOTO_EXTENSIONS = {
@@ -304,15 +305,49 @@ def evaluate_group_discrepancies(
     }
 
 
+_TRAILING_COPY_NUMBER_RE = re.compile(r'^(.*?)(\s*\((\d+)\))$')
+
+
+def split_copy_name(filename: str | None) -> tuple[str, tuple[int, tuple[int, ...]]]:
+    """Extrai (nome_base_normalizado, (qtd_sufixos, (n1, n2, ...))) de cópias '(n)' ao final.
+
+    Ex.: 'foto.jpg' -> ('foto.jpg', (0, ()))
+         'foto (2).jpg' -> ('foto.jpg', (1, (2,)))
+         'foto (1) (2).jpg' -> ('foto.jpg', (2, (1, 2)))
+    Preserva anos de 4 dígitos (1900..2100) como parte legítima do nome.
+    """
+    raw = str(filename or '')
+    stem, ext = ntpath.splitext(raw)
+    copy_nums: list[int] = []
+    cur = stem
+    while cur:
+        match = _TRAILING_COPY_NUMBER_RE.match(cur)
+        if not match:
+            break
+        digits = match.group(3)
+        num = int(digits)
+        if len(digits) == 4 and 1900 <= num <= 2100:
+            break
+        prefix = match.group(1)
+        if not prefix.strip():
+            break
+        copy_nums.append(num)
+        cur = prefix
+    copy_nums.reverse()
+    base_name = unicodedata.normalize('NFC', f'{cur}{ext}').casefold()
+    return base_name, (len(copy_nums), tuple(copy_nums))
+
+
 def select_keeper_and_duplicates(
     group: list[dict],
     roots: list[str],
     *,
     context_items: list[dict] | None = None,
 ) -> tuple[dict, list[dict]]:
-    """Prioriza sempre a pasta raiz mais antiga; desempates em cadeia padrão."""
+    """Prioriza pasta raiz mais antiga → não-Organizar → menor profundidade → sem '(n)' (ou menor n) no mesmo nome-base → mais tags → caminho menor → mais antigo."""
     del context_items
-    enriched = []
+    by_tier_and_base: dict[tuple, list[tuple[tuple, tuple, dict]]] = defaultdict(list)
+
     for item in group:
         rel_parts = _relative_parts_from_roots(item['path'], roots)
         in_org = 1 if _is_in_organizar(rel_parts) else 0
@@ -326,21 +361,29 @@ def select_keeper_and_duplicates(
         item_copy['depth'] = depth
         if exif_year is not None:
             item_copy['exif_year'] = exif_year
-        sort_key = (
-            (0, root_year_num) if root_year_num is not None else (1, 0),
-            in_org,
-            depth,
+
+        year_key = (0, root_year_num) if root_year_num is not None else (1, 0)
+        tier_prefix = (year_key, in_org, depth)
+        base_name, copy_rank = split_copy_name(item.get('name') or ntpath.basename(item['path']))
+        post_tie = (
             -tag_cnt,
             len(item['path']),
             item.get('drive_created') or str(item.get('createdTime') or ''),
             item['path'].casefold(),
         )
-        enriched.append((sort_key, item_copy))
+        by_tier_and_base[(tier_prefix, base_name)].append((copy_rank, post_tie, item_copy))
 
-    enriched.sort(key=lambda pair: pair[0])
-    keeper = enriched[0][1]
-    duplicates = [pair[1] for pair in enriched[1:]]
-    return keeper, duplicates
+    ranked_buckets = []
+    for (tier_prefix, _base_name), members in by_tier_and_base.items():
+        members.sort(key=lambda entry: (entry[0], entry[1]))
+        best_copy_rank, best_post_tie, _ = members[0]
+        ranked_buckets.append(((tier_prefix, best_post_tie, best_copy_rank), members))
+
+    ranked_buckets.sort(key=lambda bucket: bucket[0])
+    ordered: list[dict] = []
+    for _, members in ranked_buckets:
+        ordered.extend(entry[2] for entry in members)
+    return ordered[0], ordered[1:]
 
 
 def default_banco_apagado_path(config_mgr: ConfigManager | None = None) -> str:
@@ -528,10 +571,14 @@ class DedupCancelled(RuntimeError):
 
 class DriveCatalog:
     """Paginação completa e resolução por hierarquia, nunca busca global por nome."""
-    def __init__(self, service, drive_id, cancelled=lambda: False, progress=None):
+    cancelled = staticmethod(lambda: False)
+    on_wait = None
+
+    def __init__(self, service, drive_id, cancelled=lambda: False, progress=None, on_wait=None):
         self.service, self.drive_id, self.cancelled = service, drive_id, cancelled
         self.children = defaultdict(list)
         self.progress = progress
+        self.on_wait = on_wait
         self._loaded_parents = set()
         self._located_parents = set()
         self._parent_items = {}
@@ -548,7 +595,12 @@ class DriveCatalog:
                           fields=f'nextPageToken,incompleteSearch,files({fields})')
             if token:
                 kwargs['pageToken'] = token
-            page = self.service.files().list(**kwargs).execute()
+            page = execute_drive_read(
+                lambda kw=kwargs: self.service.files().list(**kw),
+                cancelled=self.cancelled,
+                cancel_error=DedupCancelled,
+                on_wait=self.on_wait,
+            )
             if page.get('incompleteSearch'):
                 raise RuntimeError('Busca incompleta do Drive; não é seguro escolher candidatos.')
             result.extend(page.get('files', []))
@@ -619,11 +671,21 @@ class DriveCatalog:
         return item
 
     def get(self, file_id):
-        request = self.service.files().get(fileId=file_id, supportsAllDrives=True, fields=META_FIELDS)
         headers = {}
-        if hasattr(request, 'add_response_callback'):
-            request.add_response_callback(lambda response: headers.update(response))
-        item = request.execute()
+
+        def make_request():
+            headers.clear()
+            request = self.service.files().get(fileId=file_id, supportsAllDrives=True, fields=META_FIELDS)
+            if hasattr(request, 'add_response_callback'):
+                request.add_response_callback(lambda response: headers.update(response))
+            return request
+
+        item = execute_drive_read(
+            make_request,
+            cancelled=self.cancelled,
+            cancel_error=DedupCancelled,
+            on_wait=self.on_wait,
+        )
         item['_etag'] = headers.get('etag') or headers.get('ETag')
         return item
 
@@ -632,8 +694,14 @@ class DriveCatalog:
             return item
         if self._conditional_service is None:
             self._conditional_service = conditional_service(self.service)
-        legacy = self._conditional_service.files().get(
-            fileId=item['id'], supportsAllDrives=True, fields=CONDITIONAL_FIELDS).execute()
+        legacy = execute_drive_read(
+            lambda: self._conditional_service.files().get(
+                fileId=item['id'], supportsAllDrives=True, fields=CONDITIONAL_FIELDS
+            ),
+            cancelled=self.cancelled,
+            cancel_error=DedupCancelled,
+            on_wait=self.on_wait,
+        )
         comparable = dict(id=legacy.get('id'), version=legacy.get('version'), name=legacy.get('title'),
                           parents=sorted(p['id'] for p in legacy.get('parents', [])),
                           driveId=legacy.get('driveId'), trashed=legacy.get('labels', {}).get('trashed', False),
@@ -655,6 +723,10 @@ class DriveCatalog:
             body = dict(kwargs.pop('body', {}))
             if 'name' in body:
                 body['title'] = body.pop('name')
+            if 'trashed' in body:
+                labels = dict(body.get('labels') or {})
+                labels['trashed'] = bool(body.pop('trashed'))
+                body['labels'] = labels
             request = self._conditional_service.files().patch(
                 fileId=item['id'], supportsAllDrives=True, fields='id', body=body, **kwargs)
         else:
@@ -732,8 +804,11 @@ class HashScanWorker(QObject):
             self.drive_service = private_service(self.drive_service)
             roots = catalog_roots(cfg)
             validate_scope(self.scope_mode, self.custom_folders, self.reference_folders, roots, cfg)
-            cloud = DriveCatalog(self.drive_service, cfg.get('production_drive_id'), lambda: self._cancelled,
-                lambda count: self.progress_update.emit(2, f'Consultando metadados: {count:,} itens (sem baixar originais)...'))
+            cloud = DriveCatalog(
+                self.drive_service, cfg.get('production_drive_id'), lambda: self._cancelled,
+                lambda count: self.progress_update.emit(2, f'Consultando metadados: {count:,} itens (sem baixar originais)...'),
+                on_wait=lambda msg: self.progress_update.emit(2, msg),
+            )
             self.progress_update.emit(1, 'Consultando metadados/checksums no Drive (sem baixar fotos)...')
             if self.scope_mode == MODE_SELECTED_FOLDERS:
                 cloud.load_selected([[] if norm(folder) == norm(roots[0]) else relative_parts(folder, roots[0])
@@ -881,7 +956,10 @@ def relocate_local(indexer, payload):
 
 def clean_local(indexer, payload):
     # Nunca operar por nome; remover somente os IDs registrados após confirmação remota.
-    ids = {payload['local_id'], to_canonical_id(payload['local_id']), payload['file_id']}
+    ids = {payload['file_id']}
+    if payload.get('local_id'):
+        ids.update((payload['local_id'], to_canonical_id(payload['local_id'])))
+    indexer.ensure_conn()
     indexer.conn.execute('BEGIN IMMEDIATE')
     try:
         for fid in ids:
@@ -894,6 +972,55 @@ def clean_local(indexer, payload):
     except Exception:
         indexer.conn.rollback()
         raise
+
+
+def find_local_ids_by_drive_id(indexer, drive_id):
+    """Localiza file_id(s) locais ou remotos no catálogo vinculados estritamente a drive_id."""
+    if indexer is None or not drive_id:
+        return []
+    indexer.ensure_conn()
+    matched = []
+    seen = set()
+    for row in indexer.conn.execute('SELECT file_id FROM files WHERE file_id=?', (drive_id,)).fetchall():
+        if row[0] not in seen:
+            matched.append(row[0])
+            seen.add(row[0])
+    for fid, web_link in indexer.conn.execute(
+        'SELECT file_id, webContentLink FROM files WHERE webContentLink LIKE ?',
+        (f'%{drive_id}%',),
+    ).fetchall():
+        if extract_drive_file_id(web_link or '') == drive_id and fid not in seen:
+            matched.append(fid)
+            seen.add(fid)
+    return matched
+
+
+def update_local_description_by_drive_id(indexer, drive_id, description):
+    """Atualiza a descrição no índice local somente em linhas vinculadas a drive_id."""
+    count = 0
+    for fid in find_local_ids_by_drive_id(indexer, drive_id):
+        indexer.update_description(fid, description, commit=True, allow_empty_override=True)
+        count += 1
+    return count
+
+
+def clean_local_by_drive_id(indexer, drive_id):
+    """Remove do catálogo local apenas registros vinculados a drive_id, nunca por nome."""
+    if indexer is None or not drive_id:
+        return []
+    cleaned = find_local_ids_by_drive_id(indexer, drive_id)
+    for lid in cleaned:
+        clean_local(indexer, {'local_id': lid, 'file_id': drive_id})
+    indexer.ensure_conn()
+    if indexer.conn.execute("SELECT 1 FROM sqlite_master WHERE name='drive_link_validation'").fetchone():
+        indexer.conn.execute('BEGIN IMMEDIATE')
+        try:
+            indexer.conn.execute('DELETE FROM drive_link_validation WHERE drive_id=?', (drive_id,))
+            indexer.conn.commit()
+        except Exception:
+            indexer.conn.rollback()
+            raise
+    return cleaned
 
 
 class HashDedupExecuteWorker(QObject):
@@ -987,9 +1114,31 @@ class HashDedupExecuteWorker(QObject):
                 journal.state(file_id, 'confirmed')
                 if payload.get('kind') == 'keeper_relocation':
                     relocate_local(indexer, payload)
+                elif payload.get('source') == 'name_disambiguation' or not payload.get('local_id'):
+                    clean_local_by_drive_id(indexer, file_id)
                 else:
                     clean_local(indexer, payload)
                 journal.state(file_id, 'cleaned')
+                if payload.get('source') == 'name_disambiguation' and payload.get('job'):
+                    nd_path = Path(self.db_name).resolve().parent / 'name_disambiguation' / 'journal.db'
+                    if nd_path.exists():
+                        from src.services.name_disambiguation import NameJournal
+                        nj = NameJournal(self.db_name)
+                        try:
+                            cur = nj.conn.execute(
+                                'SELECT state FROM operations WHERE job=? AND fid=?',
+                                (payload['job'], file_id),
+                            ).fetchone()
+                            if cur and cur[0] != 'completed':
+                                nj.state(
+                                    payload['job'], file_id, 'completed', '',
+                                    event_action='uncertain_confirmed_completed',
+                                    event_payload={'name': fresh.get('name'), 'parents': fresh.get('parents'),
+                                                   'md5': fresh.get('md5Checksum', ''), 'size': fresh.get('size', ''),
+                                                   'recovered_by': 'hash_dedup'},
+                                )
+                        finally:
+                            nj.close()
                 journal.event('reconciled', payload)
                 recovered += 1
             else:
@@ -1054,7 +1203,13 @@ class HashDedupExecuteWorker(QObject):
             journal.event('started', {'backup': backup, 'destination': self.dest_root})
             indexer = FileIndexer(self.db_name)
             roots = catalog_roots(cfg)
-            self.cloud = DriveCatalog(self.drive_service, cfg.get('production_drive_id'), lambda: self._cancelled)
+            last_pct = [0]
+            self.cloud = DriveCatalog(
+                self.drive_service,
+                cfg.get('production_drive_id'),
+                lambda: self._cancelled,
+                on_wait=lambda msg: self.progress_update.emit(last_pct[0], msg),
+            )
             if self.recover_only:
                 result['reconciled'], unresolved = self.recover(indexer, journal)
                 if unresolved:
@@ -1063,7 +1218,8 @@ class HashDedupExecuteWorker(QObject):
                 for position, grp in enumerate(self.groups):
                     if self._cancelled:
                         break
-                    self.progress_update.emit(int(100 * position / max(1, len(self.groups))),
+                    last_pct[0] = int(100 * position / max(1, len(self.groups)))
+                    self.progress_update.emit(last_pct[0],
                                               f'Conferindo grupo {position + 1}/{len(self.groups)}...')
                     try:
                         complete = self.execute_group(grp, indexer, journal, roots, cfg, result)

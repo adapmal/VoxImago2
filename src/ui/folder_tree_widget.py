@@ -9,7 +9,7 @@ import json
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTreeView,
     QHeaderView, QAbstractItemView, QPushButton, QInputDialog,
-    QMessageBox, QMenu, QStyledItemDelegate
+    QMessageBox, QMenu, QStyledItemDelegate, QTreeWidget, QTreeWidgetItem
 )
 from PyQt6.QtGui import QFileSystemModel, QDragEnterEvent, QDragMoveEvent, QDropEvent, QCursor, QColor, QPen, QFont
 from PyQt6.QtCore import pyqtSignal, Qt, QDir, QUrl, QModelIndex, QTimer
@@ -210,10 +210,57 @@ class DropEnabledTreeView(QTreeView):
                     })
 
         if dropped_items:
-            event.acceptProposedAction()
+            # O Explorer não deve interpretar o drop como movimento já realizado.
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
             self.filesDropped.emit(dropped_items, os.path.normpath(target_path))
         else:
             event.ignore()
+
+
+class PendingFolderTree(QTreeWidget):
+    """Destinos virtuais: drop apenas emite intenção, nunca toca no disco."""
+    filesDropped = pyqtSignal(list, str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setHeaderLabel('Pastas pendentes — ainda não criadas')
+        self.setAcceptDrops(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
+        self.setMaximumHeight(200)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasFormat('application/x-voximago-file-items') or event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if self.itemAt(event.position().toPoint()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        target = self.itemAt(event.position().toPoint())
+        if not target:
+            event.ignore()
+            return
+        records = []
+        try:
+            if event.mimeData().hasFormat('application/x-voximago-file-items'):
+                records = json.loads(bytes(event.mimeData().data('application/x-voximago-file-items')).decode('utf-8'))
+            else:
+                records = [dict(path=u.toLocalFile(), file_id=u.toLocalFile(), name=os.path.basename(u.toLocalFile()), source='local')
+                           for u in event.mimeData().urls() if u.isLocalFile()]
+            if not isinstance(records, list) or not all(isinstance(r, dict) for r in records):
+                raise ValueError('Drop inválido')
+        except (ValueError, UnicodeError):
+            event.ignore()
+            return
+        self.filesDropped.emit(records, target.data(0, Qt.ItemDataRole.UserRole))
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
 
 
 class FolderTreeWidget(QWidget):
@@ -304,8 +351,49 @@ class FolderTreeWidget(QWidget):
         self.tree_view.filesDropped.connect(self.filesDroppedOnFolder.emit)
         layout.addWidget(self.tree_view)
 
+        self.pending_tree = PendingFolderTree(self)
+        self.pending_tree.filesDropped.connect(self.filesDroppedOnFolder.emit)
+        self.pending_tree.itemClicked.connect(self._select_pending_folder)
+        self.pending_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.pending_tree.customContextMenuRequested.connect(self._pending_context_menu)
+        layout.addWidget(self.pending_tree)
+        from src.ui.staging_queue import StagingQueue
+        StagingQueue().queueChanged.connect(self._refresh_pending_folders)
+        self._refresh_pending_folders()
+
         # Atualizar visualização quando o modo Sandbox alternar
         self.config_mgr.modeChanged.connect(self._on_mode_changed)
+
+    def _refresh_pending_folders(self, *_):
+        from src.ui.staging_queue import StagingQueue
+        self.pending_tree.clear()
+        self._pending_paths = set()
+        for item in StagingQueue().items:
+            if item.action_type != 'create_folder' or item.execution_state not in ('pending', 'blocked'):
+                continue
+            path = item.new_value or item.path
+            if not path:
+                continue
+            self._pending_paths.add(os.path.normcase(os.path.normpath(path)))
+            node = QTreeWidgetItem([path])
+            node.setData(0, Qt.ItemDataRole.UserRole, path)
+            node.setToolTip(0, 'Pasta virtual. Só será criada após aprovar a execução na Fila.')
+            self.pending_tree.addTopLevelItem(node)
+        self.pending_tree.setVisible(bool(self._pending_paths))
+
+    def _select_pending_folder(self, node, column=0):
+        self.tree_view.selectionModel().blockSignals(True)
+        self.tree_view.clearSelection()
+        self.tree_view.selectionModel().blockSignals(False)
+        self.folderSelected.emit(node.data(0, Qt.ItemDataRole.UserRole))
+
+    def _pending_context_menu(self, position):
+        node = self.pending_tree.itemAt(position)
+        if node:
+            menu = QMenu(self)
+            action = menu.addAction('Agendar subpasta aqui…')
+            action.triggered.connect(lambda: self.create_new_folder(node.data(0, Qt.ItemDataRole.UserRole)))
+            menu.exec(self.pending_tree.viewport().mapToGlobal(position))
 
     def _copy_path_to_clipboard(self, target_path):
         from PyQt6.QtWidgets import QApplication
@@ -495,10 +583,18 @@ class FolderTreeWidget(QWidget):
             win.status_bar.showMessage("🔄 Árvore de pastas recarregada com sucesso!", 3500)
 
     def create_new_folder(self, target_parent_path=None):
+        from src.ui.staging_queue import StagingQueue, StagingItem
+        queue = StagingQueue()
+        if not queue.can_edit():
+            return
         if self.config_mgr.is_read_only():
             QMessageBox.warning(self, "Modo Somente Leitura", "O aplicativo está em Modo Somente Leitura. Desative o modo somente leitura para criar pastas.")
             return
 
+        if not target_parent_path:
+            selected_virtual = self.pending_tree.selectedItems()
+            if selected_virtual and not self.tree_view.selectedIndexes():
+                target_parent_path = selected_virtual[0].data(0, Qt.ItemDataRole.UserRole)
         if not target_parent_path:
             indexes = self.tree_view.selectedIndexes()
             if indexes:
@@ -506,7 +602,8 @@ class FolderTreeWidget(QWidget):
             else:
                 target_parent_path = self.root_dir
 
-        if not target_parent_path or not os.path.exists(target_parent_path):
+        if not target_parent_path or (not os.path.exists(target_parent_path)
+                and os.path.normcase(os.path.normpath(target_parent_path)) not in self._pending_paths):
             target_parent_path = self.root_dir
 
         parent_name = os.path.basename(target_parent_path) or target_parent_path
@@ -540,28 +637,12 @@ class FolderTreeWidget(QWidget):
                 QMessageBox.information(self, "Pasta em Fila", f"A pasta '{folder_name}' já está agendada na Fila de Revisão.")
                 return
 
-        # 1. Cria a pasta localmente para que o QFileSystemModel a exiba na árvore e receba drag-and-drop
-        try:
-            os.makedirs(new_path, exist_ok=True)
-        except Exception as e_mk:
-            QMessageBox.critical(self, "Erro ao Criar Pasta", f"Não foi possível preparar a pasta local:\n{e_mk}")
-            return
-
-        # 2. Agenda a criação oficial / sincronização na nuvem na Fila de Revisão
+        # Intenção somente. A seção virtual aceita drops sem criar um placeholder.
         st_item = StagingItem(new_path, folder_name, new_path, 'create_folder', old_value="", new_value=new_path)
-        queue.add_item(st_item)
-        
-        # 3. Registrar como pasta conhecida e atualizar visualização
-        self.model.add_known_parent(target_parent_path)
-        self.model.refresh_subdirs_cache(self.root_dir)
-        parent_idx = self.model.index(target_parent_path)
-        if parent_idx.isValid():
-            self.tree_view.expand(parent_idx)
-
-        new_idx = self.model.index(new_path)
-        if new_idx.isValid():
-            self.tree_view.setCurrentIndex(new_idx)
-            self.folderSelected.emit(new_path)
+        if not queue.add_item(st_item):
+            return
+        self._refresh_pending_folders()
+        self.folderSelected.emit(new_path)
         
         win = self.window()
         if hasattr(win, 'status_bar') and win.status_bar:
@@ -608,6 +689,7 @@ class FolderTreeWidget(QWidget):
             return
         indexes = self.tree_view.selectedIndexes()
         if indexes and self.model.isDir(indexes[0]):
+            self.pending_tree.clearSelection()
             folder_path = self.model.filePath(indexes[0])
             if folder_path:
                 self._update_header_for_folder(folder_path)
@@ -632,6 +714,12 @@ class FolderTreeWidget(QWidget):
 
     def select_and_expand_folder(self, folder_path):
         """Expande os níveis intermediários e seleciona a pasta alvo na árvore."""
+        for index in range(self.pending_tree.topLevelItemCount()):
+            node = self.pending_tree.topLevelItem(index)
+            if os.path.normcase(node.data(0, Qt.ItemDataRole.UserRole)) == os.path.normcase(folder_path or ''):
+                self.pending_tree.setCurrentItem(node)
+                self._select_pending_folder(node)
+                return True
         if not folder_path or not os.path.exists(folder_path):
             return False
 

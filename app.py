@@ -34,9 +34,11 @@ def main():
     logging.info("=== Iniciando VoxImago.MB ===")
     from PyQt6.QtWidgets import QApplication, QMessageBox, QProgressDialog
     from PyQt6.QtCore import QLockFile, QEventLoop, QTimer
+    from src.ui.popup_text_selection import install_popup_text_selection
     from src.ui.ui import DriveFileGalleryApp
 
     app = QApplication(sys.argv)
+    install_popup_text_selection(app)
     app.setQuitOnLastWindowClosed(False)
     # Impede que esta versão troque um catálogo aberto por outra instância
     # desta instalação. Ferramentas externas devem estar fechadas na adoção.

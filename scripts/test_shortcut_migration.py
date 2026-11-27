@@ -245,7 +245,7 @@ class MigrationTests(unittest.TestCase):
         self.assertIn('ocupado', result['errors'][0])
         self.assertEqual(['source'], self.drive.items['photo']['parents'])
 
-    def test_archive_names_loaded_once_and_collisions_reserved_between_files(self):
+    def test_archive_names_revalidated_before_each_move_and_collisions_reserved(self):
         self.drive.photo('existing', 'preservada.jpg', 'destination')
         self.drive.items['child'].update(name='foto.jpg', md5Checksum='a' * 32, sha256Checksum='a' * 64)
         self.drive.folder('archived', 'Banco_Apagado', 'archive', 'archive')
@@ -258,7 +258,7 @@ class MigrationTests(unittest.TestCase):
         self.assertNotEqual(self.drive.items['photo']['name'], self.drive.items['child']['name'])
         listings = [r for r in self.drive.reads if r[0] == 'list'
                     and r[1] == "'apagar' in parents and trashed = false"]
-        self.assertEqual(1, len(listings))
+        self.assertEqual(4, len(listings))  # Pré-verificação + imediatamente antes de cada movimento.
 
     def test_shortcut_create_timeout_keeps_original_and_resumes(self):
         p = self.scan()
@@ -484,6 +484,58 @@ class MigrationTests(unittest.TestCase):
         for value in ('O:\\Fotos', 'root', '../file', 'https://example.org/folders/abc'):
             with self.assertRaises(ValueError):
                 folder_id(value)
+
+    def test_invalid_destination_reports_destination_not_my_drive_root(self):
+        with self.assertRaisesRegex(ValueError, 'Destino:.*link ou ID'):
+            self.engine.scan('source', 'Teste\\MyDriveDiario5')
+        self.assertEqual([], self.drive.writes)
+
+    def test_planned_file_names_visible_before_any_write(self):
+        self.drive.photo('sibling', 'foto.jpg', 'source', md5='e' * 32)
+        plan = self.scan()
+        rows = [r for r in plan['items'] if r['source']['parents'] == ['source']]
+        self.assertEqual(['foto.jpg', 'foto [sibling].jpg'], [r['destination_name'] for r in rows])
+        self.assertTrue(all(r['destination_parts'][-1] == r['destination_name'] for r in rows))
+        self.assertEqual([], self.drive.writes)
+        self.assertEqual([], self.execute(plan)['errors'])
+        for row in rows:
+            self.assertEqual(row['destination_name'], self.drive.items[row['source']['id']]['name'])
+
+    def test_file_folder_name_collision_is_in_preview(self):
+        self.drive.items['photo']['name'] = 'Viagens'
+        plan = self.scan()
+        row = next(r for r in plan['items'] if r['source']['id'] == 'photo')
+        self.assertEqual('Viagens [photo]', row['destination_name'])
+        self.assertEqual([], self.execute(plan)['errors'])
+
+    def test_lowercase_archive_folder_reused_without_duplicate(self):
+        self.drive.photo('existing', 'original.jpg', 'destination')
+        self.drive.folder('archived', 'banco_apagado', 'archive', 'archive')
+        self.drive.folder('apagar', 'apagar', 'archived', 'archive')
+        result = self.execute(self.scan())
+        self.assertEqual([], result['errors'])
+        self.assertEqual(['apagar'], self.drive.items['photo']['parents'])
+
+    def test_new_folder_collision_after_plan_blocks_instead_of_choosing_suffix(self):
+        plan = self.scan()
+        self.drive.folder('someone', 'Fotos Maria', 'destination', 'bank')
+        with self.assertRaisesRegex(ValueError, 'ocupado'):
+            self.execute(plan)
+        self.assertEqual([], self.drive.writes)
+
+    def test_legacy_plan_without_final_names_requires_new_analysis(self):
+        plan = self.scan()
+        journal = MigrationJournal(self.db)
+        try:
+            payload = json.loads(journal.conn.execute('SELECT plan FROM jobs WHERE id=?', (plan['id'],)).fetchone()[0])
+            payload.pop('name_plan_version')
+            with journal.conn:
+                journal.conn.execute('UPDATE jobs SET plan=? WHERE id=?', (json.dumps(payload), plan['id']))
+        finally:
+            journal.close()
+        with self.assertRaisesRegex(ValueError, 'prévia'):
+            self.execute(plan)
+        self.assertEqual([], self.drive.writes)
 
 
 class MigrationDialogTests(unittest.TestCase):

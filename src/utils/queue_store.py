@@ -70,6 +70,9 @@ class QueueStore:
             connection.execute('CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)')
             connection.execute('CREATE TABLE IF NOT EXISTS items (id TEXT PRIMARY KEY, position INTEGER, payload TEXT)')
             connection.execute('CREATE TABLE IF NOT EXISTS execution (id TEXT PRIMARY KEY, state TEXT, updated REAL)')
+            connection.execute('CREATE TABLE IF NOT EXISTS context_assets (id TEXT PRIMARY KEY, path TEXT, drive_id TEXT)')
+            connection.execute('CREATE TABLE IF NOT EXISTS context_operations (id TEXT PRIMARY KEY, asset TEXT, state TEXT, payload TEXT, message TEXT)')
+            connection.execute('CREATE TABLE IF NOT EXISTS context_events (seq INTEGER PRIMARY KEY, operation_id TEXT, state TEXT, payload TEXT, created REAL)')
             initialized = connection.execute("SELECT value FROM metadata WHERE key='initialized'").fetchone()
         if not initialized:
             records = read_queue_json(self.legacy_path) if self.legacy_path.exists() else []
@@ -97,6 +100,12 @@ class QueueStore:
             connection.execute('BEGIN IMMEDIATE')
             self.check_revision(connection)
             previous = dict(connection.execute('SELECT id,payload FROM items'))
+            protected = {row[0] for row in connection.execute(
+                "SELECT id FROM context_operations WHERE state IN ('applying','local_applied','waiting_cloud','uncertain')")}
+            incoming = {r['operation_id']: r for r in records}
+            for key in protected:
+                if key in previous and incoming.get(key) != json.loads(previous[key]):
+                    raise ValueError('Há operações aplicadas ou incertas. Confira a sincronização antes de remover, editar ou recuperar estes itens.')
             ids = set()
             for position, record in enumerate(records):
                 key = record['operation_id']

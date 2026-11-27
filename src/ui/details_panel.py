@@ -19,6 +19,7 @@ from src.utils.exif_utils import extract_exif_summary
 from src.ui.thumbnails import ThumbnailCache, ThumbnailManager
 from src.drive.auto_tagger import AutoTagger
 from src.ui.staging_queue import StagingQueue, StagingItem
+from src.utils.staging_schema import physical_item_path
 from src.drive.match import select_unique_drive_candidate_by_size
 from src.utils.config_manager import ConfigManager
 from src.utils.path_validation import validate_path_component
@@ -118,6 +119,7 @@ class FileDetailsPanel(QFrame):
         self.content_layout.addWidget(self.title_label)
 
         self.thumbnail_label = QLabel()
+        self.thumbnail_label.setObjectName('thumbnail_label')
         self.thumbnail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.thumbnail_label.setFixedSize(300, 300)
         self.thumbnail_label.setStyleSheet("background-color: #2D2D2D; border-radius: 6px;")
@@ -732,29 +734,39 @@ class FileDetailsPanel(QFrame):
             self._start_batch_tags(added_tags, explicitly_removed)
             return
             
-        raw_fid = self.current_file_item.get('file_id') or self.current_file_item.get('id') or ''
-        raw_path = self.current_file_item.get('path', '')
-        norm_fid = os.path.normcase(os.path.normpath(raw_fid)) if raw_fid else ''
-        norm_path = os.path.normcase(os.path.normpath(raw_path)) if raw_path else ''
-        fname = self.current_file_item.get('name', '')
-        
-        # Buscar a descrição original salva no banco de dados SQLite para comparação
-        old_desc = ""
-        if hasattr(self.parent_app, 'indexer') and self.parent_app.indexer:
-            self.parent_app.indexer.ensure_conn()
-            self.parent_app.indexer.cursor.execute(
-                "SELECT description FROM files WHERE file_id = ? OR path = ? LIMIT 1",
-                (raw_fid, raw_path)
-            )
-            r = self.parent_app.indexer.cursor.fetchone()
-            if r:
-                old_desc = r[0] or ""
+        from src.services.batch_tags import build_single_edit_items
+        db_path = (
+            self.parent_app.indexer.db_name
+            if (hasattr(self.parent_app, 'indexer') and self.parent_app.indexer)
+            else None
+        )
+        items_to_stage, matching_ids, partner_count, final_new_desc, raw_was_auto_added = build_single_edit_items(
+            db_path,
+            self.current_file_item,
+            new_desc,
+            self.staging_queue.items,
+            active_tags=self.tag_chips_widget.get_active_tags(),
+        )
+        saved = self.staging_queue.replace_descriptions(items_to_stage, matching_ids)
+        if not saved:
+            self.update_details(self.current_file_item)
+            return
 
-        item = None
-        if new_desc != old_desc:
-            item = StagingItem(raw_fid or raw_path, fname, raw_path, 'set_description', old_value=old_desc, new_value=new_desc)
-        self.staging_queue.replace_description(item, {value for value in (norm_fid, norm_path) if value})
-            
+        # Se a tag 'RAW' foi adicionada automaticamente ao arquivo bruto, refletir no widget de chips sem disparar loop
+        if raw_was_auto_added:
+            prev_flag = self._is_updating
+            self._is_updating = True
+            try:
+                self.tag_chips_widget.add_tag('RAW')
+            finally:
+                self._is_updating = prev_flag
+
+        if partner_count and hasattr(self.parent_app, 'status_bar') and self.parent_app.status_bar:
+            self.parent_app.status_bar.showMessage(
+                f'Tags sincronizadas na fila com {partner_count} arquivo(s) correspondente(s) (RAW ↔ Cópia).',
+                5000,
+            )
+
         self._refresh_suggestions_view()
 
     def _start_batch_tags(self, added, removed):
@@ -796,7 +808,12 @@ class FileDetailsPanel(QFrame):
             self.staging_queue.items = [StagingItem.from_dict(row) for row in records]
             self.staging_queue._tag_index = None
             self.staging_queue.queueChanged.emit(self.staging_queue.count())
-            win.status_bar.showMessage(f'Tags preparadas para {len(files):,} arquivos. Fila salva.', 10000)
+            partners = getattr(worker, 'partner_count', 0)
+            partner_note = f' (+ {partners:,} par(es) RAW↔Cópia)' if partners else ''
+            win.status_bar.showMessage(
+                f'Tags preparadas para {len(files):,} arquivo(s){partner_note}. Fila salva ({self.staging_queue.count():,} na fila).',
+                10000,
+            )
 
         def finish():
             win.status_bar.removeWidget(batch_progress)
@@ -827,7 +844,7 @@ class FileDetailsPanel(QFrame):
         if self._is_updating or self._inspection_only or not self.current_file_item:
             return
         fid = self.current_file_item.get('file_id') or self.current_file_item.get('id')
-        fpath = self.current_file_item.get('path', '')
+        fpath = physical_item_path(self.current_file_item)
         
         # Buscar o nome original salvo no banco de dados SQLite para comparação
         old_name = ""
@@ -965,7 +982,7 @@ class FileDetailsPanel(QFrame):
             if not item_data: continue
             fid = item_data.get('file_id') or item_data.get('id')
             fname = item_data.get('name', 'N/A')
-            fpath = item_data.get('path', '')
+            fpath = physical_item_path(item_data)
 
             already_marked = False
             for it in list(self.staging_queue.items):
@@ -974,15 +991,14 @@ class FileDetailsPanel(QFrame):
                     self.staging_queue.remove_item(it)
             
             if not already_marked:
-                for it in list(self.staging_queue.items):
-                    if it.file_id == fid:
-                        self.staging_queue.remove_item(it)
-
                 item = StagingItem(fid, fname, fpath, 'delete', old_value='', new_value='')
-                self.staging_queue.add_item(item)
-                is_any_added_to_queue = True
+                is_any_added_to_queue = self.staging_queue.add_item(item) or is_any_added_to_queue
             
         if not getattr(self, '_is_batch_mode', False):
+            current = self.current_file_item or {}
+            current_id = current.get('file_id') or current.get('id')
+            is_any_added_to_queue = any(it.file_id == current_id and it.action_type == 'delete'
+                                        for it in self.staging_queue.items)
             self._apply_delete_visual_state(is_any_added_to_queue)
             if is_any_added_to_queue:
                 self._fade_current_thumbnail()
